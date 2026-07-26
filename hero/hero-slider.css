@@ -1,0 +1,359 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   Hero Slider — clean rebuild.
+   Layout is owned entirely by the browser via CSS scroll-snap:
+     - .jhs-track is the horizontal scroll container (overflow-x: auto)
+     - each .jhs-slide is scroll-snap-align: start, width: 100%
+   There is no JS-computed width/transform anywhere — swipe on mobile is
+   native scrolling, not custom touch math.
+   Breakpoints mirror the rest of the site: Desktop (>1200px) → Laptop
+   (1025–1200px) → Tablet (769–1024px) → Mobile (481–768px) → Small phone
+   (≤480px).
+   ═══════════════════════════════════════════════════════════════════════ */
+
+#heroSliderMount {
+  display: block;
+}
+#heroSliderMount[hidden] {
+  display: none;
+}
+
+.jhs-wrap {
+  position: relative;
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+  border-radius: 0 0 24px 24px;
+  box-shadow: 0 24px 48px -24px rgba(15, 23, 42, 0.45);
+  background: var(--dark-bg, #1e1b4b);
+}
+
+/* ── Scroll-snap track: the browser computes offsets, we never do ── */
+.jhs-track {
+  display: flex;
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  scroll-behavior: smooth;
+  -webkit-overflow-scrolling: touch;
+  outline: none;
+  /* Hide the native scrollbar; scrolling itself (mouse-drag, trackpad,
+     touch swipe, arrow buttons, dots) all remain fully functional. */
+  scrollbar-width: none;
+}
+.jhs-track::-webkit-scrollbar { display: none; }
+.jhs-track:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.85);
+  outline-offset: -3px;
+}
+
+.jhs-slide {
+  flex: 0 0 100%;
+  width: 100%;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+  position: relative;
+  min-height: 460px;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+}
+
+.jhs-slide-picture {
+  position: absolute;
+  inset: 0;
+  display: block;
+  line-height: 0;
+}
+.jhs-slide-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center 45%;
+  /* Subtle, premium "Ken Burns" drift: a slow, barely-perceptible zoom-out
+     while a slide is active. Transform-only (no layout/paint cost beyond
+     compositing), and reset to the same start state every time a slide
+     becomes inactive so it always begins fresh next time it's shown. */
+  transform: scale(1.06);
+  transition: transform 8s cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: transform;
+}
+.jhs-slide.jhs-slide-active .jhs-slide-img {
+  transform: scale(1);
+}
+/* Image failed to load (404/network) — fall back to a neutral gradient
+   instead of leaving a blank hole; text/buttons stay fully legible. */
+.jhs-slide.jhs-img-broken .jhs-slide-img { display: none; }
+.jhs-slide.jhs-img-broken .jhs-slide-picture::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(120% 140% at 15% 20%, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0) 55%),
+    linear-gradient(135deg, var(--dark-bg, #1e1b4b), var(--dark-bg-2, #312e81));
+}
+
+.jhs-slide-overlay {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(to top, rgba(8, 10, 22, 0.78) 0%, rgba(8, 10, 22, 0.38) 38%, rgba(8, 10, 22, 0) 68%),
+    linear-gradient(to left, rgba(8, 10, 22, 0.62) 0%, rgba(8, 10, 22, 0) 55%),
+    radial-gradient(120% 90% at 100% 100%, rgba(8, 10, 22, 0.22) 0%, rgba(8, 10, 22, 0) 60%);
+}
+.jhs-slide[data-position='left'] .jhs-slide-overlay {
+  background-image:
+    linear-gradient(to top, rgba(8, 10, 22, 0.78) 0%, rgba(8, 10, 22, 0.38) 38%, rgba(8, 10, 22, 0) 68%),
+    linear-gradient(to right, rgba(8, 10, 22, 0.62) 0%, rgba(8, 10, 22, 0) 55%),
+    radial-gradient(120% 90% at 0% 100%, rgba(8, 10, 22, 0.22) 0%, rgba(8, 10, 22, 0) 60%);
+}
+.jhs-slide[data-position='center'] .jhs-slide-overlay {
+  background-image:
+    linear-gradient(to top, rgba(8, 10, 22, 0.8) 0%, rgba(8, 10, 22, 0.42) 40%, rgba(8, 10, 22, 0) 70%),
+    linear-gradient(to bottom, rgba(8, 10, 22, 0.2) 0%, rgba(8, 10, 22, 0.2) 100%);
+}
+
+.jhs-slide-content {
+  position: relative;
+  z-index: 1;
+  max-width: 1280px;
+  margin: 0 auto;
+  width: 100%;
+  padding: 0 24px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+}
+.jhs-slide-content.jhs-pos-right { align-items: flex-end; text-align: right; }
+.jhs-slide-content.jhs-pos-left { align-items: flex-start; text-align: left; }
+.jhs-slide-content.jhs-pos-center { align-items: center; text-align: center; }
+.jhs-slide-content.jhs-pos-center .jhs-slide-btns { justify-content: center; }
+
+/* ── Soft entrance for text/CTAs when a slide becomes active ──
+   Each child gets a slightly later delay so the block reads top-to-bottom
+   instead of popping in as one flat unit. Deliberately scoped only to
+   `.jhs-slide-active` — outside that state these elements have no
+   animation/opacity override at all, so they render fully visible by
+   default. That keeps the slide readable even in the (unlikely) case the
+   active-slide class never gets applied, instead of risking invisible text. */
+@keyframes jhs-content-in {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.jhs-slide.jhs-slide-active .jhs-slide-label { animation: jhs-content-in 0.7s cubic-bezier(0.16, 1, 0.3, 1) 0.05s both; }
+.jhs-slide.jhs-slide-active .jhs-slide-title { animation: jhs-content-in 0.7s cubic-bezier(0.16, 1, 0.3, 1) 0.14s both; }
+.jhs-slide.jhs-slide-active .jhs-slide-desc { animation: jhs-content-in 0.7s cubic-bezier(0.16, 1, 0.3, 1) 0.22s both; }
+.jhs-slide.jhs-slide-active .jhs-slide-btns { animation: jhs-content-in 0.7s cubic-bezier(0.16, 1, 0.3, 1) 0.3s both; }
+
+.jhs-slide-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 20px;
+  padding: 6px 16px;
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.4px;
+  margin-bottom: 18px;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.jhs-slide-title {
+  font-size: 40px;
+  font-weight: 800;
+  color: #fff;
+  line-height: 1.22;
+  margin-bottom: 18px;
+  letter-spacing: -0.6px;
+  text-shadow: 0 4px 28px rgba(0, 0, 0, 0.4);
+  max-width: 640px;
+}
+.jhs-slide-desc {
+  font-size: 15px;
+  color: rgba(255, 255, 255, 0.86);
+  margin-bottom: 30px;
+  line-height: 1.8;
+  font-weight: 400;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+  max-width: 560px;
+}
+.jhs-slide-btns {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+.jhs-slide-btn {
+  max-width: 100%;
+  text-decoration: none;
+  padding: 14px 30px;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 14px;
+  letter-spacing: 0.1px;
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.25s ease, background-color 0.2s ease, border-color 0.2s ease;
+}
+.jhs-slide-btns .btn-primary.jhs-slide-btn {
+  box-shadow: 0 10px 26px -8px rgba(0, 0, 0, 0.55);
+}
+.jhs-slide-btns .btn-ghost.jhs-slide-btn {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1.5px solid rgba(255, 255, 255, 0.45);
+  color: #fff;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.jhs-slide-btn:hover {
+  transform: translateY(-2px);
+}
+.jhs-slide-btns .btn-ghost.jhs-slide-btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.7);
+}
+.jhs-slide-btn:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 3px;
+}
+
+/* ── Arrows ── */
+.jhs-arrow {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.2s ease, transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.2s ease;
+  z-index: 2;
+}
+.jhs-arrow:hover { background: rgba(15, 23, 42, 0.7); border-color: rgba(255, 255, 255, 0.4); transform: translateY(-50%) scale(1.06); }
+.jhs-arrow:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+.jhs-arrow svg { width: 18px; height: 18px; }
+/* RTL layout: "previous" sits visually on the right, "next" on the left. */
+.jhs-arrow-prev { right: 20px; }
+.jhs-arrow-next { left: 20px; }
+
+/* ── Dots ── */
+.jhs-dots {
+  position: absolute;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 8px;
+  z-index: 2;
+  max-width: calc(100% - 32px);
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.jhs-dot {
+  position: relative;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255, 255, 255, 0.4);
+  cursor: pointer;
+  padding: 0;
+  transition: width 0.2s, background 0.2s, border-radius 0.2s;
+}
+/* Invisible hit-area extension: keeps the dot visually minimal while still
+   meeting the WCAG 2.5.8 minimum (~24px) touch target, without overlapping
+   the neighboring dot's hit-area given the 8px gap between them. */
+.jhs-dot::after {
+  content: '';
+  position: absolute;
+  inset: -8px;
+}
+.jhs-dot-active { width: 22px; border-radius: 5px; background: var(--primary-light, #ddd6fe); }
+.jhs-dot:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+
+/* ── Loading skeleton ── */
+.jhs-skeleton {
+  width: 100%;
+  min-height: 460px;
+  border-radius: 0 0 24px 24px;
+  background: linear-gradient(
+    100deg,
+    var(--dark-bg, #1e1b4b) 40%,
+    var(--dark-bg-2, #312e81) 50%,
+    var(--dark-bg, #1e1b4b) 60%
+  );
+  background-size: 250% 100%;
+  animation: jhs-shimmer 1.6s ease-in-out infinite;
+}
+@keyframes jhs-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -50% 0; }
+}
+
+/* ── Responsive breakpoints ── */
+@media (max-width: 1200px) {
+  .jhs-slide-content { padding: 0 32px; }
+  .jhs-slide { min-height: 420px; }
+  .jhs-slide-title { font-size: 30px; max-width: 560px; }
+  .jhs-slide-desc { font-size: 14px; max-width: 500px; }
+  .jhs-arrow { width: 38px; height: 38px; }
+}
+@media (max-width: 1024px) {
+  .jhs-slide { min-height: 400px; }
+  .jhs-slide-content { padding: 0 18px; }
+  .jhs-slide-title { font-size: 26px; max-width: 100%; }
+  .jhs-slide-desc { font-size: 13px; max-width: 100%; }
+  .jhs-slide-btns .jhs-slide-btn { flex: 1 1 auto; justify-content: center; padding: 11px 14px; font-size: 12.5px; }
+  .jhs-arrow { width: 36px; height: 36px; }
+  .jhs-arrow-prev { right: 10px; }
+  .jhs-arrow-next { left: 10px; }
+  .jhs-slide-img { object-position: center 38%; }
+}
+@media (max-width: 768px) {
+  .jhs-slide { min-height: 360px; }
+  .jhs-skeleton { min-height: 360px; }
+  .jhs-slide-content { padding: 0 16px 34px; }
+  .jhs-slide-title { font-size: 22px; margin-bottom: 10px; }
+  .jhs-slide-desc { font-size: 12.5px; margin-bottom: 20px; }
+  .jhs-slide-label { font-size: 11px; padding: 4px 11px; margin-bottom: 12px; }
+  .jhs-slide-btns .jhs-slide-btn { min-height: 44px; }
+  .jhs-arrow { display: none; }
+  .jhs-dots { bottom: 12px; max-width: calc(100% - 24px); }
+}
+@media (max-width: 480px) {
+  .jhs-slide { min-height: 340px; }
+  .jhs-skeleton { min-height: 340px; }
+  .jhs-slide-btns { gap: 8px; }
+  .jhs-slide-btns .jhs-slide-btn { font-size: 11.5px; padding: 10px 10px; white-space: normal; }
+}
+
+/* Respect reduced-motion: keep scroll-snap usable, just remove the animated
+   easing / shimmer / autoplay smoothness (autoplay itself is also skipped in
+   JS when this media query matches), the Ken Burns image drift, and the
+   text entrance animation — content is simply shown at its resting state. */
+@media (prefers-reduced-motion: reduce) {
+  .jhs-track { scroll-behavior: auto; }
+  .jhs-arrow, .jhs-arrow:hover, .jhs-dot, .jhs-slide-btn { transition: none; }
+  .jhs-skeleton { animation: none; }
+  .jhs-slide-img { transition: none; transform: none; }
+  .jhs-slide.jhs-slide-active .jhs-slide-label,
+  .jhs-slide.jhs-slide-active .jhs-slide-title,
+  .jhs-slide.jhs-slide-active .jhs-slide-desc,
+  .jhs-slide.jhs-slide-active .jhs-slide-btns {
+    animation: none;
+    opacity: 1;
+    transform: none;
+  }
+}

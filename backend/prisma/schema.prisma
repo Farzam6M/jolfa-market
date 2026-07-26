@@ -1,0 +1,682 @@
+// ════════════════════════════════════════════════════════════════════
+// Jolfa Market — Prisma Schema
+// Modular e-commerce marketplace: Auth, Users, Roles, Products,
+// Categories, Stores, Sellers, Orders, Payments, Cart, Wishlist,
+// Reviews, Support Chat, Notifications, Admin.
+// ════════════════════════════════════════════════════════════════════
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ──────────────────────────── Auth / Users / Roles ────────────────────────────
+
+enum RoleKey {
+  CUSTOMER
+  SELLER
+  ADMIN
+  SUPER_ADMIN
+}
+
+model Role {
+  id          String     @id @default(uuid())
+  key         RoleKey    @unique
+  name        String
+  description String?
+  permissions RolePermission[]
+  users       User[]
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String            @id @default(uuid())
+  key         String            @unique // e.g. "products:create", "orders:read:own"
+  description String?
+  roles       RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+}
+
+model User {
+  id             String       @id @default(uuid())
+  name           String
+  mobile         String       @unique
+  email          String?      @unique
+  passwordHash   String
+  avatarUrl      String?
+  roleId         String
+  role           Role         @relation(fields: [roleId], references: [id])
+  status         UserStatus   @default(ACTIVE)
+  lastLoginAt    DateTime?
+  emailVerifiedAt  DateTime?
+  mobileVerifiedAt DateTime?
+  failedLoginCount Int        @default(0)
+  lockedUntil      DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  // Soft-delete marker set by DELETE /api/admin/sellers/:sellerId (removeSeller()
+  // in sellers.service.js). The row itself is never SQL-DELETEd — a seller's
+  // Store/Product rows can carry order history that must survive (see
+  // products.service.js remove()'s identical "never hard-delete anything with
+  // order history" rule) — so deletion instead bans the account (`status`)
+  // and stamps when/by whom. Plain string, no relation, matching the existing
+  // reviewedById convention on Product / SellerApplication.
+  deletedAt      DateTime?
+  deletedById    String?
+
+  refreshTokens        RefreshToken[]
+  passwordResetTokens  PasswordResetToken[]
+  verificationTokens   VerificationToken[]
+  addresses            Address[]
+  store                Store?
+  sellerApplication    SellerApplication?
+  cart                 Cart?
+  wishlist             WishlistItem[]
+  reviews              Review[]
+  orders               Order[]
+  wallet               Wallet?
+  supportConversations SupportConversation[]
+  storeConversations   StoreConversation[]    @relation("CustomerConversations")
+  storeMessages        StoreMessage[]
+  supportMessages      SupportMessage[]
+  notificationDismissals NotificationDismissal[]
+  notificationReads    NotificationRead[]
+  adminActivityLogs    AdminActivityLog[]
+
+  @@index([roleId])
+  @@map("users")
+}
+
+model RefreshToken {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String   @unique
+  revoked    Boolean  @default(false)
+  expiresAt  DateTime
+  // Session metadata — each refresh token IS a session (one issued per login/refresh).
+  userAgent  String?
+  ip         String?
+  lastUsedAt DateTime?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+
+model PasswordResetToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  used      Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+enum VerificationType {
+  EMAIL
+  MOBILE
+}
+
+
+model VerificationToken {
+  id        String            @id @default(uuid())
+  userId    String
+  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      VerificationType
+  target    String
+  tokenHash String            @unique
+  used      Boolean           @default(false)
+  expiresAt DateTime
+  createdAt DateTime          @default(now())
+
+  @@index([userId, type])
+  @@map("verification_tokens")
+}
+
+model Address {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fullName   String
+  phone      String
+  province   String
+  city       String
+  addressLine String
+  postalCode String?
+  isDefault  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  orders Order[]
+
+  @@index([userId])
+  @@map("addresses")
+}
+
+// ──────────────────────────── Stores / Sellers ────────────────────────────
+
+enum StoreStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+model Store {
+  id          String      @id @default(uuid())
+  sellerId    String      @unique
+  seller      User        @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  name        String
+  slug        String      @unique
+  categoryTag String?
+  region      String?
+  description String?
+  logoUrl     String?
+  rating      Decimal     @default(0) @db.Decimal(2, 1)
+  status      StoreStatus @default(PENDING)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  products           Product[]
+  orderItems         OrderItem[]
+  storeConversations StoreConversation[]
+
+  @@index([status])
+  @@map("stores")
+}
+
+enum SellerApplicationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model SellerApplication {
+  id           String                    @id @default(uuid())
+  userId       String                    @unique
+  user         User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  storeName    String
+  businessInfo Json?
+  documents    Json?
+  status       SellerApplicationStatus   @default(PENDING)
+  reviewedById String?
+  reviewedAt   DateTime?
+  createdAt    DateTime                  @default(now())
+
+  @@map("seller_applications")
+}
+
+// ──────────────────────────── Categories / Products ────────────────────────────
+
+model Category {
+  id       String     @id @default(uuid())
+  name     String
+  slug     String     @unique
+  icon     String?
+  // Admin-controlled visibility toggle. An inactive category is hidden from
+  // public browsing/filtering and can't be selected for new/edited products,
+  // but existing products keep their categoryId (no cascading side effects).
+  isActive Boolean    @default(true)
+  parentId String?
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryTree")
+  products Product[]
+
+  @@index([isActive])
+  @@map("categories")
+}
+
+enum ProductType {
+  RETAIL
+  WHOLESALE
+}
+
+enum ProductStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  ARCHIVED
+}
+
+model Product {
+  id             String        @id @default(uuid())
+  storeId        String
+  store          Store         @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  categoryId     String?
+  category       Category?     @relation(fields: [categoryId], references: [id])
+  name           String
+  slug           String        @unique
+  brand          String?
+  description    String?
+  price          Decimal       @db.Decimal(12, 0)
+  compareAtPrice Decimal?      @db.Decimal(12, 0)
+  stock          Int           @default(0)
+  type           ProductType   @default(RETAIL)
+  status         ProductStatus @default(PENDING)
+  // Seller-controlled visibility toggle — independent from `status` (admin moderation).
+  // A product can be APPROVED but temporarily hidden by its seller (isActive=false),
+  // e.g. while it's out of stock or paused; toggling it does NOT require re-approval.
+  isActive       Boolean       @default(true)
+  reviewedById   String?
+  reviewedAt     DateTime?
+  // Set by moderate() when status is set to REJECTED (shown to the seller in
+  // their own product list); cleared back to null on a later APPROVED moderation.
+  rejectReason   String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  images        ProductImage[]
+  wholesaleTiers WholesaleTier[]
+  cartItems     CartItem[]
+  wishlistItems WishlistItem[]
+  reviews       Review[]
+  orderItems    OrderItem[]
+
+  @@index([storeId])
+  @@index([categoryId])
+  @@index([status])
+  // Every public/customer listing query filters on both of these together
+  // (status = APPROVED AND isActive = true) — a composite index lets that
+  // filter be satisfied by a single index scan instead of one index scan
+  // plus a row-by-row isActive re-check.
+  @@index([status, isActive])
+  @@map("products")
+}
+
+model ProductImage {
+  id        String   @id @default(uuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  url       String
+  position  Int      @default(0)
+
+  @@index([productId])
+  @@map("product_images")
+}
+
+model WholesaleTier {
+  id        String  @id @default(uuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  minQty    Int
+  price     Decimal @db.Decimal(12, 0)
+
+  @@index([productId])
+  @@map("wholesale_tiers")
+}
+
+// ──────────────────────────── Cart / Wishlist ────────────────────────────
+
+model Cart {
+  id        String     @id @default(uuid())
+  userId    String     @unique
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items     CartItem[]
+  updatedAt DateTime   @updatedAt
+
+  @@map("carts")
+}
+
+model CartItem {
+  id            String  @id @default(uuid())
+  cartId        String
+  cart          Cart    @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  productId     String
+  product       Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  qty           Int     @default(1)
+  priceSnapshot Decimal @db.Decimal(12, 0)
+
+  @@unique([cartId, productId])
+  @@map("cart_items")
+}
+
+model WishlistItem {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, productId])
+  @@map("wishlist_items")
+}
+
+// ──────────────────────────── Reviews ────────────────────────────
+
+enum ReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model Review {
+  id        String       @id @default(uuid())
+  productId String
+  product   Product      @relation(fields: [productId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rating    Int
+  comment   String?
+  status    ReviewStatus @default(APPROVED)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  @@unique([productId, userId])
+  @@map("reviews")
+}
+
+// ──────────────────────────── Orders / Payments ────────────────────────────
+
+// Order lifecycle only — NOT payment status (see PaymentStatus below, which
+// is tracked independently on the Payment model). CONFIRMED covers "payment
+// succeeded / order accepted"; a failed or refunded payment is visible on
+// the Payment record without forcing the order itself backward.
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PREPARING
+  SENT
+  DELIVERED
+  CANCELLED
+}
+
+model Order {
+  id           String      @id @default(uuid())
+  orderNumber  String      @unique
+  userId       String
+  user         User        @relation(fields: [userId], references: [id])
+  addressId    String?
+  address      Address?    @relation(fields: [addressId], references: [id])
+  status       OrderStatus @default(PENDING)
+  subtotal     Decimal     @db.Decimal(12, 0)
+  shippingFee  Decimal     @db.Decimal(12, 0) @default(0)
+  total        Decimal     @db.Decimal(12, 0)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  items    OrderItem[]
+  payments Payment[]
+
+  @@index([userId])
+  @@index([status])
+  @@map("orders")
+}
+
+model OrderItem {
+  id        String  @id @default(uuid())
+  orderId   String
+  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+  storeId   String
+  store     Store   @relation(fields: [storeId], references: [id])
+  nameSnapshot  String
+  priceSnapshot Decimal @db.Decimal(12, 0)
+  qty       Int
+
+  @@index([orderId])
+  @@index([storeId])
+  @@map("order_items")
+}
+
+enum PaymentMethod {
+  WALLET
+  GATEWAY
+  CASH_ON_DELIVERY
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+model Payment {
+  id              String        @id @default(uuid())
+  orderId         String
+  order           Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  method          PaymentMethod
+  amount          Decimal       @db.Decimal(12, 0)
+  status          PaymentStatus @default(PENDING)
+  transactionRef  String?
+  paidAt          DateTime?
+  createdAt       DateTime      @default(now())
+
+  @@index([orderId])
+  @@map("payments")
+}
+
+model Wallet {
+  id           String              @id @default(uuid())
+  userId       String              @unique
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balance      Decimal             @default(0) @db.Decimal(12, 0)
+  updatedAt    DateTime            @updatedAt
+  transactions WalletTransaction[]
+
+  @@map("wallets")
+}
+
+enum WalletTxType {
+  CREDIT
+  DEBIT
+}
+
+model WalletTransaction {
+  id        String       @id @default(uuid())
+  walletId  String
+  wallet    Wallet       @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  type      WalletTxType
+  amount    Decimal      @db.Decimal(12, 0)
+  reason    String
+  refId     String?
+  createdAt DateTime     @default(now())
+
+  @@index([walletId])
+  @@map("wallet_transactions")
+}
+
+// ──────────────────────────── Support Chat / Store Chat ────────────────────────────
+
+enum ConversationStatus {
+  OPEN
+  CLOSED
+}
+
+model SupportConversation {
+  id          String              @id @default(uuid())
+  userId      String
+  user        User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status      ConversationStatus  @default(OPEN)
+  // Read-state watermarks (mirrors frontend chat-service.js exactly): the
+  // last time each side actually opened this conversation. A message is
+  // "read" by a viewer iff message.createdAt <= the viewer's watermark.
+  userReadAt  DateTime?
+  adminReadAt DateTime?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+  messages    SupportMessage[]
+
+  @@unique([userId]) // one support conversation per user, matches frontend ChatService rule
+  @@map("support_conversations")
+}
+
+enum SupportSender {
+  USER
+  SUPPORT
+}
+
+model SupportMessage {
+  id             String               @id @default(uuid())
+  conversationId String
+  conversation   SupportConversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  senderId       String
+  sender         User                 @relation(fields: [senderId], references: [id])
+  from           SupportSender
+  body           String
+  createdAt      DateTime             @default(now())
+
+  @@index([conversationId])
+  @@map("support_messages")
+}
+
+model StoreConversation {
+  id             String    @id @default(uuid())
+  storeId        String
+  store          Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  customerId     String
+  customer       User      @relation("CustomerConversations", fields: [customerId], references: [id], onDelete: Cascade)
+  // Read-state watermarks, same idea as SupportConversation above.
+  customerReadAt DateTime?
+  storeReadAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  messages       StoreMessage[]
+
+  @@unique([storeId, customerId]) // one conversation per (store, customer) pair, matches frontend rule
+  @@map("store_conversations")
+}
+
+enum StoreSender {
+  CUSTOMER
+  STORE
+}
+
+model StoreMessage {
+  id             String            @id @default(uuid())
+  conversationId String
+  conversation   StoreConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  senderId       String
+  sender         User              @relation(fields: [senderId], references: [id])
+  from           StoreSender
+  body           String
+  createdAt      DateTime          @default(now())
+
+  @@index([conversationId])
+  @@map("store_messages")
+}
+
+// ──────────────────────────── Notifications ────────────────────────────
+
+enum NotificationScope {
+  ALL
+  ROLE
+  USER
+}
+
+model Notification {
+  id         String            @id @default(uuid())
+  icon       String?
+  text       String
+  actionUrl  String?
+  scope      NotificationScope @default(ALL)
+  targetRole RoleKey?
+  targetUserId String?
+  createdAt  DateTime          @default(now())
+
+  dismissals NotificationDismissal[]
+  reads      NotificationRead[]
+
+  @@index([scope])
+  @@map("notifications")
+}
+
+model NotificationDismissal {
+  id             String       @id @default(uuid())
+  notificationId String
+  notification   Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  dismissedAt    DateTime     @default(now())
+
+  @@unique([notificationId, userId])
+  @@map("notification_dismissals")
+}
+
+
+model NotificationRead {
+  id             String       @id @default(uuid())
+  notificationId String
+  notification   Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  readAt         DateTime     @default(now())
+
+  @@unique([notificationId, userId])
+  @@map("notification_reads")
+}
+
+// ──────────────────────────── Hero Slider ────────────────────────────
+
+
+model HeroSlide {
+  id                  String    @id @default(uuid())
+  title               String
+  subtitle            String?
+  description         String?
+  desktopImageUrl     String
+  mobileImageUrl      String?
+  primaryButtonText   String?
+  primaryButtonLink   String?
+  secondaryButtonText String?
+  secondaryButtonLink String?
+  displayOrder        Int       @default(0)
+  isActive            Boolean   @default(true)
+  // Where the text/button column sits over the image on the storefront;
+  // "right" matches the project's RTL default. Non-nullable with a DB-level
+  // default so existing rows (created before this field existed) read as
+  // "right" without a backfill step.
+  contentPosition     String    @default("right")
+  startAt             DateTime?
+  endAt               DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([isActive, displayOrder])
+  @@map("hero_slides")
+}
+
+// ──────────────────────────── Admin ────────────────────────────
+
+model AdminActivityLog {
+  id        String   @id @default(uuid())
+  actorId   String?
+  actor     User?    @relation(fields: [actorId], references: [id])
+  action    String
+  meta      Json?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@map("admin_activity_log")
+}

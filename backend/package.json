@@ -1,0 +1,48 @@
+{
+  "name": "jolfa-market-backend",
+  "version": "1.0.0",
+  "description": "Modular, secure, scalable REST API backend for Jolfa Market e-commerce marketplace",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "postinstall": "prisma generate",
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
+    "prisma:studio": "prisma studio",
+    "seed": "node prisma/seed.js",
+    "test": "jest --runInBand"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.19.1",
+    "bcryptjs": "^2.4.3",
+    "compression": "^1.7.4",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-async-errors": "^3.1.1",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "ms": "^2.0.0",
+    "multer": "^1.4.5-lts.1",
+    "socket.io": "^4.7.5",
+    "winston": "^3.13.1",
+    "winston-daily-rotate-file": "^5.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.1.4",
+    "prisma": "^5.19.1",
+    "socket.io-client": "^4.7.5",
+    "supertest": "^6.3.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

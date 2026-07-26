@@ -1,0 +1,32 @@
+# Node.js
+backend/node_modules/
+npm-debug.log*
+
+# Environment
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# Uploads
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# Logs
+*.log
+logs/
+backend/logs/
+
+# Coverage
+coverage/
+.nyc_output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating System
+.DS_Store
+Thumbs.db
