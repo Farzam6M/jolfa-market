@@ -2614,24 +2614,37 @@
           <button class="btn-auth" onclick="doLogin()">ورود به حساب کاربری</button>
         </div>
         <div id="registerForm" style="display:none;">
-          <div class="form-group"><label class="form-label">نام و نام خانوادگی</label><input type="text" class="form-input" id="regName" placeholder="نام کامل"></div>
-          <div class="form-group"><label class="form-label">شماره موبایل</label><input type="text" class="form-input" id="regMobile" placeholder="09123478659"></div>
-          <div class="form-group"><label class="form-label">رمز عبور</label>
-            <div class="password-field-wrap">
-              <input type="password" class="form-input" id="regPassword" placeholder="حداقل 8 کاراکتر" oninput="updatePasswordRequirements(this.value)">
-              <svg class="password-toggle-eye" viewBox="0 0 24 24" onclick="togglePasswordVisibility('regPassword', this)"><use href="#i-eye-off"/></svg>
+          <!-- مرحله ۱: نام/موبایل/رمز عبور — با تایید، OTP برای purpose=register ارسال می‌شود -->
+          <div id="registerStep1">
+            <div class="form-group"><label class="form-label">نام و نام خانوادگی</label><input type="text" class="form-input" id="regName" placeholder="نام کامل"></div>
+            <div class="form-group"><label class="form-label">شماره موبایل</label><input type="text" class="form-input" id="regMobile" placeholder="09123478659"></div>
+            <div class="form-group"><label class="form-label">رمز عبور</label>
+              <div class="password-field-wrap">
+                <input type="password" class="form-input" id="regPassword" placeholder="حداقل 8 کاراکتر" oninput="updatePasswordRequirements(this.value)">
+                <svg class="password-toggle-eye" viewBox="0 0 24 24" onclick="togglePasswordVisibility('regPassword', this)"><use href="#i-eye-off"/></svg>
+              </div>
+              <!-- رمز عبور باید شامل: دقیقاً همان قوانین strongPasswordSchema بک‌اند
+                   (auth.validation.js) — حداقل ۸ کاراکتر، حرف کوچک، حرف بزرگ، عدد.
+                   همیشه قابل مشاهده است (نه فقط بعد از خطای اعتبارسنجی). -->
+              <ul class="pw-req-box" id="regPasswordReqs">
+                <li class="pw-req" data-rule="len"><svg class="pw-req-ic" viewBox="0 0 24 24"><use href="#i-check"/></svg><span>حداقل ۸ کاراکتر</span></li>
+                <li class="pw-req" data-rule="upper"><svg class="pw-req-ic" viewBox="0 0 24 24"><use href="#i-check"/></svg><span>حداقل یک حرف بزرگ انگلیسی (A-Z)</span></li>
+                <li class="pw-req" data-rule="lower"><svg class="pw-req-ic" viewBox="0 0 24 24"><use href="#i-check"/></svg><span>حداقل یک حرف کوچک انگلیسی (a-z)</span></li>
+                <li class="pw-req" data-rule="num"><svg class="pw-req-ic" viewBox="0 0 24 24"><use href="#i-check"/></svg><span>حداقل یک عدد</span></li>
+              </ul>
             </div>
-            <!-- رمز عبور باید شامل: دقیقاً همان قوانین strongPasswordSchema بک‌اند
-                 (auth.validation.js) — حداقل ۸ کاراکتر، حرف کوچک، حرف بزرگ، عدد.
-                 همیشه قابل مشاهده است (نه فقط بعد از خطای اعتبارسنجی). -->
-            <ul class="pw-req-box" id="regPasswordReqs">
-              <li class="pw-req" data-rule="len"><svg class="pw-req-ic" viewBox="0 0 24 24"><use href="#i-check"/></svg><span>حداقل ۸ کاراکتر</span></li>
-              <li class="pw-req" data-rule="upper"><svg class="pw-req-ic" viewBox="0 0 24 24"><use href="#i-check"/></svg><span>حداقل یک حرف بزرگ انگلیسی (A-Z)</span></li>
-              <li class="pw-req" data-rule="lower"><svg class="pw-req-ic" viewBox="0 0 24 24"><use href="#i-check"/></svg><span>حداقل یک حرف کوچک انگلیسی (a-z)</span></li>
-              <li class="pw-req" data-rule="num"><svg class="pw-req-ic" viewBox="0 0 24 24"><use href="#i-check"/></svg><span>حداقل یک عدد</span></li>
-            </ul>
+            <button class="btn-auth" id="regStep1Btn" onclick="sendRegisterOtp()">ادامه</button>
           </div>
-          <button class="btn-auth" onclick="doRegister()">ثبت نام</button>
+          <!-- مرحله ۲: کد OTP ارسال‌شده به موبایل — با تایید، POST /auth/register با otpCode انجام می‌شود -->
+          <div id="registerStep2" style="display:none;">
+            <p style="font-size:12.5px;color:var(--gray-500);margin-bottom:16px;">کد تایید ارسال شده به <b id="regOtpMobileDisplay" style="color:var(--text);"></b> را وارد کنید</p>
+            <div class="form-group"><label class="form-label">کد تایید</label><input type="text" class="form-input" id="regOtpCode" placeholder="کد تایید را وارد کنید" maxlength="10"></div>
+            <button class="btn-auth" id="regStep2Btn" onclick="doRegister()">ثبت نام</button>
+            <div style="text-align:center;margin-top:16px;display:flex;justify-content:center;gap:6px;">
+              <span class="auth-back-link" id="regResendOtpBtn" onclick="resendRegisterOtp()">ارسال مجدد کد</span>
+              <span class="auth-back-link" onclick="cancelRegisterOtpStep()">ویرایش اطلاعات</span>
+            </div>
+          </div>
         </div>
 
         <!-- Forgot password: step 1 - enter mobile/email -->
@@ -4244,9 +4257,48 @@ function updatePasswordRequirements(password) {
   });
 }
 
-/* ── Registration: every new account is created as "customer" — there is
-      no role picker anywhere in the sign-up form. ── */
-async function doRegister() {
+/* ── Registration (OTP-backed, ۲ مرحله‌ای): مرحله ۱ نام/موبایل/رمز عبور را
+      می‌گیرد و از طریق POST /auth/otp/send (purpose=register) کد تایید
+      می‌فرستد؛ مرحله ۲ همان کد را می‌گیرد و POST /auth/register را با
+      otpCode کامل می‌کند. هر حساب جدید همچنان به‌صورت "customer" ساخته
+      می‌شود — هیچ role picker ای در فرم ثبت‌نام نیست. ── */
+
+/* نگهداری موقت اطلاعات مرحله ۱ (نام/موبایل/رمز عبور) تا زمان تایید OTP در
+   مرحله ۲ — فقط در حافظه (نه localStorage)؛ با موفقیت ثبت‌نام یا انصراف
+   از مرحله OTP پاک می‌شود. */
+let _pendingRegisterData = null;
+let _registerOtpTimerId = null;
+let _registerOtpCooldownEnd = 0;
+const REGISTER_OTP_RESEND_COOLDOWN_SEC = 60; // باید با env.otp.resendCooldownSec بک‌اند هم‌خوان باشد (پیش‌فرض ۶۰ ثانیه)
+
+/* شمارش‌معکوس دکمهٔ «ارسال مجدد کد»: تا پایان cooldown غیرفعال و با
+   شمارنده نمایش داده می‌شود، سپس به حالت قابل‌کلیک برمی‌گردد. */
+function _updateRegisterOtpResendUI() {
+  const btn = document.getElementById('regResendOtpBtn');
+  if (!btn) return;
+  const remaining = Math.ceil((_registerOtpCooldownEnd - Date.now()) / 1000);
+  if (remaining > 0) {
+    btn.textContent = 'ارسال مجدد کد (' + remaining + ')';
+    btn.style.opacity = '0.6';
+    btn.style.pointerEvents = 'none';
+  } else {
+    btn.textContent = 'ارسال مجدد کد';
+    btn.style.opacity = '';
+    btn.style.pointerEvents = '';
+    if (_registerOtpTimerId) { clearInterval(_registerOtpTimerId); _registerOtpTimerId = null; }
+  }
+}
+function _startRegisterOtpResendCooldown() {
+  if (_registerOtpTimerId) { clearInterval(_registerOtpTimerId); _registerOtpTimerId = null; }
+  _registerOtpCooldownEnd = Date.now() + REGISTER_OTP_RESEND_COOLDOWN_SEC * 1000;
+  _updateRegisterOtpResendUI();
+  _registerOtpTimerId = setInterval(_updateRegisterOtpResendUI, 1000);
+}
+
+/* مرحله ۱ → ارسال OTP: همان اعتبارسنجی سمت کلاینت قبلی (آینهٔ registerSchema
+   بک‌اند) حفظ شده؛ فقط به‌جای تماس مستقیم با /auth/register، ابتدا
+   /auth/otp/send با purpose=register صدا زده می‌شود. */
+async function sendRegisterOtp() {
   const nameEl = document.getElementById('regName');
   const mobileEl = document.getElementById('regMobile');
   const passEl = document.getElementById('regPassword');
@@ -4264,8 +4316,73 @@ async function doRegister() {
   if (!/[a-z]/.test(password)) { toast('رمز عبور باید حداقل شامل یک حرف کوچک انگلیسی باشد'); return; }
   if (!/[A-Z]/.test(password)) { toast('رمز عبور باید حداقل شامل یک حرف بزرگ انگلیسی باشد'); return; }
   if (!/[0-9]/.test(password)) { toast('رمز عبور باید حداقل شامل یک عدد باشد'); return; }
+
+  const btn = document.getElementById('regStep1Btn');
+  if (btn) btn.disabled = true;
   try {
-    await authApiFetch('/auth/register', { method: 'POST', body: { name, mobile, password }, skipAuth: true });
+    await authApiFetch('/auth/otp/send', { method: 'POST', body: { mobile, purpose: 'register' }, skipAuth: true });
+  } catch (err) {
+    const detailMsg = Array.isArray(err.details) && err.details.length
+      ? err.details.map(function(d) { return d.message; }).filter(Boolean).join(' — ')
+      : '';
+    toast(detailMsg || err.message || 'ارسال کد تایید ناموفق بود');
+    return;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+
+  _pendingRegisterData = { name, mobile, password };
+  const mobileDisplay = document.getElementById('regOtpMobileDisplay');
+  if (mobileDisplay) mobileDisplay.textContent = mobile;
+  const otpInput = document.getElementById('regOtpCode');
+  if (otpInput) otpInput.value = '';
+  document.getElementById('registerStep1').style.display = 'none';
+  document.getElementById('registerStep2').style.display = 'block';
+  _startRegisterOtpResendCooldown();
+  toast('کد تایید ارسال شد');
+}
+
+/* ارسال مجدد کد OTP برای همان موبایلِ مرحله ۱ — تا پایان cooldown دکمه
+   غیرفعال است (هم با pointer-events، هم با بررسی زیر به‌عنوان لایهٔ دوم). */
+async function resendRegisterOtp() {
+  if (Date.now() < _registerOtpCooldownEnd) return;
+  if (!_pendingRegisterData) { toast('لطفا ابتدا اطلاعات ثبت‌نام را کامل کنید'); cancelRegisterOtpStep(); return; }
+  try {
+    await authApiFetch('/auth/otp/send', { method: 'POST', body: { mobile: _pendingRegisterData.mobile, purpose: 'register' }, skipAuth: true });
+  } catch (err) {
+    const detailMsg = Array.isArray(err.details) && err.details.length
+      ? err.details.map(function(d) { return d.message; }).filter(Boolean).join(' — ')
+      : '';
+    toast(detailMsg || err.message || 'ارسال مجدد کد ناموفق بود');
+    return;
+  }
+  _startRegisterOtpResendCooldown();
+  toast('کد تایید مجدداً ارسال شد');
+}
+
+/* انصراف از مرحله OTP و بازگشت به مرحله ۱ برای ویرایش نام/موبایل/رمز عبور —
+   اطلاعات موقت پاک و تایمر cooldown متوقف می‌شود. */
+function cancelRegisterOtpStep() {
+  if (_registerOtpTimerId) { clearInterval(_registerOtpTimerId); _registerOtpTimerId = null; }
+  _registerOtpCooldownEnd = 0;
+  _pendingRegisterData = null;
+  const step2 = document.getElementById('registerStep2');
+  const step1 = document.getElementById('registerStep1');
+  if (step2) step2.style.display = 'none';
+  if (step1) step1.style.display = 'block';
+}
+
+/* مرحله ۲ → ثبت‌نام نهایی: کد OTP وارد‌شده به همراه اطلاعات نگه‌داشته‌شدهٔ
+   مرحله ۱ به POST /auth/register فرستاده می‌شود. */
+async function doRegister() {
+  if (!_pendingRegisterData) { toast('لطفا ابتدا اطلاعات ثبت‌نام را کامل کنید'); cancelRegisterOtpStep(); return; }
+  const otpEl = document.getElementById('regOtpCode');
+  const otpCode = otpEl ? otpEl.value.trim() : '';
+  if (!otpCode) { toast('لطفا کد تایید را وارد کنید'); return; }
+
+  const { name, mobile, password } = _pendingRegisterData;
+  try {
+    await authApiFetch('/auth/register', { method: 'POST', body: { name, mobile, password, otpCode }, skipAuth: true });
   } catch (err) {
     /* اگر بک‌اند جزئیات فیلدبه‌فیلد خطای اعتبارسنجی را برگردانده باشد
        (err.details از validate.middleware.js)، همان پیام دقیق را نشان بده؛
@@ -4277,11 +4394,17 @@ async function doRegister() {
     toast(detailMsg || err.message || 'ثبت‌نام ناموفق بود');
     return;
   }
+
+  if (_registerOtpTimerId) { clearInterval(_registerOtpTimerId); _registerOtpTimerId = null; }
+  _registerOtpCooldownEnd = 0;
+  _pendingRegisterData = null;
+
   /* رفتار ظاهری قبلی حفظ شده: ثبت‌نام auto-login نمی‌کند، فقط کاربر را به تب
      ورود می‌برد — با اینکه پاسخ /auth/register هم accessToken/refreshToken
      برمی‌گرداند، عمداً نادیده گرفته می‌شود تا UX دقیقاً همان قبلی بماند. */
   toast('ثبت نام با موفقیت انجام شد — اکنون وارد شوید');
   setTimeout(() => {
+    cancelRegisterOtpStep();
     const loginTab = document.querySelectorAll('#authTabsWrap .auth-tab')[0];
     if (loginTab) switchAuthTab(loginTab, 'login');
   }, 700);
