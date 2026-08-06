@@ -5,6 +5,8 @@ const service = require('./products.service');
 
 const list = asyncHandler(async (req, res) => res.json(new ApiResponse(await service.list(req.query, req.user))));
 const getById = asyncHandler(async (req, res) => res.json(new ApiResponse(await service.getById(req.params.id, req.user))));
+// GET /:productId/offers — productId is the GLOBAL Product id, not a StoreProduct id (see products.routes.js / products.service.js#getOffersByProduct).
+const getOffersByProduct = asyncHandler(async (req, res) => res.json(new ApiResponse(await service.getOffersByProduct(req.params.productId))));
 const create = asyncHandler(async (req, res) => res.status(201).json(new ApiResponse(await service.create(req.user.id, req.body, req.user), 'محصول برای بررسی ارسال شد')));
 const update = asyncHandler(async (req, res) => res.json(new ApiResponse(await service.update(req.params.id, req.user, req.body), 'محصول ویرایش شد و منتظر تایید مجدد است')));
 const remove = asyncHandler(async (req, res) => { await service.remove(req.params.id, req.user); res.json(new ApiResponse(null, 'محصول حذف شد')); });
@@ -35,5 +37,5 @@ const removeImage = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
-  list, getById, create, update, remove, moderate, moderateByStatusAlias, updateStock, toggleActive, addImage, removeImage,
+  list, getById, getOffersByProduct, create, update, remove, moderate, moderateByStatusAlias, updateStock, toggleActive, addImage, removeImage,
 };

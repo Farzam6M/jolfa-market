@@ -73,7 +73,7 @@ async function makeApprovedProduct(sellerAuth, adminAuth, categoryId, overrides 
   });
   const id = created.body.data.id;
   await api.patch(`${PREFIX}/products/${id}/moderate`).set('Authorization', adminAuth).send({ status: 'APPROVED' });
-  return prisma.product.findUnique({ where: { id } });
+  return prisma.storeProduct.findUnique({ where: { id } });
 }
 
 beforeAll(async () => {
@@ -135,6 +135,95 @@ describe('Cart', () => {
     expect(res.status).toBe(400);
     await api.delete(`${PREFIX}/cart`).set('Authorization', customer.auth);
   });
+
+  test('adding the same StoreProduct twice increments qty on one CartItem row, never creates a duplicate', async () => {
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: product.id, qty: 1 });
+    const res = await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: product.id, qty: 2 });
+    expect(res.status).toBe(200);
+    const rows = res.body.data.items.filter((it) => it.productId === product.id);
+    expect(rows.length).toBe(1); // single CartItem row for this cart+storeProduct pair
+    expect(rows[0].qty).toBe(3); // 1 + 2, not two separate lines
+
+    // Same invariant enforced at the DB level: @@unique([cartId, storeProductId]).
+    const cartRow = await prisma.cart.findUnique({ where: { userId: customer.user.id } });
+    const dbRows = await prisma.cartItem.findMany({ where: { cartId: cartRow.id, storeProductId: product.id } });
+    expect(dbRows.length).toBe(1);
+
+    await api.delete(`${PREFIX}/cart`).set('Authorization', customer.auth);
+  });
+
+  test('same Product, different stores: one store having zero stock does not block another store\'s offer', async () => {
+    const sellerB = await makeUser('SELLER', '50030000' + Math.floor(Math.random() * 9));
+    await makeApprovedStore(sellerB.user.id, 'فروشگاه دوم سبد خرید');
+
+    // Store A's offer, deliberately out of stock.
+    const outOfStock = await makeApprovedProduct(seller.auth, admin.auth, category.id, {
+      name: 'محصول مشترک چند فروشگاهی', price: 30000, stock: 0,
+    });
+    // Store B's offer of the SAME global Product (identical identity fields dedupe to one Product row).
+    const inStock = await makeApprovedProduct(sellerB.auth, admin.auth, category.id, {
+      name: 'محصول مشترک چند فروشگاهی', price: 35000, stock: 10,
+    });
+    expect(inStock.productId).toBe(outOfStock.productId); // same global Product...
+    expect(inStock.id).not.toBe(outOfStock.id); // ...different StoreProduct offers
+
+    const blocked = await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: outOfStock.id, qty: 1 });
+    expect(blocked.status).toBe(400); // Store A: zero stock
+
+    const allowed = await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: inStock.id, qty: 1 });
+    expect(allowed.status).toBe(200); // Store B: in stock, unaffected by Store A's stock level
+    expect(allowed.body.data.totals.subtotal).toBe(35000); // priced from Store B's StoreProduct, not Store A's
+
+    await api.delete(`${PREFIX}/cart`).set('Authorization', customer.auth);
+  });
+
+  test('an inactive StoreProduct cannot be added to the cart', async () => {
+    const inactive = await makeApprovedProduct(seller.auth, admin.auth, category.id, { name: 'محصول غیرفعال', price: 15000, stock: 5 });
+    await api.patch(`${PREFIX}/products/${inactive.id}/active`).set('Authorization', seller.auth).send({ isActive: false });
+
+    const res = await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: inactive.id, qty: 1 });
+    expect(res.status).toBe(404);
+  });
+
+  test('a StoreProduct belonging to a suspended store cannot be added to the cart', async () => {
+    const sellerC = await makeUser('SELLER', '50040000' + Math.floor(Math.random() * 9));
+    const storeC = await makeApprovedStore(sellerC.user.id, 'فروشگاه معلق');
+    const offer = await makeApprovedProduct(sellerC.auth, admin.auth, category.id, { name: 'محصول فروشگاه معلق', price: 15000, stock: 5 });
+
+    await prisma.store.update({ where: { id: storeC.id }, data: { status: 'SUSPENDED' } });
+
+    const res = await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: offer.id, qty: 1 });
+    expect(res.status).toBe(404);
+  });
+
+  test('a StoreProduct belonging to a soft-deleted seller cannot be added to the cart', async () => {
+    const sellerD = await makeUser('SELLER', '50050000' + Math.floor(Math.random() * 9));
+    await makeApprovedStore(sellerD.user.id, 'فروشگاه فروشنده حذف‌شده');
+    const offer = await makeApprovedProduct(sellerD.auth, admin.auth, category.id, { name: 'محصول فروشنده حذف‌شده', price: 15000, stock: 5 });
+
+    await prisma.user.update({ where: { id: sellerD.user.id }, data: { deletedAt: new Date() } });
+
+    const res = await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: offer.id, qty: 1 });
+    expect(res.status).toBe(404);
+  });
+
+  test('cart prices from the StoreProduct wholesale tier once qty crosses minQty, not the regular price', async () => {
+    const wholesale = await makeApprovedProduct(seller.auth, admin.auth, category.id, {
+      name: 'محصول عمده‌فروشی سبد خرید',
+      price: 10000,
+      stock: 100,
+      wholesaleTiers: [{ minQty: 5, price: 8000 }],
+    });
+
+    const below = await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: wholesale.id, qty: 2 });
+    expect(below.body.data.totals.subtotal).toBe(20000); // 2 * regular price (10000), tier not reached
+
+    const above = await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: wholesale.id, qty: 3 });
+    // total qty now 5 -> crosses minQty=5 -> whole line re-priced at the tier price (8000), not the client-suppliable regular price
+    expect(above.body.data.totals.subtotal).toBe(40000); // 5 * 8000
+
+    await api.delete(`${PREFIX}/cart`).set('Authorization', customer.auth);
+  });
 });
 
 describe('Checkout, order status machine, and visibility', () => {
@@ -164,7 +253,7 @@ describe('Checkout, order status machine, and visibility', () => {
     expect(Number(res.body.data.subtotal)).toBe(60000); // 2 * 30000, NOT the forged "1"
     expect(res.body.data.status).toBe('PENDING');
 
-    const stillStock = await prisma.product.findUnique({ where: { id: product.id } });
+    const stillStock = await prisma.storeProduct.findUnique({ where: { id: product.id } });
     expect(stillStock.stock).toBe(3); // 5 - 2, decremented atomically at checkout
   });
 
@@ -192,16 +281,16 @@ describe('Checkout, order status machine, and visibility', () => {
   });
 
   test('cancelling an order restocks its items', async () => {
-    const before = await prisma.product.findUnique({ where: { id: product.id } });
+    const before = await prisma.storeProduct.findUnique({ where: { id: product.id } });
     await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: product.id, qty: 1 });
     const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', customer.auth).send({});
-    const afterCheckout = await prisma.product.findUnique({ where: { id: product.id } });
+    const afterCheckout = await prisma.storeProduct.findUnique({ where: { id: product.id } });
     expect(afterCheckout.stock).toBe(before.stock - 1);
 
     const cancelled = await api.patch(`${PREFIX}/orders/${order.body.data.id}/status`).set('Authorization', admin.auth).send({ status: 'CANCELLED' });
     expect(cancelled.status).toBe(200);
 
-    const afterCancel = await prisma.product.findUnique({ where: { id: product.id } });
+    const afterCancel = await prisma.storeProduct.findUnique({ where: { id: product.id } });
     expect(afterCancel.stock).toBe(before.stock); // fully restored
   });
 
@@ -300,6 +389,184 @@ describe('Checkout, order status machine, and visibility', () => {
     const res = await api.get(`${PREFIX}/orders/${order.body.data.id}`).set('Authorization', otherCustomer.auth);
     expect(res.status).toBe(403);
   });
+
+  test('same Product sold by two different stores: checkout links each OrderItem to the correct StoreProduct/store and price', async () => {
+    const sellerA = await makeUser('SELLER', '51110000' + Math.floor(Math.random() * 9));
+    const sellerB = await makeUser('SELLER', '51120000' + Math.floor(Math.random() * 9));
+    const storeA = await makeApprovedStore(sellerA.user.id, 'فروشگاه چندفروشگاهی الف');
+    const storeB = await makeApprovedStore(sellerB.user.id, 'فروشگاه چندفروشگاهی ب');
+    const offerA = await makeApprovedProduct(sellerA.auth, admin.auth, category.id, { name: 'محصول مشترک سفارش', price: 25000, stock: 10 });
+    const offerB = await makeApprovedProduct(sellerB.auth, admin.auth, category.id, { name: 'محصول مشترک سفارش', price: 40000, stock: 10 });
+    expect(offerA.productId).toBe(offerB.productId); // same global Product...
+    expect(offerA.id).not.toBe(offerB.id); // ...two distinct store offers
+
+    const buyer = await makeUser('CUSTOMER', '51130000' + Math.floor(Math.random() * 9));
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', buyer.auth).send({ productId: offerA.id, qty: 2 });
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', buyer.auth).send({ productId: offerB.id, qty: 1 });
+
+    const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyer.auth).send({});
+    expect(order.status).toBe(201);
+    expect(Number(order.body.data.subtotal)).toBe(2 * 25000 + 40000);
+
+    const itemA = order.body.data.items.find((it) => it.storeProductId === offerA.id);
+    const itemB = order.body.data.items.find((it) => it.storeProductId === offerB.id);
+    expect(itemA).toBeDefined();
+    expect(itemB).toBeDefined();
+    expect(Number(itemA.priceSnapshot)).toBe(25000);
+    expect(Number(itemB.priceSnapshot)).toBe(40000);
+    expect(itemA.storeId).toBe(storeA.id);
+    expect(itemB.storeId).toBe(storeB.id);
+
+    const stockA = await prisma.storeProduct.findUnique({ where: { id: offerA.id } });
+    const stockB = await prisma.storeProduct.findUnique({ where: { id: offerB.id } });
+    expect(stockA.stock).toBe(8); // 10 - 2, only Store A's own stock touched
+    expect(stockB.stock).toBe(9); // 10 - 1, only Store B's own stock touched
+  });
+
+  test('a later price/discount/warranty/shippingTime change by the seller never alters an already-placed order', async () => {
+    const buyer = await makeUser('CUSTOMER', '51140000' + Math.floor(Math.random() * 9));
+    const offer = await makeApprovedProduct(seller.auth, admin.auth, category.id, {
+      name: 'محصول قیمت ثابت سفارش', price: 50000, stock: 10, discount: 10, warranty: '12 ماه', shippingTime: '3 روز',
+    });
+
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', buyer.auth).send({ productId: offer.id, qty: 1 });
+    const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyer.auth).send({});
+    expect(order.status).toBe(201);
+    const orderId = order.body.data.id;
+    expect(Number(order.body.data.subtotal)).toBe(50000);
+
+    // Seller changes every mutable commercial term after the sale.
+    const edit = await api.patch(`${PREFIX}/products/${offer.id}`).set('Authorization', seller.auth)
+      .send({
+        price: 99000, discount: 50, warranty: '1 ماه', shippingTime: '10 روز', compareAtPrice: 120000,
+      });
+    expect(edit.status).toBe(200);
+
+    // The order record itself (subtotal/total) never recomputes off live data.
+    const reread = await api.get(`${PREFIX}/orders/${orderId}`).set('Authorization', buyer.auth);
+    expect(reread.status).toBe(200);
+    expect(Number(reread.body.data.subtotal)).toBe(50000);
+    expect(Number(reread.body.data.total)).toBe(50000 + 45000);
+    const orderItem = reread.body.data.items[0];
+    expect(Number(orderItem.priceSnapshot)).toBe(50000); // untouched by the seller's later price change
+    expect(orderItem.nameSnapshot).toBe('محصول قیمت ثابت سفارش');
+    // The product view attached to order history must show identity only —
+    // never today's (now-changed) price/discount/warranty/shippingTime, which
+    // would otherwise make a supposedly-immutable order look different over time.
+    expect(orderItem.product.price).toBeUndefined();
+    expect(orderItem.product.discount).toBeUndefined();
+    expect(orderItem.product.warranty).toBeUndefined();
+    expect(orderItem.product.shippingTime).toBeUndefined();
+
+    // Same guarantee from the seller's own order list view.
+    const storeView = await api.get(`${PREFIX}/orders/store`).set('Authorization', seller.auth);
+    const sameOrder = storeView.body.data.items.find((o) => o.id === orderId);
+    const sellerSideItem = sameOrder.items.find((it) => it.storeProductId === offer.id);
+    expect(Number(sellerSideItem.priceSnapshot)).toBe(50000);
+    expect(sellerSideItem.product.price).toBeUndefined();
+    expect(sellerSideItem.product.discount).toBeUndefined();
+  });
+
+  test('checkout re-validates stock and rejects a cart item whose stock dropped below cart qty after it was added', async () => {
+    const buyer = await makeUser('CUSTOMER', '51150000' + Math.floor(Math.random() * 9));
+    const offer = await makeApprovedProduct(seller.auth, admin.auth, category.id, { name: 'محصول کاهش موجودی', price: 12000, stock: 3 });
+
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', buyer.auth).send({ productId: offer.id, qty: 3 });
+    // Stock drops (e.g. seller adjusts inventory) after the item is already sitting in the cart.
+    await api.patch(`${PREFIX}/products/${offer.id}/stock`).set('Authorization', seller.auth).send({ stock: 1 });
+
+    const res = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyer.auth).send({});
+    expect(res.status).toBe(400);
+
+    const after = await prisma.storeProduct.findUnique({ where: { id: offer.id } });
+    expect(after.stock).toBe(1); // untouched — a rejected checkout must not decrement stock
+    const cartAfter = await api.get(`${PREFIX}/cart`).set('Authorization', buyer.auth);
+    expect(cartAfter.body.data.items.length).toBe(1); // failed checkout must not have emptied the cart
+  });
+
+  test('checkout rejects a cart item whose offer became inactive after it was added to the cart', async () => {
+    const buyer = await makeUser('CUSTOMER', '51160000' + Math.floor(Math.random() * 9));
+    const offer = await makeApprovedProduct(seller.auth, admin.auth, category.id, { name: 'محصول غیرفعال‌شده بعد از افزودن', price: 12000, stock: 5 });
+
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', buyer.auth).send({ productId: offer.id, qty: 1 });
+    await api.patch(`${PREFIX}/products/${offer.id}/active`).set('Authorization', seller.auth).send({ isActive: false });
+
+    const res = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyer.auth).send({});
+    expect(res.status).toBe(400);
+    const stock = await prisma.storeProduct.findUnique({ where: { id: offer.id } });
+    expect(stock.stock).toBe(5); // never decremented
+  });
+
+  test('checkout rejects an order once the selling store is suspended, even though the item was added while the store was active', async () => {
+    const sellerX = await makeUser('SELLER', '51170000' + Math.floor(Math.random() * 9));
+    const storeX = await makeApprovedStore(sellerX.user.id, 'فروشگاه معلق‌شده هنگام تسویه');
+    const offer = await makeApprovedProduct(sellerX.auth, admin.auth, category.id, { name: 'محصول فروشگاه معلق‌شده', price: 12000, stock: 5 });
+    const buyer = await makeUser('CUSTOMER', '51180000' + Math.floor(Math.random() * 9));
+
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', buyer.auth).send({ productId: offer.id, qty: 1 });
+    await prisma.store.update({ where: { id: storeX.id }, data: { status: 'SUSPENDED' } });
+
+    const res = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyer.auth).send({});
+    expect(res.status).toBe(400);
+  });
+
+  test('an already-placed order stays fully readable after its seller is later soft-deleted, while a fresh checkout of that seller\'s offer is blocked', async () => {
+    const sellerY = await makeUser('SELLER', '51190000' + Math.floor(Math.random() * 9));
+    await makeApprovedStore(sellerY.user.id, 'فروشگاه فروشنده حذف‌شده سفارش');
+    const offer = await makeApprovedProduct(sellerY.auth, admin.auth, category.id, { name: 'محصول قبل از حذف فروشنده', price: 18000, stock: 5 });
+    const buyer = await makeUser('CUSTOMER', '51200000' + Math.floor(Math.random() * 9));
+
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', buyer.auth).send({ productId: offer.id, qty: 1 });
+    const placedOrder = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyer.auth).send({});
+    expect(placedOrder.status).toBe(201);
+
+    await prisma.user.update({ where: { id: sellerY.user.id }, data: { deletedAt: new Date() } });
+
+    // History remains fully accessible to the buyer.
+    const reread = await api.get(`${PREFIX}/orders/${placedOrder.body.data.id}`).set('Authorization', buyer.auth);
+    expect(reread.status).toBe(200);
+    expect(Number(reread.body.data.subtotal)).toBe(18000);
+
+    // A brand new attempt to buy the same (now-orphaned) offer is blocked at add-to-cart...
+    const blockedAdd = await api.post(`${PREFIX}/cart/items`).set('Authorization', buyer.auth).send({ productId: offer.id, qty: 1 });
+    expect(blockedAdd.status).toBe(404);
+  });
+
+  test('a StoreProduct that already has order history can never be hard-deleted, protecting order integrity', async () => {
+    const sellerZ = await makeUser('SELLER', '51210000' + Math.floor(Math.random() * 9));
+    await makeApprovedStore(sellerZ.user.id, 'فروشگاه محافظت از سابقه');
+    const offer = await makeApprovedProduct(sellerZ.auth, admin.auth, category.id, { name: 'محصول دارای سابقه سفارش', price: 22000, stock: 5 });
+    const buyer = await makeUser('CUSTOMER', '51220000' + Math.floor(Math.random() * 9));
+
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', buyer.auth).send({ productId: offer.id, qty: 1 });
+    await api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyer.auth).send({});
+
+    const del = await api.delete(`${PREFIX}/products/${offer.id}`).set('Authorization', sellerZ.auth);
+    expect(del.status).toBe(409); // blocked precisely because order history references it
+    const stillThere = await prisma.storeProduct.findUnique({ where: { id: offer.id } });
+    expect(stillThere).not.toBeNull();
+  });
+
+  test('two simultaneous checkouts for the last unit of stock: exactly one succeeds, the other is rejected, stock never goes negative', async () => {
+    const sellerRace = await makeUser('SELLER', '51230000' + Math.floor(Math.random() * 9));
+    await makeApprovedStore(sellerRace.user.id, 'فروشگاه رقابت همزمان');
+    const offer = await makeApprovedProduct(sellerRace.auth, admin.auth, category.id, { name: 'محصول کمیاب همزمان', price: 9000, stock: 1 });
+
+    const buyer1 = await makeUser('CUSTOMER', '51240000' + Math.floor(Math.random() * 9));
+    const buyer2 = await makeUser('CUSTOMER', '51250000' + Math.floor(Math.random() * 9));
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', buyer1.auth).send({ productId: offer.id, qty: 1 });
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', buyer2.auth).send({ productId: offer.id, qty: 1 });
+
+    const [res1, res2] = await Promise.all([
+      api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyer1.auth).send({}),
+      api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyer2.auth).send({}),
+    ]);
+    const statuses = [res1.status, res2.status].sort();
+    expect(statuses).toEqual([201, 400]); // exactly one winner, one loser — never both succeeding
+
+    const finalStock = await prisma.storeProduct.findUnique({ where: { id: offer.id } });
+    expect(finalStock.stock).toBe(0); // never went negative, never stayed at 1 (the winning purchase did decrement it)
+  });
 });
 
 describe('Payments', () => {
@@ -396,6 +663,146 @@ describe('Payments', () => {
 
     const stillOrder = await prisma.order.findUnique({ where: { id: order.body.data.id } });
     expect(stillOrder.status).toBe('PENDING');
+  });
+
+  test('a failed gateway callback marks the payment FAILED and leaves the order PENDING (retryable)', async () => {
+    const product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 15000, stock: 5 });
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: product.id, qty: 1 });
+    const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', customer.auth).send({});
+    const gwPay = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
+      .send({ orderId: order.body.data.id, method: 'GATEWAY' });
+
+    const body = { transactionRef: gwPay.body.data.transactionRef, success: false };
+    const { signature } = signGatewayPayload(body);
+    const callback = await api.post(`${PREFIX}/payments/gateway/callback`)
+      .set('x-gateway-signature', signature)
+      .send(body);
+    expect(callback.status).toBe(200);
+
+    const payment = await prisma.payment.findUnique({ where: { id: gwPay.body.data.id } });
+    expect(payment.status).toBe('FAILED');
+    const stillOrder = await prisma.order.findUnique({ where: { id: order.body.data.id } });
+    expect(stillOrder.status).toBe('PENDING'); // not CONFIRMED, not stuck — customer can still retry payment
+
+    // The order is still PENDING, so a second, different-method payment attempt succeeds.
+    const retry = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
+      .send({ orderId: order.body.data.id, method: 'CASH_ON_DELIVERY' });
+    expect(retry.status).toBe(201);
+  });
+
+  test('a duplicate/replayed gateway callback is a safe no-op, not a second state flip', async () => {
+    const product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 15000, stock: 5 });
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: product.id, qty: 1 });
+    const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', customer.auth).send({});
+    const gwPay = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
+      .send({ orderId: order.body.data.id, method: 'GATEWAY' });
+
+    const body = { transactionRef: gwPay.body.data.transactionRef, success: true };
+    const { signature } = signGatewayPayload(body);
+
+    const first = await api.post(`${PREFIX}/payments/gateway/callback`).set('x-gateway-signature', signature).send(body);
+    expect(first.status).toBe(200);
+    const afterFirst = await prisma.payment.findUnique({ where: { id: gwPay.body.data.id } });
+
+    // Gateways commonly redeliver the same webhook; replaying the identical,
+    // validly-signed payload must not re-run the settlement side effects.
+    const second = await api.post(`${PREFIX}/payments/gateway/callback`).set('x-gateway-signature', signature).send(body);
+    expect(second.status).toBe(200);
+    const afterSecond = await prisma.payment.findUnique({ where: { id: gwPay.body.data.id } });
+
+    expect(afterSecond.status).toBe('SUCCESS');
+    expect(afterSecond.paidAt.getTime()).toBe(afterFirst.paidAt.getTime()); // untouched by the replay
+    const onlyOnePayment = await prisma.payment.count({ where: { orderId: order.body.data.id } });
+    expect(onlyOnePayment).toBe(1); // no duplicate payment record was created
+  });
+
+  test('a gateway callback for an unknown transactionRef is rejected', async () => {
+    const body = { transactionRef: 'this-ref-was-never-issued', success: true };
+    const { signature } = signGatewayPayload(body);
+    const res = await api.post(`${PREFIX}/payments/gateway/callback`).set('x-gateway-signature', signature).send(body);
+    expect(res.status).toBe(404);
+  });
+
+  test('a gateway callback cannot smuggle a client-chosen amount — the schema has no amount field to strip into', async () => {
+    const product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 15000, stock: 5 });
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: product.id, qty: 1 });
+    const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', customer.auth).send({});
+    const gwPay = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
+      .send({ orderId: order.body.data.id, method: 'GATEWAY' });
+
+    const body = { transactionRef: gwPay.body.data.transactionRef, success: true, amount: 1 };
+    const { signature } = signGatewayPayload(body); // signed over the raw body including the bogus "amount"
+    const callback = await api.post(`${PREFIX}/payments/gateway/callback`).set('x-gateway-signature', signature).send(body);
+    expect(callback.status).toBe(200);
+
+    const payment = await prisma.payment.findUnique({ where: { id: gwPay.body.data.id } });
+    expect(Number(payment.amount)).toBe(15000); // unchanged — amount was fixed at initGatewayPayment(order), never taken from the callback
+  });
+
+  test('cannot pay an order that is already paid/confirmed', async () => {
+    const product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 15000, stock: 5 });
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: product.id, qty: 1 });
+    const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', customer.auth).send({});
+    await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
+      .send({ orderId: order.body.data.id, method: 'CASH_ON_DELIVERY' });
+
+    const again = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
+      .send({ orderId: order.body.data.id, method: 'CASH_ON_DELIVERY' });
+    expect(again.status).toBe(409);
+
+    const viaGateway = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
+      .send({ orderId: order.body.data.id, method: 'GATEWAY' });
+    expect(viaGateway.status).toBe(409);
+  });
+
+  test('two gateway payment attempts for the same order never share a transactionRef', async () => {
+    const product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 15000, stock: 5 });
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: product.id, qty: 1 });
+    const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', customer.auth).send({});
+
+    // Order stays PENDING after a GATEWAY init (unlike WALLET/COD), so a
+    // second attempt is possible if the first session was abandoned.
+    const first = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
+      .send({ orderId: order.body.data.id, method: 'GATEWAY' });
+    const second = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
+      .send({ orderId: order.body.data.id, method: 'GATEWAY' });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(201);
+    expect(first.body.data.transactionRef).not.toBe(second.body.data.transactionRef);
+
+    // Settling the second attempt must only ever touch that attempt's row.
+    const body = { transactionRef: second.body.data.transactionRef, success: true };
+    const { signature } = signGatewayPayload(body);
+    await api.post(`${PREFIX}/payments/gateway/callback`).set('x-gateway-signature', signature).send(body);
+
+    const firstPayment = await prisma.payment.findUnique({ where: { id: first.body.data.id } });
+    const secondPayment = await prisma.payment.findUnique({ where: { id: second.body.data.id } });
+    expect(firstPayment.status).toBe('PENDING');
+    expect(secondPayment.status).toBe('SUCCESS');
+  });
+
+  test('a late gateway callback cannot resurrect an order that was cancelled in the meantime', async () => {
+    const product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 15000, stock: 5 });
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: product.id, qty: 1 });
+    const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', customer.auth).send({});
+    const gwPay = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
+      .send({ orderId: order.body.data.id, method: 'GATEWAY' });
+
+    // Admin cancels the abandoned order (restocking it) before the gateway's callback arrives.
+    const cancel = await api.patch(`${PREFIX}/orders/${order.body.data.id}/status`).set('Authorization', admin.auth)
+      .send({ status: 'CANCELLED' });
+    expect(cancel.status).toBe(200);
+
+    const body = { transactionRef: gwPay.body.data.transactionRef, success: true };
+    const { signature } = signGatewayPayload(body);
+    const callback = await api.post(`${PREFIX}/payments/gateway/callback`).set('x-gateway-signature', signature).send(body);
+    expect(callback.status).toBe(200); // the callback itself is still accepted...
+
+    const payment = await prisma.payment.findUnique({ where: { id: gwPay.body.data.id } });
+    expect(payment.status).toBe('SUCCESS'); // ...the charge is still recorded as captured...
+    const stillCancelled = await prisma.order.findUnique({ where: { id: order.body.data.id } });
+    expect(stillCancelled.status).toBe('CANCELLED'); // ...but it never got resurrected out of its terminal state
   });
 
   test('checkout rejects an addressId that does not belong to the checking-out customer (IDOR guard)', async () => {

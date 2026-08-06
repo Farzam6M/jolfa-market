@@ -7,11 +7,18 @@ const { PERMISSIONS } = require('../roles/permissions.constants');
 const service = require('./products.service');
 const upload = require('../../middlewares/upload.middleware');
 const {
-  createSchema, updateSchema, moderateSchema, statusAliasSchema, listQuerySchema, stockSchema, activeSchema, addImageSchema,
+  createSchema, updateSchema, moderateSchema, statusAliasSchema, listQuerySchema, stockSchema, activeSchema, addImageSchema, productIdParamSchema,
 } = require('./products.validation');
 
 router.get('/', optionalAuthenticate, validate({ query: listQuerySchema }), controller.list); // public
 router.get('/:id', optionalAuthenticate, controller.getById); // public
+
+// Multi-vendor product detail: :productId is the GLOBAL Product id (NOT a
+// StoreProduct id like every other :id above/below) — one global Product +
+// every store's live offer for it, cheapest first. Deliberately a separate
+// route rather than a change to GET /:id above, which stays exactly as-is
+// for the admin panel's existing flat-StoreProduct consumers.
+router.get('/:productId/offers', validate({ params: productIdParamSchema }), controller.getOffersByProduct); // public
 
 // A staff member (PRODUCTS_MODERATE, e.g. admin/super_admin) can also create a
 // product directly — see products.service#create for the storeId handling.

@@ -28,5 +28,10 @@ router.get('/:id', requirePermission(PERMISSIONS.USERS_READ_ANY), controller.get
 // Admin-only: edit any user's profile fields (was previously unwired dead permission). Status changes stay on /:id/status.
 router.patch('/:id', requirePermission(PERMISSIONS.USERS_UPDATE_ANY), validate({ body: updateSelfSchema }), controller.updateAny);
 router.patch('/:id/status', requirePermission(PERMISSIONS.USERS_BAN), validate({ body: updateStatusSchema }), controller.updateStatus);
+// General "Delete User" (soft delete, any role) — admin/super_admin only.
+// Finer-grained hierarchy (admin can't delete another admin/super_admin) is
+// enforced in users.service.js#deleteUser, not here — this permission just
+// gates the endpoint to staff.
+router.delete('/:id', requirePermission(PERMISSIONS.USERS_DELETE), controller.deleteUser);
 
 module.exports = router;

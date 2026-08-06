@@ -1,5 +1,7 @@
+const crypto = require('crypto');
 const { prisma } = require('../../config/database');
 const ApiError = require('../../utils/ApiError');
+const logger = require('../../utils/logger');
 const { pushNotification } = require('../notifications/notifications.service');
 
 async function payWithWallet(order, userId) {
@@ -34,11 +36,19 @@ async function payWithWallet(order, userId) {
  * GATEWAY payments are created PENDING and settled by `confirmGateway`
  * (the real payment-gateway callback) — never marked SUCCESS synchronously,
  * since the actual charge happens on the gateway's side.
+ *
+ * The placeholder ref is randomized per attempt (not just derived from
+ * orderNumber) so that retrying a failed/abandoned gateway session for the
+ * same order can never produce two PENDING payments with the *same* ref —
+ * that collision previously meant confirmGateway's lookup-by-transactionRef
+ * could settle the wrong attempt, silently losing a real successful charge.
+ * Swap this for whatever ref the actual gateway's session-creation call
+ * returns once a provider is wired in; the uniqueness requirement stays.
  */
 async function initGatewayPayment(order) {
   return prisma.payment.create({
     data: {
-      orderId: order.id, method: 'GATEWAY', amount: order.total, status: 'PENDING', transactionRef: `PENDING-${order.orderNumber}`,
+      orderId: order.id, method: 'GATEWAY', amount: order.total, status: 'PENDING', transactionRef: `PENDING-${order.orderNumber}-${crypto.randomBytes(8).toString('hex')}`,
     },
   });
 }
@@ -100,7 +110,21 @@ async function confirmGateway(transactionRef, success) {
 
   const order = await prisma.order.findUnique({ where: { id: payment.orderId } });
   if (success) {
-    await prisma.order.update({ where: { id: payment.orderId }, data: { status: 'CONFIRMED' } });
+    // Conditional, not unconditional: an order can leave PENDING for reasons
+    // that have nothing to do with this payment (most importantly, an admin
+    // cancelling an abandoned order, which restocks it — see
+    // orders.service.js updateStatus). A gateway callback can arrive late or
+    // be redelivered well after that happens. Blindly setting status:
+    // 'CONFIRMED' here would resurrect a CANCELLED order — reversing the
+    // ORDER_TRANSITIONS state machine's rule that CANCELLED is terminal —
+    // while the stock it freed stays sold. The payment itself is still
+    // marked SUCCESS above (money was genuinely captured), it just no
+    // longer auto-confirms an order that has moved on; that needs manual
+    // reconciliation/refund, not a silent state-machine violation.
+    const claim = await prisma.order.updateMany({ where: { id: payment.orderId, status: 'PENDING' }, data: { status: 'CONFIRMED' } });
+    if (claim.count === 0) {
+      logger.error(`Gateway payment ${payment.id} succeeded for order ${order.orderNumber} but the order is no longer PENDING (now ${order.status}) — order left as-is, needs manual reconciliation`);
+    }
     await pushNotification({ icon: 'i-wallet', text: `پرداخت سفارش ${order.orderNumber} با موفقیت انجام شد`, scope: 'USER', targetUserId: order.userId });
   } else {
     await pushNotification({ icon: 'i-wallet', text: `پرداخت سفارش ${order.orderNumber} ناموفق بود`, scope: 'USER', targetUserId: order.userId });

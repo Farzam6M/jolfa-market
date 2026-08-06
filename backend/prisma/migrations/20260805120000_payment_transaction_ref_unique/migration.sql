@@ -1,0 +1,12 @@
+-- Adds the unique constraint on payments.transactionRef required by
+-- schema.prisma (`transactionRef String? @unique` on model Payment).
+--
+-- The "payments" table was created in 20260716222658_init with
+-- "transactionRef" as a plain nullable TEXT column and no uniqueness
+-- constraint. No later migration in this project ever added one, so the
+-- database has been out of sync with schema.prisma since the @unique
+-- attribute was introduced. This recreates that missing constraint.
+--
+-- Postgres unique indexes allow unlimited NULLs, so this does not affect
+-- WALLET / CASH_ON_DELIVERY payments, which store no transactionRef.
+CREATE UNIQUE INDEX "payments_transactionRef_key" ON "payments"("transactionRef");

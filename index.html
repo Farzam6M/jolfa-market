@@ -1152,12 +1152,20 @@
         <div class="brand-tag" id="pdBrandTag">برند</div>
         <h1 id="pdName">نام محصول</h1>
         <div class="stars-row" id="pdStarsRow" style="margin-bottom:6px;"></div>
-        <div class="price-compare">
+        <div class="price-compare" id="pdSingleOfferSection">
           <h3>قیمت و موجودی</h3>
           <div class="price-row">
             <div class="shop-n"><svg viewBox="0 0 24 24" width="14" height="14" style="stroke:var(--gray-400);fill:none;stroke-width:2;"><use href="#i-store"/></svg><span id="pdShopName">فروشگاه</span></div>
             <div style="display:flex;align-items:center;gap:8px;"><span class="price-n" id="pdPrice">0 تومان</span><span class="avail avail-yes">موجود</span></div>
           </div>
+        </div>
+        <!-- چند-فروشنده (GET /products/:productId/offers): وقتی کارت محصول data-product-id
+             واقعی دارد، این بخش جای پدیدهٔ single-offer بالا را می‌گیرد و همه‌ی فروشندگان
+             را ارزان‌ترین اول نشان می‌دهد؛ برای کارت‌های نمایشی/دمو (بدون productId واقعی)
+             دست‌نخورده و مخفی می‌ماند و همان بخش single-offer بالا مثل قبل کار می‌کند. -->
+        <div class="price-compare" id="pdOffersSection" style="display:none;">
+          <h3>فروشندگان</h3>
+          <div id="pdOffersList"></div>
         </div>
         <button class="btn-cart" id="pdAddToCartBtn" onclick="addProductDetailToCart()"><svg viewBox="0 0 24 24"><use href="#i-cart"/></svg> افزودن به سبد خرید</button>
         <button class="btn-wish" id="pdWishBtn" onclick="event.stopPropagation();toggleFav(this)"><svg viewBox="0 0 24 24"><use href="#i-heart"/></svg><span id="pdWishBtnLabel"> افزودن به علاقه‌مندی‌ها</span></button>
@@ -3986,17 +3994,38 @@ function invalidateMySellerApplicationCache() { _mySellerAppFetched = false; _my
 function fmtPriceFa(price) {
   return Number(price || 0).toLocaleString('fa-IR-u-nu-latn');
 }
-function buildProductCardHtml(product) {
+function buildProductCardHtml(product, opts) {
+  opts = opts || {};
   const localCat = (product.category && API_TO_LOCAL_CATEGORY_SLUG[product.category.slug]) || '';
   const img = (product.images && product.images[0] && product.images[0].url) || '';
   const storeName = (product.store && product.store.name) || '';
   const inStockLabel = product.stock > 0 ? 'موجود' : 'ناموجود';
   const likedCls = isProductWishlisted(product.id) ? ' liked' : '';
-  return `<div class="product-card" data-shop="${escapeHtml(product.store ? product.store.slug : '')}" data-cat="${escapeHtml(localCat)}" data-id="${escapeHtml(product.id)}" data-brand="${escapeHtml((product.brand || '').toLowerCase())}">
+  /* Offer-count badge ("Available in X stores" / از X فروشگاه — همان عبارت
+     فارسی که پیش‌تر در کارت‌های دمو/استاتیک این پروژه استفاده می‌شد، ر.ک.
+     مثال‌های <div class="product-shops">از 3 فروشگاه</div> در index.html).
+     opts.showOfferCount فقط توسط صفحه‌ی محصولات (renderProductsPageFromApi)
+     و صفحه‌ی اصلی (renderHomeProductsFromApi) true پاس داده می‌شود — صفحه‌ی
+     فروشگاه (renderStorefront) همچنان buildProductCardHtml(product) را
+     بدون این گزینه صدا می‌زند، پس این نشان هرگز آنجا ظاهر نمی‌شود (فاز
+     Storefront دست‌نخورده می‌ماند). product.offerCount هم فقط روی پاسخ
+     عمومی/دیدوپلیکیت‌شدهٔ GET /products ست شده (products.service.js —
+     buildProductLevelPage)؛ یک فروشگاه (offerCount==1) هیچ نشانی نمی‌گیرد. */
+  const offerCount = Number(product.offerCount) || 0;
+  const offerCountHtml = (opts.showOfferCount && offerCount > 1)
+    ? `<div class="product-offer-count">از ${offerCount.toLocaleString('fa-IR-u-nu-latn')} فروشگاه</div>`
+    : '';
+  /* data-id = StoreProduct id (کارت همیشه یک offer مشخص را نمایش می‌دهد؛
+     سبد خرید/علاقه‌مندی‌ها دقیقاً به همین شناسه نیاز دارند — دست‌نخورده
+     ماند). data-product-id = شناسه‌ی سراسری Product (از flattenStoreProduct
+     در بک‌اند، فیلد productId — بدون هیچ تغییر بک‌اند از قبل موجود بود)،
+     فقط برای صفحه‌ی جزئیات محصول لازم است تا GET /products/:productId/offers
+     زده شود و همه‌ی فروشندگان این محصول نمایش داده شوند. */
+  return `<div class="product-card" data-shop="${escapeHtml(product.store ? product.store.slug : '')}" data-cat="${escapeHtml(localCat)}" data-id="${escapeHtml(product.id)}" data-product-id="${escapeHtml(product.productId || product.id)}" data-brand="${escapeHtml((product.brand || '').toLowerCase())}">
     <div class="product-img" style="background:#f4f4f8;">${img ? `<img src="${escapeHtml(img)}" alt="" style="width:100%;height:100%;object-fit:cover;">` : `<svg viewBox="0 0 24 24" width="52" height="52" style="stroke:var(--primary);fill:none;stroke-width:1.6;"><use href="#i-box"/></svg>`}
       <div class="product-fav${likedCls}" onclick="event.stopPropagation();toggleFav(this)"><svg viewBox="0 0 24 24"><use href="#i-heart"/></svg></div>
     </div>
-    <div class="product-info"><div class="product-brand">${escapeHtml(product.brand || storeName)}</div><div class="product-name">${escapeHtml(product.name)}</div><div class="product-price">${fmtPriceFa(product.price)} <span>تومان</span></div><div class="product-shops">${escapeHtml(storeName || inStockLabel)}</div>
+    <div class="product-info"><div class="product-brand">${escapeHtml(product.brand || storeName)}</div><div class="product-name">${escapeHtml(product.name)}</div><div class="product-price">${fmtPriceFa(product.price)} <span>تومان</span></div><div class="product-shops">${escapeHtml(storeName || inStockLabel)}</div>${offerCountHtml}
       <div class="stars-row"><span class="stars">★★★★★</span><span class="rating-num">۰</span></div>
     </div>
   </div>`;
@@ -4016,6 +4045,22 @@ async function fetchApiProducts(force) {
   const data = await authApiFetch('/products?pageSize=100', { method: 'GET', skipAuth: true });
   _productsCache = (data && data.items) || [];
   return _productsCache;
+}
+/** GET /products?storeId=... — used ONLY by the storefront (renderStorefront), never
+    by the public catalogue/home/search paths above. Unlike fetchApiProducts() (no
+    storeId), this hits products.service.js#list with a storeId already in `where`
+    BEFORE the public-catalogue de-dup (buildProductLevelPage) runs its
+    distinct(['productId']) — so the de-dup collapses only within this one store's
+    own rows (which are already unique per product via the DB's
+    @@unique([storeId, productId])) instead of collapsing across every store's
+    offers for the same product. That's what makes this safe to use for "show every
+    StoreProduct this store has", where fetchApiProducts()/the public catalogue
+    cache is not: a store that isn't the cheapest seller of a shared product is
+    invisible in the deduplicated public list, but shows up here. No backend change
+    needed — storeId was already an accepted query param (products.validation.js). */
+async function fetchApiProductsByStoreId(storeId) {
+  const data = await authApiFetch('/products?storeId=' + encodeURIComponent(storeId) + '&pageSize=100', { method: 'GET', skipAuth: true });
+  return (data && data.items) || [];
 }
 async function fetchApiProductById(id) {
   return authApiFetch('/products/' + encodeURIComponent(id), { method: 'GET', skipAuth: true });
@@ -4052,7 +4097,7 @@ async function renderProductsPageFromApi() {
       const grid = sec.querySelector('.products-grid');
       if (!grid) return;
       const items = byLocalCat[cat] || [];
-      grid.innerHTML = items.length ? items.map(buildProductCardHtml).join('')
+      grid.innerHTML = items.length ? items.map(p => buildProductCardHtml(p, { showOfferCount: true })).join('')
         : '<div style="grid-column:1/-1;padding:20px;text-align:center;color:var(--gray-400);font-size:13px;">هنوز محصول تاییدشده‌ای در این دسته ثبت نشده است</div>';
     });
     /* کارت‌های تازه از innerHTML جایگزین شدند، پس دکمه «افزودن به سبد خرید»
@@ -4092,7 +4137,7 @@ async function renderHomeProductsFromApi() {
     const [products] = await Promise.all([fetchApiProducts(), fetchWishlistFromApi()]);
     if (featuredGrid) {
       const featured = products.slice(0, 6);
-      featuredGrid.innerHTML = featured.length ? featured.map(buildProductCardHtml).join('') : emptyMsg;
+      featuredGrid.innerHTML = featured.length ? featured.map(p => buildProductCardHtml(p, { showOfferCount: true })).join('') : emptyMsg;
     }
     const byLocalCat = {};
     products.forEach(p => {
@@ -4102,7 +4147,7 @@ async function renderHomeProductsFromApi() {
     catGrids.forEach(grid => {
       const cat = grid.getAttribute('data-cat');
       const items = (byLocalCat[cat] || []).slice(0, 2);
-      grid.innerHTML = items.length ? items.map(buildProductCardHtml).join('') : emptyMsg;
+      grid.innerHTML = items.length ? items.map(p => buildProductCardHtml(p, { showOfferCount: true })).join('') : emptyMsg;
     });
     /* کارت‌های تازه از innerHTML جایگزین شدند، پس دکمه «افزودن به سبد خرید»
        باید دوباره روی آن‌ها تزریق شود — دقیقاً همان کاری که
@@ -5294,26 +5339,55 @@ async function renderAdminUsersTab(force) {
   if (!users.length) { tbody.innerHTML = '<tr><td colspan="6">کاربری یافت نشد</td></tr>'; return; }
   tbody.innerHTML = users.map(u => {
     const initials = (u.name || '').trim().split(/\s+/).map(p => p[0]).filter(Boolean).slice(0, 2).join('.');
-    /* بک‌اند فقط ACTIVE/SUSPENDED/BANNED را قبول می‌کند (ر.ک. users.validation.js)؛
-       مقدار قدیمی BLOCKED هرگز از سرور نمی‌آید و نباید اینجا هم تولید شود. */
+    /* بک‌اند ACTIVE/SUSPENDED/BANNED/DELETED را قبول می‌کند (ر.ک. users.validation.js
+       برای PATCH /:id/status که همچنان فقط سه‌تای اول را می‌پذیرد، و
+       users.service.js#deleteUser که تنها راه رسیدن به DELETED است)؛ مقدار
+       قدیمی BLOCKED هرگز از سرور نمی‌آید و نباید اینجا هم تولید شود. */
     const userStatus = String(u.status || (u.active === false ? 'SUSPENDED' : 'ACTIVE')).toUpperCase();
-    const isBlocked = userStatus === 'SUSPENDED' || userStatus === 'BANNED';
+    const isDeleted = userStatus === 'DELETED';
+    const isBlocked = !isDeleted && (userStatus === 'SUSPENDED' || userStatus === 'BANNED');
     const joinDate = u.createdAt ? new Date(u.createdAt).toLocaleDateString('fa-IR') : '—';
     const orders = typeof u.ordersCount === 'number' ? u.ordersCount.toLocaleString('fa-IR-u-nu-latn') : '—';
+    const statusLabel = isDeleted ? 'حذف شده' : (isBlocked ? 'مسدود' : 'فعال');
+    const statusBg = isDeleted ? '#F3F4F6' : (isBlocked ? '#FEE2E2' : '#DCFCE7');
+    const statusColor = isDeleted ? '#6B7280' : (isBlocked ? '#B91C1C' : '#15803D');
+    /* یک کاربر حذف‌شده دیگر نه قابل مسدود/فعال‌سازی است (بک‌اند این را با 409
+       رد می‌کند — ر.ک. updateStatus()) و نه قابل حذف مجدد — پس هیچ دکمه‌ای
+       برایش رندر نمی‌شود، فقط تگ وضعیت. */
+    const actionsHtml = isDeleted ? '' : `
+      <svg class="row-action-ic" viewBox="0 0 24 24" width="16" height="16" style="stroke:var(--gray-400);" onclick="toggleAdminUserStatus('${escJsAttr(u.id)}')" title="مسدود / فعال‌سازی کاربر"><use href="#i-cog"/></svg>${canDeleteUserRow(u) ? `<svg class="row-action-ic" viewBox="0 0 24 24" width="16" height="16" style="stroke:var(--red);margin-right:12px;" onclick="apOpenDeleteUser('${escJsAttr(u.id)}')" title="حذف کاربر"><use href="#i-trash"/></svg>` : ''}`;
     return `<tr data-user-id="${escapeHtml(u.id)}">
       <td><span class="table-avatar">${escapeHtml(initials)}</span>${escapeHtml(u.name || '—')}</td>
       <td>${escapeHtml(u.mobile || '—')}</td>
       <td>${joinDate}</td>
       <td>${orders}</td>
-      <td><span class="tag-status" style="background:${isBlocked ? '#FEE2E2' : '#DCFCE7'};color:${isBlocked ? '#B91C1C' : '#15803D'};">${isBlocked ? 'مسدود' : 'فعال'}</span></td>
-      <td><svg class="row-action-ic" viewBox="0 0 24 24" width="16" height="16" style="stroke:var(--gray-400);" onclick="toggleAdminUserStatus('${escapeHtml(u.id)}')" title="مسدود / فعال‌سازی کاربر"><use href="#i-cog"/></svg></td>
+      <td><span class="tag-status" style="background:${statusBg};color:${statusColor};">${statusLabel}</span></td>
+      <td>${actionsHtml}</td>
     </tr>`;
   }).join('');
+}
+/* «مجوز حذف کاربر» — طبق نکات تسک:
+     - ادمین/سوپرادمین می‌توانند کاربر عادی/فروشنده را حذف کنند.
+     - ادمین نمی‌تواند ادمین دیگر یا سوپرادمین را حذف کند.
+     - سوپرادمین دسترسی کامل دارد، اما حذف خودِ سوپرادمین از هیچ مسیری مجاز
+       نیست (ر.ک. users.service.js#deleteUser — همان قانون مطلقی که
+       removeSeller() هم برایش دارد).
+   این فقط یک محافظت UI برای نمایش/عدم‌نمایش دکمه است؛ تایید نهایی همیشه روی
+   بک‌اند (DELETE /users/:id) انجام می‌شود. */
+function canDeleteUserRow(u) {
+  const me = getCurrentUser();
+  if (!me || (me.role !== 'admin' && me.role !== 'super_admin')) return false;
+  if (u.id === me.id) return false; // امکان حذف حساب خودتان وجود ندارد
+  const targetRole = String(u.role || '').toUpperCase();
+  if (targetRole === 'SUPER_ADMIN') return false; // هرگز قابل حذف نیست
+  if (targetRole === 'ADMIN' && me.role !== 'super_admin') return false; // فقط سوپرادمین ادمین دیگر را حذف می‌کند
+  return true;
 }
 const _adminUserRowBusy = new Set();
 async function toggleAdminUserStatus(id) {
   if (_adminUserRowBusy.has(id)) return;
   const user = _adminUsersCache.find(u => u.id === id);
+  if (user && String(user.status || '').toUpperCase() === 'DELETED') return; // بک‌اند این را با 409 رد می‌کند
   const name = user ? user.name : '';
   /* همان منطق ACTIVE/SUSPENDED/BANNED که در renderAdminUsersTab استفاده شد؛
      دیگر BLOCKED (که بک‌اند رد می‌کند) هرگز تولید یا ارسال نمی‌شود. */
@@ -5349,6 +5423,76 @@ async function toggleAdminUserStatus(id) {
     _adminUserRowBusy.delete(id);
   }
 }
+/* ══════════════════════════════════════════════════════════════════════
+   ADMIN/SUPER-ADMIN: DELETE USER (general, any role) — DELETE /users/:id
+   دقیقاً همان الگوی apOpenDeleteSeller/apSubmitDeleteSeller (تب «مدیریت
+   فروشندگان»): از همان apModalOverlay/apModalBody/apModalTitle مشترک
+   استفاده می‌کند. دکمهٔ حذف در جدول (renderAdminUsersTab) فقط وقتی رندر
+   می‌شود که canDeleteUserRow(u) صحیح باشد؛ خودِ این دو تابع هم دوباره آن را
+   چک می‌کنند تا حتی با صدازدن دستیِ onclick هم بدون مجوز چیزی اجرا نشود —
+   محافظت واقعی همیشه با بک‌اند (users.service.js#deleteUser) است.
+
+   بعد از موفقیت، برخلاف حذف فروشنده (که ردیف را از جدول حذف می‌کند)، ردیف
+   کاربر در جدول باقی می‌ماند و فقط وضعیتش به DELETED تغییر می‌کند — طبق نکتهٔ
+   تسک «وضعیت DELETED در لیست کاربران نمایش داده شود». به همین دلیل مقدار
+   mobile/email محلی هم دست‌نخورده می‌ماند (مقادیر واقعی روی سرور آزاد/پاک
+   شده‌اند، اما نمایش محلی همان مقدار قبلی را نگه می‌دارد — گیج‌کننده نیست
+   چون دیگر هیچ اکشنی روی این ردیف قابل انجام نیست). ---------- */
+const _auDeleteBusy = new Set();
+let auDeleteUserId = null;
+function apOpenDeleteUser(id) {
+  const target = _adminUsersCache.find(u => u.id === id);
+  if (!target || !canDeleteUserRow(target)) return;
+  if (_auDeleteBusy.has(id)) return; // یک درخواست حذف برای همین کاربر در حال انجام است
+  const overlay = document.getElementById('apModalOverlay');
+  const body = document.getElementById('apModalBody');
+  const title = document.getElementById('apModalTitle');
+  if (!overlay || !body || !title) return;
+  auDeleteUserId = id;
+  title.textContent = 'حذف کاربر';
+  body.innerHTML = `
+    <p style="margin:0 0 14px;font-size:14px;color:var(--gray-700);">آیا مطمئن هستید؟ این کاربر حذف خواهد شد و در صورت ثبت‌نام مجدد حساب جدیدی ایجاد می‌شود.</p>
+    <div class="dash-card" style="margin:0 0 14px;padding:12px 14px;background:var(--gray-50);">
+      <div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;"><span style="color:var(--gray-500);">نام کاربر</span><b>${escapeHtml(target.name || '—')}</b></div>
+      <div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;"><span style="color:var(--gray-500);">شماره موبایل</span><b>${escapeHtml(target.mobile || '—')}</b></div>
+    </div>
+    <div class="pending-note" style="background:#FEE2E2;border-color:#FCA5A5;color:#B91C1C;margin-top:0;">
+      <svg viewBox="0 0 24 24" style="stroke:#B91C1C;"><use href="#i-info"/></svg>
+      سفارش‌ها، پرداخت‌ها و پیام‌های این کاربر حذف نمی‌شوند و دست‌نخورده باقی می‌مانند. این عملیات قابل بازگشت نیست.
+    </div>
+    <button class="btn-primary" style="margin-top:16px;width:100%;justify-content:center;background:#B91C1C;" id="auDeleteSubmitBtn" onclick="apSubmitDeleteUser()"><svg viewBox="0 0 24 24" width="14" height="14"><use href="#i-trash"/></svg> حذف کاربر</button>
+  `;
+  overlay.style.display = 'flex';
+}
+async function apSubmitDeleteUser() {
+  const id = auDeleteUserId;
+  const target = id ? _adminUsersCache.find(u => u.id === id) : null;
+  if (!id || !target || !canDeleteUserRow(target) || _auDeleteBusy.has(id)) return;
+  const btn = document.getElementById('auDeleteSubmitBtn');
+  _auDeleteBusy.add(id);
+  if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14"><use href="#i-cog"/></svg> در حال حذف...'; }
+  try {
+    await authApiFetch('/users/' + encodeURIComponent(id), { method: 'DELETE' });
+    /* فقط وضعیت محلی به DELETED تغییر می‌کند — ردیف از جدول حذف نمی‌شود
+       (طبق نکتهٔ تسک، باید همچنان با تگ «حذف شده» دیده شود). */
+    target.status = 'DELETED';
+    if (String(target.role || '').toUpperCase() === 'SELLER') {
+      // همان هماهنگ‌سازی کش که toggleAdminUserStatus برای فروشنده انجام می‌دهد.
+      invalidateProductsCache();
+      apStoresState.loaded = false;
+    }
+    const overlay = document.getElementById('apModalOverlay');
+    if (overlay) overlay.style.display = 'none';
+    toast('کاربر حذف شد');
+    await renderAdminUsersTab(false);
+  } catch (err) {
+    toast(err.message || 'حذف کاربر ناموفق بود');
+    if (btn) { btn.disabled = false; btn.style.opacity = ''; btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14"><use href="#i-trash"/></svg> حذف کاربر'; }
+  } finally {
+    _auDeleteBusy.delete(id);
+  }
+}
+
 function toggleAdminActive(id) {
   if (!isSuperAdmin()) { toast('فقط مدیر اصلی سایت اجازه این کار را دارد'); return; }
   const target = findUserById(id);
@@ -5427,7 +5571,7 @@ function goToShopProducts(shopId, shopName) {
   renderStorefront(shopId, shopName);
   nav('storefront');
 }
-function renderStorefront(shopId, shopName) {
+async function renderStorefront(shopId, shopName) {
   currentStorefrontShopId = shopId;
   const info = getAllChatStores().find(s => s.id === shopId) || {
     id: shopId, name: shopName, shopLabel: (shopName || '').replace('فروشگاه', '').trim(),
@@ -5457,18 +5601,55 @@ function renderStorefront(shopId, shopName) {
   setText('sfHoursDays', info.hoursDays);
   setText('sfHoursTime', info.hoursTime);
 
-  /* محصولات همان فروشگاه را از روی کارت‌های واقعی صفحه محصولات کپی می‌کنیم
-     (data-shop="shopId") — همان شنوندهٔ کلیک سراسری روی .product-card که در
-     صفحه محصولات کار می‌کند، روی این کپی‌ها هم بدون هیچ کد اضافه‌ای کار می‌کند. */
+  /* FIX (storefront/public-catalogue de-dup bug): محصولات این فروشگاه دیگر از
+     روی کارت‌های صفحه‌ی محصولات عمومی کپی نمی‌شوند. آن صفحه از GET /products
+     (بدون storeId) پر می‌شود که برای هر Product سراسری فقط یک کارت — همان
+     ارزان‌ترین offer — نشان می‌دهد (buildProductLevelPage در
+     products.service.js). یعنی اگر این فروشگاه ارزان‌ترین فروشنده‌ی یک
+     محصول نبود، هیچ کارتی با data-shop=این فروشگاه در آن صفحه وجود نداشت و
+     صفحه‌ی فروشگاه آن را (اشتباهاً) نشان نمی‌داد — even though این فروشگاه
+     واقعاً یک StoreProduct فعال برای آن دارد.
+     اکنون مستقیماً GET /products?storeId=<شناسه واقعی این فروشگاه> زده
+     می‌شود (همان اندپوینت/همان service.list — پارامتر storeId از قبل در
+     products.validation.js پذیرفته می‌شد، فقط قبلاً از سمت فرانت هرگز با
+     storeId صدا زده نمی‌شد). چون where از قبل روی همین storeId محدود شده،
+     de-dup داخل آن فقط بین ردیف‌های خودِ این فروشگاه اعمال می‌شود که به خاطر
+     @@unique([storeId, productId]) در schema.prisma از قبل یکتا هستند — پس
+     هیچ offer واقعی این فروشگاه هرگز حذف نمی‌شود. کاتالوگ عمومی، جزئیات
+     محصول، سبد خرید، علاقه‌مندی‌ها و نظرات دست‌نخورده ماندند — هیچ‌کدام از
+     fetchApiProductsByStoreId استفاده نمی‌کنند. */
   const grid = document.getElementById('sfProductsGrid');
   const empty = document.getElementById('sfProductsEmpty');
   const countBadge = document.getElementById('sfProductsCount');
-  if (grid) {
-    grid.innerHTML = '';
-    const cards = document.querySelectorAll('#page-product .product-card[data-shop="' + shopId + '"]');
-    cards.forEach(c => grid.appendChild(c.cloneNode(true)));
-    if (countBadge) countBadge.textContent = cards.length.toLocaleString('fa-IR-u-nu-latn');
-    if (empty) empty.style.display = cards.length ? 'none' : 'block';
+  if (!grid) return;
+  const renderToken = shopId; // currentStorefrontShopId already set to shopId above
+  grid.innerHTML = '<div style="grid-column:1/-1;padding:20px;text-align:center;color:var(--gray-500);font-size:13px;">در حال دریافت محصولات فروشگاه...</div>';
+  if (empty) empty.style.display = 'none';
+  try {
+    const stores = await fetchApiStores();
+    const store = stores.find(s => s.slug === shopId);
+    if (renderToken !== currentStorefrontShopId) return; // کاربر پیش از پایان درخواست به فروشگاه دیگری رفته
+    if (!store) {
+      // Fallback for shop ids that aren't real API stores (e.g. static/demo shop
+      // cards shown before the /stores API loads, or if it's unavailable) — keeps
+      // prior behavior for that case rather than showing a false "empty" storefront.
+      grid.innerHTML = '';
+      const cards = document.querySelectorAll('#page-product .product-card[data-shop="' + shopId + '"]');
+      cards.forEach(c => grid.appendChild(c.cloneNode(true)));
+      if (countBadge) countBadge.textContent = cards.length.toLocaleString('fa-IR-u-nu-latn');
+      if (empty) empty.style.display = cards.length ? 'none' : 'block';
+      return;
+    }
+    const products = await fetchApiProductsByStoreId(store.id);
+    if (renderToken !== currentStorefrontShopId) return;
+    grid.innerHTML = products.length ? products.map(buildProductCardHtml).join('') : '';
+    if (typeof initProductAddToCartButtons === 'function') initProductAddToCartButtons();
+    if (countBadge) countBadge.textContent = products.length.toLocaleString('fa-IR-u-nu-latn');
+    if (empty) empty.style.display = products.length ? 'none' : 'block';
+  } catch (err) {
+    if (renderToken !== currentStorefrontShopId) return;
+    grid.innerHTML = '<div style="grid-column:1/-1;padding:20px;text-align:center;color:#B91C1C;font-size:13px;">' + escapeHtml((err && err.message) || 'دریافت محصولات فروشگاه ممکن نشد.') + '</div>';
+    if (countBadge) countBadge.textContent = '۰';
   }
 }
 /* دکمه «گفتگو با فروشگاه» در صفحه فروشگاه، مستقیماً همان فروشگاه را در صفحه چت باز می‌کند. */
@@ -5585,15 +5766,22 @@ async function toggleFav(el) {
   }
 
   /* ── محصول: اتصال واقعی به POST/DELETE /wishlist ──
-     productId فقط روی کارت‌های محصول واقعی (از GET /products، دقیقاً همان
-     data-id ای که addToCart هم از آن استفاده می‌کند) ست شده. کارت‌های
-     نمایشی/دمو معادل واقعی در دیتابیس ندارند، پس دقیقاً مثل addToCart فقط
-     یک راهنما نشان داده می‌شود، نه افزودن واقعی. */
-  const productId = isPdWish
-    ? (CURRENT_PRODUCT_DETAIL && CURRENT_PRODUCT_DETAIL.productId)
+     WishlistItem در بک‌اند به StoreProduct اشاره می‌کند (نه Product سراسری) —
+     چون «علاقه‌مندی» یعنی پیشنهاد یک فروشگاه مشخص با قیمت/موجودی خودش، نه
+     خودِ محصول کلی (ر.ک. schema.prisma: WishlistItem.storeProductId). بدنه‌ی
+     POST/DELETE /wishlist همچنان به نام «productId» فرستاده می‌شود چون این
+     پارامتر API از قبل همین نام را دارد (سازگاری با بک‌اند)، اما مقداری که
+     می‌فرستیم همیشه باید یک StoreProduct id باشد:
+     - روی کارت محصول: همان card.dataset.id (که addToCart هم از آن استفاده
+       می‌کند).
+     - در صفحه جزئیات محصول: CURRENT_PRODUCT_DETAIL.selectedOfferId (نه
+       .productId — آن فیلد شناسه‌ی سراسری Product است و مخصوص نظرات/اطلاعات
+       محصول، نه علاقه‌مندی/سبد خرید. ر.ک. تعریف CURRENT_PRODUCT_DETAIL). */
+  const storeProductId = isPdWish
+    ? (CURRENT_PRODUCT_DETAIL && CURRENT_PRODUCT_DETAIL.selectedOfferId)
     : ((el.closest('.product-card') || {}).dataset ? el.closest('.product-card').dataset.id : null);
 
-  if (!productId) {
+  if (!storeProductId) {
     toast('این مورد یک نمونهٔ نمایشی است — برای افزودن واقعی به علاقه‌مندی‌ها، محصول را از صفحه «محصولات» انتخاب کنید');
     return;
   }
@@ -5601,9 +5789,9 @@ async function toggleFav(el) {
   const nowLiked = !el.classList.contains('liked');
   try {
     if (nowLiked) {
-      await authApiFetch('/wishlist', { method: 'POST', body: { productId } });
+      await authApiFetch('/wishlist', { method: 'POST', body: { productId: storeProductId } });
     } else {
-      await authApiFetch('/wishlist/' + encodeURIComponent(productId), { method: 'DELETE' });
+      await authApiFetch('/wishlist/' + encodeURIComponent(storeProductId), { method: 'DELETE' });
     }
   } catch (err) {
     toast((err && err.message) || 'بروزرسانی علاقه‌مندی‌ها ممکن نشد');
@@ -5611,7 +5799,7 @@ async function toggleFav(el) {
   }
 
   el.classList.toggle('liked');
-  if (nowLiked) _wishlistIdSet.add(productId); else _wishlistIdSet.delete(productId);
+  if (nowLiked) _wishlistIdSet.add(storeProductId); else _wishlistIdSet.delete(storeProductId);
   _wishlistCache = null; // کش خام باطل می‌شود تا دفعه بعد رفرش واقعی از سرور بگیرد
 
   if (isPdWish) {
@@ -8661,8 +8849,10 @@ function openWholesaleDetail(card) {
     (tierRows.length ? ` قیمت پلکانی: ${tierRows.join(' — ')}.` : '') +
     ` این محصول توسط فروشگاه‌های معتبر منطقه آزاد ارس ارائه می‌شود.`;
 
-  const id = slugify('wholesale-' + brand + '-' + name);
-  CURRENT_PRODUCT_DETAIL = { id, name, brand, price, img, desc, shop: brand };
+  /* کارت‌های عمده‌فروشی معادل واقعی در بک‌اند ندارند — نه Product سراسری
+     (برای نظرات) و نه StoreProduct (برای سبد/علاقه‌مندی‌ها) — پس هر دو
+     صراحتاً null هستند (نه فقط id قدیمی/گمراه‌کننده). */
+  CURRENT_PRODUCT_DETAIL = { productId: null, selectedOfferId: null, name, brand, price, img, desc, shop: brand };
 
   const setText = (elId, val) => { const el = document.getElementById(elId); if (el) el.textContent = val; };
   setText('pdBreadcrumbName', name);
@@ -8693,12 +8883,212 @@ function openWholesaleDetail(card) {
     if (wishLabel) wishLabel.textContent = ' ' + (alreadyFav ? 'حذف از علاقه‌مندی‌ها' : 'افزودن به علاقه‌مندی‌ها');
   }
 
+  /* کارت‌های عمده‌فروشی هرگز چند-فروشنده نیستند، پس همیشه بخش single-offor
+     قدیمی نمایش داده می‌شود، نه لیست چند-فروشندهٔ pdOffersSection (که ممکن
+     است از بازدید قبلی یک محصول واقعی هنوز نمایش داده شده باشد). */
+  resetPdOffersSections();
+
   renderRatingInput(5);
   renderProductDetailReviews();
   nav('productdetail');
 }
 
-function openProductDetail(card) {
+/* بخش single-offer قدیمی (pdSingleOfferSection/pdShopName/pdPrice/pdAddToCartBtn)
+   و بخش جدید چند-فروشنده (pdOffersSection/pdOffersList) به‌طور مشترک روی همین یک
+   صفحهٔ جزئیات محصول (#page-productdetail) قرار دارند. این تابع فقط نمایش/عدم‌نمایش
+   بین آن دو را کنترل می‌کند؛ به همین دلیل هم از مسیر DOM-fallback (openProductDetailFromDom/
+   openWholesaleDetail) و هم از مسیر API واقعی (renderProductDetailFromOffers) صدا زده
+   می‌شود تا صفحه هیچ‌وقت باقیماندهٔ محصول قبلی را نشان ندهد. */
+function resetPdOffersSections(showMulti) {
+  const singleSection = document.getElementById('pdSingleOfferSection');
+  const offersSection = document.getElementById('pdOffersSection');
+  const addBtn = document.getElementById('pdAddToCartBtn');
+  if (singleSection) singleSection.style.display = showMulti ? 'none' : '';
+  if (offersSection) offersSection.style.display = showMulti ? '' : 'none';
+  if (addBtn) addBtn.style.display = '';
+}
+
+/* Dispatcher: کارت‌های محصول واقعی (از GET /products، طبق buildProductCardHtml)
+   همیشه data-product-id (شناسه‌ی سراسری Product) دارند — این‌ها از سرور
+   GET /products/:productId/offers می‌گیرند تا همه‌ی فروشندگان دیده شوند.
+   کارت‌های نمایشی/دمو (خرید عمده، بخش‌های استاتیک بدون داده‌ی واقعی بک‌اند)
+   این attribute را ندارند، پس دقیقاً مثل قبل فقط از روی DOM کارت ساخته می‌شوند
+   (fallback handling طبق فاز — نه یک منبع داده‌ی جدید). */
+async function openProductDetail(card) {
+  const apiProductId = card.dataset.productId || null;
+  if (!apiProductId) {
+    openProductDetailFromDom(card);
+    return;
+  }
+  let data;
+  try {
+    data = await fetchProductOffers(apiProductId);
+  } catch (err) {
+    toast((err && err.message) || 'دریافت اطلاعات محصول از سرور ممکن نشد');
+    openProductDetailFromDom(card); // fallback: حداقل همان دادهٔ کارت را نشان بده
+    return;
+  }
+  renderProductDetailFromOffers(data);
+}
+
+/** GET /products/:productId/offers — productId اینجا همیشه شناسه‌ی سراسری
+    Product است (نه StoreProduct)، طبق قرارداد بک‌اند در products.routes.js. */
+async function fetchProductOffers(productId) {
+  return authApiFetch('/products/' + encodeURIComponent(productId) + '/offers', { method: 'GET', skipAuth: true });
+}
+
+/** یک ردیف «فروشنده» در لیست چند-فروشنده — از همان کلاس‌های price-row/shop-n/
+    price-n/avail موجود (که برای بخش single-offer قدیمی طراحی شده بودند) استفاده
+    می‌کند تا ظاهر صفحه بازطراحی نشود؛ فقط ضمانت/زمان ارسال، دکمهٔ «افزودن به
+    سبد» مخصوص همین offer، و وضعیت انتخاب‌شده (selected) به آن اضافه شده است. */
+function pdOfferRowHtml(offer, isSelected) {
+  const storeName = (offer.store && offer.store.name) || 'فروشگاه';
+  const img = (offer.images && offer.images[0] && offer.images[0].url) || '';
+  const inStock = (offer.stock || 0) > 0;
+  const warranty = offer.warranty || 'ندارد';
+  const shipping = offer.shippingTime || 'نامشخص';
+  return `<div class="price-row pd-offer-row${isSelected ? ' selected' : ''}" data-offer-id="${escapeHtml(offer.id)}" data-offer-price="${escapeHtml(String(offer.price || 0))}" data-offer-store="${escapeHtml(storeName)}" data-offer-img="${escapeHtml(img)}">
+    <div class="shop-n"><svg viewBox="0 0 24 24" width="14" height="14" style="stroke:var(--gray-400);fill:none;stroke-width:2;"><use href="#i-store"/></svg><span>${escapeHtml(storeName)}</span></div>
+    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span class="price-n">${fmtPriceFa(offer.price)} <span style="font-weight:400;font-size:11px;">تومان</span></span>
+        <span class="avail ${inStock ? 'avail-yes' : 'avail-no'}">${inStock ? 'موجود' : 'ناموجود'}</span>
+      </div>
+      <div style="font-size:10.5px;color:var(--gray-400);">ضمانت: ${escapeHtml(warranty)} · ارسال: ${escapeHtml(shipping)}</div>
+    </div>
+    <button class="pd-offer-addcart" type="button" aria-label="افزودن به سبد خرید"><svg viewBox="0 0 24 24"><use href="#i-cart"/></svg></button>
+  </div>`;
+}
+
+/** offers را ارزان‌ترین اول مرتب می‌کند (طبق فاز — حتی اگر بک‌اند از قبل
+    orderBy:price:asc برگردانده، این یک ضمانت سمت کلاینت است) و در #pdOffersList
+    می‌ریزد؛ selectedOfferId فقط تعیین می‌کند کدام ردیف در ابتدا کلاس selected
+    بگیرد (پیش‌فرض ارزان‌ترین — دقیقاً همان چیزی که renderProductDetailFromOffers
+    به‌عنوان CURRENT_PRODUCT_DETAIL.selectedOfferId ست می‌کند). */
+function renderPdOffers(offers, selectedOfferId) {
+  const list = document.getElementById('pdOffersList');
+  if (!list) return;
+  const sorted = (offers || []).slice().sort((a, b) => (a.price || 0) - (b.price || 0));
+  list.innerHTML = sorted.length
+    ? sorted.map(o => pdOfferRowHtml(o, o.id === selectedOfferId)).join('')
+    : '<div style="padding:14px 4px;text-align:center;color:var(--gray-400);font-size:12.5px;">در حال حاضر هیچ فروشنده‌ای این محصول را عرضه نمی‌کند</div>';
+}
+
+/* دکمهٔ «افزودن به سبد» روی هر ردیف فروشنده — delegated (مثل initProductAddToCartButtons)
+   چون ردیف‌ها با innerHTML و به تعداد پویا ساخته می‌شوند. addToCart() موجود را با
+   offer.id (=StoreProduct id، دقیقاً چیزی که POST /cart/items انتظار دارد) صدا
+   می‌زند؛ هیچ تابع سبد خرید جدیدی ساخته نشده است. */
+document.addEventListener('click', function (e) {
+  const btn = e.target.closest('.pd-offer-addcart');
+  if (!btn) return;
+  e.stopPropagation();
+  const row = btn.closest('.pd-offer-row');
+  if (!row || !CURRENT_PRODUCT_DETAIL) return;
+  const offerId = row.dataset.offerId;
+  const price = parseInt(row.dataset.offerPrice, 10) || 0;
+  const storeName = row.dataset.offerStore || '';
+  const img = row.dataset.offerImg || CURRENT_PRODUCT_DETAIL.img || '';
+  addToCart(CURRENT_PRODUCT_DETAIL.name, price, storeName, img, offerId);
+});
+
+/* کلیک روی خودِ ردیف (نه دکمهٔ افزودن به سبد) آن offer را «انتخاب» می‌کند —
+   یعنی دکمهٔ سراسری «افزودن به سبد» و آیکن «علاقه‌مندی» بالای صفحه از این
+   به بعد به همین StoreProduct اشاره می‌کنند (CURRENT_PRODUCT_DETAIL.selectedOfferId).
+   بدون این قابلیت، کاربر هرگز نمی‌توانست پیشنهاد یک فروشگاه غیر از ارزان‌ترین
+   را به علاقه‌مندی‌ها اضافه کند. cursor:pointer روی .price-row از قبل در
+   style.css موجود بود؛ اینجا فقط رفتار واقعی به آن اضافه شده است. */
+document.addEventListener('click', function (e) {
+  if (e.target.closest('.pd-offer-addcart')) return; // با addToCart بالا مدیریت شده
+  const row = e.target.closest('.pd-offer-row');
+  if (!row) return;
+  selectPdOffer(row);
+});
+
+function selectPdOffer(row) {
+  if (!row || !CURRENT_PRODUCT_DETAIL) return;
+  const offerId = row.dataset.offerId || null;
+  if (!offerId || offerId === CURRENT_PRODUCT_DETAIL.selectedOfferId) return;
+
+  const list = document.getElementById('pdOffersList');
+  if (list) list.querySelectorAll('.pd-offer-row.selected').forEach(r => r.classList.remove('selected'));
+  row.classList.add('selected');
+
+  CURRENT_PRODUCT_DETAIL.selectedOfferId = offerId;
+  CURRENT_PRODUCT_DETAIL.price = fmtPriceFa(parseInt(row.dataset.offerPrice, 10) || 0) + ' تومان';
+  CURRENT_PRODUCT_DETAIL.shop = row.dataset.offerStore || '';
+  if (row.dataset.offerImg) CURRENT_PRODUCT_DETAIL.img = row.dataset.offerImg;
+
+  const wishBtn = document.getElementById('pdWishBtn');
+  const wishLabel = document.getElementById('pdWishBtnLabel');
+  if (wishBtn) {
+    const alreadyFav = isProductWishlisted(offerId);
+    wishBtn.classList.toggle('liked', alreadyFav);
+    if (wishLabel) wishLabel.textContent = ' ' + (alreadyFav ? 'حذف از علاقه‌مندی‌ها' : 'افزودن به علاقه‌مندی‌ها');
+  }
+}
+
+/** صفحهٔ جزئیات محصول را از پاسخ واقعی GET /products/:productId/offers می‌سازد —
+    بر خلاف openProductDetailFromDom، هیچ متنی از روی کارت DOM خوانده نمی‌شود؛
+    نام/برند/توضیحات از product سراسری و لیست فروشندگان از offers می‌آید. */
+function renderProductDetailFromOffers(data) {
+  const product = (data && data.product) || {};
+  const offers = ((data && data.offers) || []).slice().sort((a, b) => (a.price || 0) - (b.price || 0));
+  const cheapest = offers[0] || null;
+
+  const img = (cheapest && cheapest.images && cheapest.images[0] && cheapest.images[0].url) || '';
+  const priceText = cheapest ? (fmtPriceFa(cheapest.price) + ' تومان') : 'ناموجود';
+  const shopText = (cheapest && cheapest.store && cheapest.store.name) || '';
+
+  /* productId = شناسه‌ی سراسری Product (برای نظرات/اطلاعات محصول — Review.productId
+     در schema.prisma دقیقاً به همین ارجاع می‌دهد).
+     selectedOfferId = شناسه‌ی StoreProduct پیشنهاد «انتخاب‌شده» (پیش‌فرض:
+     ارزان‌ترین)، مخصوص سبد خرید/علاقه‌مندی‌ها (WishlistItem.storeProductId).
+     این دو قبلاً هر دو زیر یک فیلد به‌نام productId ذخیره می‌شدند که باعث
+     می‌شد نظرات با شناسه‌ی اشتباه (StoreProduct به‌جای Product سراسری)
+     ارسال/خوانده شوند — این‌جا اصلاح شده است. */
+  CURRENT_PRODUCT_DETAIL = {
+    productId: product.id || null, selectedOfferId: cheapest ? cheapest.id : null,
+    name: product.name || '', brand: product.brand || '',
+    price: priceText, img, desc: product.description || '', shop: shopText,
+  };
+
+  const setText = (elId, val) => { const el = document.getElementById(elId); if (el) el.textContent = val; };
+  setText('pdBreadcrumbName', product.name || '');
+  setText('pdName', product.name || '');
+  setText('pdBrandTag', product.brand || '');
+  setText('pdDescription', product.description || 'توضیحاتی برای این محصول ثبت نشده است.');
+  const starsRow = document.getElementById('pdStarsRow');
+  if (starsRow) starsRow.innerHTML = `<span class="stars">★★★★★</span><span class="rating-num">۰</span>`;
+
+  const mainImgTag = document.getElementById('pdMainImgTag');
+  const mainIcon = document.getElementById('pdMainIcon');
+  if (img) {
+    if (mainImgTag) { mainImgTag.src = img; mainImgTag.style.display = 'block'; }
+    if (mainIcon) mainIcon.style.display = 'none';
+  } else {
+    if (mainImgTag) mainImgTag.style.display = 'none';
+    if (mainIcon) mainIcon.style.display = 'block';
+  }
+
+  resetPdOffersSections(true);
+  renderPdOffers(offers, CURRENT_PRODUCT_DETAIL.selectedOfferId);
+  const addBtn = document.getElementById('pdAddToCartBtn');
+  if (addBtn) addBtn.style.display = cheapest ? '' : 'none';
+
+  const wishBtn = document.getElementById('pdWishBtn');
+  const wishLabel = document.getElementById('pdWishBtnLabel');
+  if (wishBtn) {
+    const alreadyFav = isProductWishlisted(CURRENT_PRODUCT_DETAIL.selectedOfferId);
+    wishBtn.classList.toggle('liked', alreadyFav);
+    if (wishLabel) wishLabel.textContent = ' ' + (alreadyFav ? 'حذف از علاقه‌مندی‌ها' : 'افزودن به علاقه‌مندی‌ها');
+  }
+
+  renderRatingInput(5);
+  renderProductDetailReviews();
+  nav('productdetail');
+}
+
+function openProductDetailFromDom(card) {
   const imgEl = card.querySelector('.product-img img');
   const iconUseEl = card.querySelector('.product-img svg use');
   const brand = ((card.querySelector('.product-brand') || {}).textContent || 'جلفا مارکت').trim();
@@ -8717,11 +9107,15 @@ function openProductDetail(card) {
       ` این محصول توسط فروشندگان معتبر منطقه آزاد ارس ارائه می‌شود و کیفیت آن مورد تایید تیم جلفا مارکت است.`;
   }
 
-  const id = slugify(brand + '-' + name);
   /* data-id فقط روی کارت‌های محصول واقعی (از GET /products) ست شده — همان
-     UUID واقعی بک‌اند که برای افزودن واقعی به سبد خرید لازم است. */
-  const productId = card.dataset.id || null;
-  CURRENT_PRODUCT_DETAIL = { id, name, brand, price, img, desc, shop: shopsText, productId };
+     UUID واقعی StoreProduct که برای سبد خرید/علاقه‌مندی‌ها لازم است.
+     این مسیر (DOM-fallback) فقط برای کارت‌های نمایشی/دموی بدون
+     data-product-id صدا زده می‌شود؛ چون این‌ها معادل Product سراسری واقعی
+     در بک‌اند ندارند، productId (مخصوص نظرات) همیشه null می‌ماند —
+     برخلاف selectedOfferId که اگر card.dataset.id موجود باشد همان مقدار
+     را می‌گیرد. */
+  const offerId = card.dataset.id || null;
+  CURRENT_PRODUCT_DETAIL = { productId: null, selectedOfferId: offerId, name, brand, price, img, desc, shop: shopsText };
 
   const setText = (elId, val) => { const el = document.getElementById(elId); if (el) el.textContent = val; };
   setText('pdBreadcrumbName', name);
@@ -8749,10 +9143,12 @@ function openProductDetail(card) {
   const wishBtn = document.getElementById('pdWishBtn');
   const wishLabel = document.getElementById('pdWishBtnLabel');
   if (wishBtn) {
-    const alreadyFav = isProductWishlisted(productId);
+    const alreadyFav = isProductWishlisted(offerId);
     wishBtn.classList.toggle('liked', alreadyFav);
     if (wishLabel) wishLabel.textContent = ' ' + (alreadyFav ? 'حذف از علاقه‌مندی‌ها' : 'افزودن به علاقه‌مندی‌ها');
   }
+
+  resetPdOffersSections();
 
   renderRatingInput(5);
   renderProductDetailReviews();
@@ -8835,7 +9231,9 @@ async function submitProductComment() {
 function addProductDetailToCart() {
   if (!CURRENT_PRODUCT_DETAIL) return;
   const priceNum = parseInt((CURRENT_PRODUCT_DETAIL.price || '0').replace(/[^\d]/g, ''), 10) || 0;
-  addToCart(CURRENT_PRODUCT_DETAIL.name, priceNum, CURRENT_PRODUCT_DETAIL.shop || CURRENT_PRODUCT_DETAIL.brand, CURRENT_PRODUCT_DETAIL.img || '', CURRENT_PRODUCT_DETAIL.productId || null);
+  /* selectedOfferId (StoreProduct id) نه productId (شناسه‌ی سراسری Product) —
+     دقیقاً همان چیزی که POST /cart/items انتظار دارد. */
+  addToCart(CURRENT_PRODUCT_DETAIL.name, priceNum, CURRENT_PRODUCT_DETAIL.shop || CURRENT_PRODUCT_DETAIL.brand, CURRENT_PRODUCT_DETAIL.img || '', CURRENT_PRODUCT_DETAIL.selectedOfferId || null);
 }
 
 /* ── Seller registration / application flow ── */

@@ -39,14 +39,28 @@ const priceRefinement = (val, ctx) => {
   }
 };
 
-const createSchema = z.object({
+// Identity fields — shared with buildIdentityKey() in products.service.js.
+// These describe the global Product; everything else in createSchema
+// describes THIS store's offer of it.
+const identitySchema = {
   name: z.string().min(2).max(200),
-  categoryId: z.string().uuid().optional(),
   brand: z.string().max(100).optional(),
+  model: z.string().max(100).optional(),
+  capacity: z.string().max(50).optional(),
+  color: z.string().max(50).optional(),
   description: z.string().max(5000).optional(),
+  specifications: z.record(z.string(), z.any()).optional(),
+  categoryId: z.string().uuid().optional(),
+};
+
+const createSchema = z.object({
+  ...identitySchema,
   price: z.number().positive(),
   compareAtPrice: z.number().positive().optional(),
   stock: z.number().int().min(0).default(0),
+  warranty: z.string().max(200).optional(),
+  shippingTime: z.string().max(200).optional(),
+  discount: z.number().int().min(0).max(100).optional(),
   type: z.enum(['RETAIL', 'WHOLESALE']).default('RETAIL'),
   images: z.array(productImageUrlSchema).max(MAX_IMAGES).optional(),
   wholesaleTiers: z.array(wholesaleTierSchema).optional(),
@@ -61,10 +75,17 @@ const updateSchema = z.object({
   name: z.string().min(2).max(200).optional(),
   categoryId: z.string().uuid().optional(),
   brand: z.string().max(100).optional(),
+  model: z.string().max(100).optional(),
+  capacity: z.string().max(50).optional(),
+  color: z.string().max(50).optional(),
   description: z.string().max(5000).optional(),
+  specifications: z.record(z.string(), z.any()).optional(),
   price: z.number().positive().optional(),
   compareAtPrice: z.number().positive().optional(),
   stock: z.number().int().min(0).optional(),
+  warranty: z.string().max(200).optional(),
+  shippingTime: z.string().max(200).optional(),
+  discount: z.number().int().min(0).max(100).optional(),
   type: z.enum(['RETAIL', 'WHOLESALE']).optional(),
   images: z.array(productImageUrlSchema).max(MAX_IMAGES).optional(),
   wholesaleTiers: z.array(wholesaleTierSchema).optional(),
@@ -121,6 +142,23 @@ const addImageSchema = z.object({
   url: z.string().url().optional(), // present when adding by URL instead of multipart upload
 });
 
+// GET /:productId/offers — :productId is the GLOBAL Product id (see
+// products.service.js getOffersByProduct()), unlike every other :id route in
+// this router which addresses a StoreProduct. Validated separately so a
+// malformed id 400s here instead of falling through to a Prisma error.
+const productIdParamSchema = z.object({
+  productId: z.string().uuid('شناسه محصول نامعتبر است'),
+});
+
 module.exports = {
-  createSchema, updateSchema, moderateSchema, statusAliasSchema, listQuerySchema, stockSchema, activeSchema, addImageSchema, MAX_IMAGES,
+  createSchema,
+  updateSchema,
+  moderateSchema,
+  statusAliasSchema,
+  listQuerySchema,
+  stockSchema,
+  activeSchema,
+  addImageSchema,
+  productIdParamSchema,
+  MAX_IMAGES,
 };

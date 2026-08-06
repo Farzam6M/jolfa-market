@@ -32,10 +32,52 @@ const ORDER_TRANSITIONS = {
 const SELLER_ALLOWED_STATUS_TARGETS = ['PREPARING', 'SENT'];
 
 /**
+ * Order-safe identity view of the StoreProduct behind an OrderItem.
+ *
+ * Deliberately excludes price, compareAtPrice, stock, discount, warranty,
+ * shippingTime, status, and isActive — those live on the *mutable*
+ * StoreProduct and can be edited by the seller at any time after the sale.
+ * The only purchase-time facts an order is allowed to show are the ones
+ * frozen at checkout (OrderItem.nameSnapshot/priceSnapshot/qty); this view
+ * exists only to show stable catalog identity (what item this was), never
+ * today's commercial terms. (Reusing products.service.js's flattenStoreProduct
+ * here — as a prior version of this function did — would leak exactly that
+ * live data into order history, which is the bug this function fixes.)
+ */
+function orderItemProductIdentity(storeProduct) {
+  if (!storeProduct) return storeProduct;
+  const { product } = storeProduct;
+  return {
+    id: storeProduct.id,
+    productId: storeProduct.productId,
+    name: product?.name,
+    brand: product?.brand,
+    model: product?.model,
+    capacity: product?.capacity,
+    color: product?.color,
+    slug: product?.slug,
+  };
+}
+
+/** Flattens an OrderItem's nested storeProduct back to the pre-split productId/product shape, using the order-safe identity view above (never live pricing/inventory). */
+function flattenOrderItem(it) {
+  const { storeProduct, ...rest } = it;
+  return {
+    ...rest,
+    productId: it.storeProductId,
+    ...(storeProduct ? { product: orderItemProductIdentity(storeProduct) } : {}),
+  };
+}
+
+/**
  * Turns the user's current cart into an Order (+ OrderItems, snapshotting
  * name/price so later product edits never change historical orders),
  * decrements stock, and empties the cart — all inside one transaction so
  * a failure midway never leaves stock or the cart in a half-updated state.
+ *
+ * A cart/order line item is a specific STORE's offer (StoreProduct) — price
+ * and stock are per-store, not on the shared global Product (see
+ * products.service.js for the Product/StoreProduct split).
  *
  * Every amount here (subtotal/shippingFee/total, and each item's
  * priceSnapshot) is derived from the product's CURRENT price (and its
@@ -62,28 +104,28 @@ async function checkout(userId, { addressId }) {
   return prisma.$transaction(async (tx) => {
     const pricedItems = [];
     for (const item of cart.items) {
-      const product = await tx.product.findUnique({
-        where: { id: item.productId },
-        include: { wholesaleTiers: true, store: { select: { status: true, seller: { select: { deletedAt: true } } } } },
+      const storeProduct = await tx.storeProduct.findUnique({
+        where: { id: item.storeProductId },
+        include: { wholesaleTiers: true, product: true, store: { select: { status: true, seller: { select: { deletedAt: true } } } } },
       });
-      if (!product || product.status !== 'APPROVED' || !product.isActive) {
-        throw ApiError.badRequest(`محصول «${item.product.name}» دیگر در دسترس نیست`);
+      if (!storeProduct || storeProduct.status !== 'APPROVED' || !storeProduct.isActive) {
+        throw ApiError.badRequest(`محصول «${item.storeProduct.product.name}» دیگر در دسترس نیست`);
       }
       // Re-checked fresh from the DB at the moment of checkout — never trusted
       // from the cart's own (possibly stale) product snapshot — for the same
       // reason prices are recomputed below: a store suspended, or a seller
       // soft-deleted (removeSeller()), after the item was added to the cart
       // must still block the order from being created.
-      if (!product.store || product.store.status === 'SUSPENDED' || !product.store.seller || product.store.seller.deletedAt) {
-        throw ApiError.badRequest(`محصول «${item.product.name}» دیگر در دسترس نیست`);
+      if (!storeProduct.store || storeProduct.store.status === 'SUSPENDED' || !storeProduct.store.seller || storeProduct.store.seller.deletedAt) {
+        throw ApiError.badRequest(`محصول «${item.storeProduct.product.name}» دیگر در دسترس نیست`);
       }
-      if (product.stock < item.qty) throw ApiError.badRequest(`موجودی «${product.name}» کافی نیست`);
+      if (storeProduct.stock < item.qty) throw ApiError.badRequest(`موجودی «${storeProduct.product.name}» کافی نیست`);
       pricedItems.push({
-        productId: item.productId,
-        storeId: item.product.storeId,
-        nameSnapshot: item.product.name,
+        storeProductId: item.storeProductId,
+        storeId: item.storeProduct.storeId,
+        nameSnapshot: item.storeProduct.product.name,
         qty: item.qty,
-        priceSnapshot: computeEffectivePrice(product, item.qty),
+        priceSnapshot: computeEffectivePrice(storeProduct, item.qty),
       });
     }
 
@@ -100,7 +142,7 @@ async function checkout(userId, { addressId }) {
         total: subtotal + shippingFee,
         items: {
           create: pricedItems.map((it) => ({
-            productId: it.productId,
+            storeProductId: it.storeProductId,
             storeId: it.storeId,
             nameSnapshot: it.nameSnapshot,
             priceSnapshot: it.priceSnapshot,
@@ -115,11 +157,11 @@ async function checkout(userId, { addressId }) {
       // Conditional update (stock only decremented if still sufficient) instead of a
       // plain decrement — closes a race window where two concurrent checkouts could
       // both pass the earlier stock check and oversell the same product.
-      const { count } = await tx.product.updateMany({
-        where: { id: item.productId, stock: { gte: item.qty } },
+      const { count } = await tx.storeProduct.updateMany({
+        where: { id: item.storeProductId, stock: { gte: item.qty } },
         data: { stock: { decrement: item.qty } },
       });
-      if (count === 0) throw ApiError.badRequest(`موجودی «${item.product.name}» کافی نیست`);
+      if (count === 0) throw ApiError.badRequest(`موجودی «${item.storeProduct.product.name}» کافی نیست`);
     }
     await tx.cartItem.deleteMany({ where: { cartId: cart.id } });
 
@@ -146,7 +188,7 @@ async function checkout(userId, { addressId }) {
 async function getById(orderId, requester) {
   const order = await prisma.order.findUnique({
     where: { id: orderId },
-    include: { items: { include: { product: true, store: true } }, payments: true, address: true },
+    include: { items: { include: { storeProduct: { include: { product: true } }, store: true } }, payments: true, address: true },
   });
   if (!order) throw ApiError.notFound('سفارش یافت نشد');
 
@@ -167,23 +209,29 @@ async function getById(orderId, requester) {
       status: order.status,
       createdAt: order.createdAt,
       items: ownStoreItems.map((it) => ({
-        id: it.id, productId: it.productId, nameSnapshot: it.nameSnapshot, priceSnapshot: it.priceSnapshot, qty: it.qty,
+        id: it.id, productId: it.storeProductId, nameSnapshot: it.nameSnapshot, priceSnapshot: it.priceSnapshot, qty: it.qty,
       })),
     };
   }
 
-  return order;
+  return { ...order, items: order.items.map(flattenOrderItem) };
 }
 
 /** Full order history for the logged-in customer. */
 async function listMine(userId, { page = 1, pageSize = 20 } = {}) {
   const where = { userId };
-  const [items, total] = await Promise.all([
+  const [rawItems, total] = await Promise.all([
     prisma.order.findMany({
       where, include: { items: true }, orderBy: { createdAt: 'desc' }, skip: (page - 1) * pageSize, take: pageSize,
     }),
     prisma.order.count({ where }),
   ]);
+  // items here carry only the point-in-time snapshot (nameSnapshot/priceSnapshot),
+  // no live product join — just alias storeProductId -> productId for API compatibility.
+  const items = rawItems.map((order) => ({
+    ...order,
+    items: order.items.map((it) => ({ ...it, productId: it.storeProductId })),
+  }));
   return {
     items, total, page, pageSize,
   };
@@ -195,16 +243,17 @@ async function listForStore(userId, { page = 1, pageSize = 20 } = {}) {
   if (!store) throw ApiError.notFound('فروشگاهی برای این کاربر یافت نشد');
 
   const where = { items: { some: { storeId: store.id } } };
-  const [items, total] = await Promise.all([
+  const [rawItems, total] = await Promise.all([
     prisma.order.findMany({
       where,
-      include: { items: { where: { storeId: store.id }, include: { product: true } } },
+      include: { items: { where: { storeId: store.id }, include: { storeProduct: { include: { product: true } } } } },
       orderBy: { createdAt: 'desc' },
       skip: (page - 1) * pageSize,
       take: pageSize,
     }),
     prisma.order.count({ where }),
   ]);
+  const items = rawItems.map((order) => ({ ...order, items: order.items.map(flattenOrderItem) }));
   return {
     items, total, page, pageSize,
   };
@@ -270,7 +319,7 @@ async function updateStatus(orderId, status, actor) {
     if (status === 'CANCELLED') {
       for (const item of order.items) {
         // eslint-disable-next-line no-await-in-loop
-        await tx.product.update({ where: { id: item.productId }, data: { stock: { increment: item.qty } } });
+        await tx.storeProduct.update({ where: { id: item.storeProductId }, data: { stock: { increment: item.qty } } });
       }
     }
     return result;

@@ -139,7 +139,7 @@ async function removeSeller(sellerId, actor) {
     // seller with no store yet is still deletable, there's just nothing to archive).
     if (target.store) {
       sId = target.store.id;
-      const archived = await tx.product.updateMany({
+      const archived = await tx.storeProduct.updateMany({
         where: { storeId: sId },
         data: { status: 'ARCHIVED', isActive: false },
       });

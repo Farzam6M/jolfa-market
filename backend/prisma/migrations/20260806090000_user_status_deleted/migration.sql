@@ -1,0 +1,13 @@
+-- Adds the DELETED value to UserStatus for the new general admin-panel
+-- "Delete User" action (DELETE /users/:id, see users.service.js#deleteUser).
+--
+-- This is additive only: ACTIVE / SUSPENDED / BANNED are untouched, so every
+-- existing "Block User" flow (PATCH /users/:id/status, removeSeller()'s
+-- status: 'BANNED') keeps working exactly as before. No existing row's
+-- status changes as a result of this migration.
+--
+-- Note: adding an enum value with ALTER TYPE ... ADD VALUE cannot be
+-- combined with using that same value inside the same transaction/migration
+-- — this migration only adds the value; it is consumed afterwards by
+-- ordinary application code in a separate transaction, which is safe.
+ALTER TYPE "UserStatus" ADD VALUE 'DELETED';

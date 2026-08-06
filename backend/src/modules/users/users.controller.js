@@ -28,6 +28,11 @@ const updateStatus = asyncHandler(async (req, res) => {
   res.json(new ApiResponse(updated, 'وضعیت کاربر به‌روزرسانی شد'));
 });
 
+const deleteUser = asyncHandler(async (req, res) => {
+  const deleted = await service.deleteUser(req.params.id, req.user);
+  res.json(new ApiResponse(deleted, 'کاربر حذف شد'));
+});
+
 const updateAvatar = asyncHandler(async (req, res) => {
   if (!req.file) throw ApiError.badRequest('فایل تصویر ارسال نشده است');
   const avatarUrl = `/uploads/${req.file.filename}`;
@@ -67,6 +72,7 @@ module.exports = {
   list,
   updateAny,
   updateStatus,
+  deleteUser,
   updateAvatar,
   updateContact,
   listAddresses,

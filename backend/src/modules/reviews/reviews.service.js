@@ -2,11 +2,24 @@ const { prisma } = require('../../config/database');
 const ApiError = require('../../utils/ApiError');
 const { logAdminActivity } = require('../admin/admin.service');
 
-/** Only customers who actually bought the product may review it — mirrors real marketplace verified-purchase rules. */
+// A review targets the shared global Product, not any one store's offer of
+// it (see prisma/schema.prisma and the 20260805000000_review_back_to_product
+// migration) — reviews represent the product itself, so a customer writes
+// (and sees) exactly one review per product no matter which store(s) they
+// bought it from, and a review isn't deleted just because the store they
+// originally bought from later removes/archives its own listing.
+
+/**
+ * Eligible if the user has an order item for ANY store's offer of this
+ * product — not just one specific store's — since the review is about the
+ * product, not the seller. Joins through StoreProduct.productId (OrderItem
+ * itself is unchanged — still keyed on storeProductId, per the task's
+ * "do not modify Orders").
+ */
 async function assertVerifiedPurchase(userId, productId) {
   const purchased = await prisma.orderItem.findFirst({
     where: {
-      productId,
+      storeProduct: { productId },
       order: { userId, status: { in: ['CONFIRMED', 'PREPARING', 'SENT', 'DELIVERED'] } },
     },
   });

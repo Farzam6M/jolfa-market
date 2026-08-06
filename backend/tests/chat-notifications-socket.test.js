@@ -58,15 +58,16 @@ async function makePurchaseRelation(customer, store) {
     update: {},
     create: { name: 'دسته تست چت', slug: 'chat-test-category' },
   });
-  const product = await prisma.product.create({
+  const name = `Chat Test Product ${Date.now()}`;
+  const slug = `chat-test-product-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const globalProduct = await prisma.product.create({
     data: {
-      storeId: store.id,
-      categoryId: category.id,
-      name: `Chat Test Product ${Date.now()}`,
-      slug: `chat-test-product-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      price: 10000,
-      stock: 10,
-      status: 'APPROVED',
+      categoryId: category.id, name, slug, identityKey: slug,
+    },
+  });
+  const product = await prisma.storeProduct.create({
+    data: {
+      storeId: store.id, productId: globalProduct.id, price: 10000, stock: 10, status: 'APPROVED',
     },
   });
   const order = await prisma.order.create({
@@ -79,7 +80,7 @@ async function makePurchaseRelation(customer, store) {
       status: 'CONFIRMED',
       items: {
         create: [{
-          productId: product.id, storeId: store.id, nameSnapshot: product.name, priceSnapshot: 10000, qty: 1,
+          storeProductId: product.id, storeId: store.id, nameSnapshot: name, priceSnapshot: 10000, qty: 1,
         }],
       },
     },

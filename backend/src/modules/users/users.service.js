@@ -65,28 +65,36 @@ async function updateStatus(targetId, status, actor) {
   if (!target) throw ApiError.notFound('کاربر یافت نشد');
   if (target.role.key === 'SUPER_ADMIN') throw ApiError.forbidden('امکان تغییر وضعیت مدیر اصلی وجود ندارد');
 
-  // A user soft-deleted via DELETE /admin/sellers/:sellerId (removeSeller() in
-  // sellers.service.js — User.deletedAt stamped) must never be brought back to
-  // ACTIVE through this generic status endpoint. Without this guard, an admin
-  // using the general "مدیریت کاربران" panel could silently undo a seller
-  // deletion (restoring login) while deletedAt stays set and the store/products
-  // remain in their deleted state — an inconsistent, invisible "half-restored"
-  // account. There is deliberately no restore flow anywhere in this project, so
-  // any status other than the deleted state stays blocked once deletedAt is set.
-  if (target.deletedAt) {
+  // Only a real DELETED account (via deleteUser()) must stay blocked here.
+  // BANNED/SUSPENDED are ordinary reversible states — including a seller
+  // banned by removeSeller() (sellers.service.js), which stamps
+  // status: 'BANNED' + deletedAt for its own audit trail. That deletedAt is
+  // NOT a signal that the account is deleted (only status === 'DELETED' is),
+  // so it must never be used to block a status change here.
+  if (target.status === 'DELETED') {
     throw ApiError.conflict('این کاربر قبلاً حذف شده است و امکان تغییر وضعیت آن وجود ندارد');
   }
 
   const updated = await prisma.$transaction(async (tx) => {
-    // The `if (target.deletedAt)` check above is a plain read taken before this
-    // transaction starts, so it cannot see a removeSeller() soft-delete that
-    // commits concurrently, between that read and this transaction's write.
-    // Mirrors removeSeller()'s own race guard: the actual write is a
-    // conditional `updateMany` re-checked at write-time — only succeeds while
-    // `deletedAt` is still null. If removeSeller() won the race first, `count`
-    // is 0 here and this status change is rejected instead of silently
-    // overwriting the status a soft-delete just set.
-    const claim = await tx.user.updateMany({ where: { id: targetId, deletedAt: null }, data: { status } });
+    // The `if (target.status === 'DELETED')` check above is a plain read taken
+    // before this transaction starts, so it cannot see a concurrent
+    // deleteUser() commit that lands between that read and this transaction's
+    // write. The actual write is a conditional `updateMany` re-checked at
+    // write-time — only succeeds while status is still not DELETED. If
+    // deleteUser() won the race first, `count` is 0 here and this status
+    // change is rejected instead of silently overwriting DELETED.
+    const claim = await tx.user.updateMany({
+      where: { id: targetId, status: { not: 'DELETED' } },
+      data: {
+        status,
+        // Restoring/changing status via this generic endpoint always clears
+        // any stale removeSeller() soft-delete markers, so the account can
+        // never end up "half-restored" (status changed here, but deletedAt/
+        // deletedById still stamped from a prior removeSeller() ban).
+        deletedAt: null,
+        deletedById: null,
+      },
+    });
     if (claim.count === 0) {
       throw ApiError.conflict('این کاربر قبلاً حذف شده است و امکان تغییر وضعیت آن وجود ندارد');
     }
@@ -103,7 +111,7 @@ async function updateStatus(targetId, status, actor) {
     // status/isActive are touched — deletedAt is intentionally left untouched
     // here, since this is a reversible status change, not a deletion.
     if (target.role.key === 'SELLER' && status !== 'ACTIVE' && target.store) {
-      await tx.product.updateMany({
+      await tx.storeProduct.updateMany({
         where: { storeId: target.store.id },
         data: { status: 'ARCHIVED', isActive: false },
       });
@@ -116,6 +124,116 @@ async function updateStatus(targetId, status, actor) {
 
   await logAdminActivity(actor.id, `تغییر وضعیت کاربر «${target.name}» به ${status}`);
   return toPublicUser(updated);
+}
+
+/**
+ * Admin/super_admin general "Delete User" (soft delete) — DELETE /users/:id.
+ * Applies to any role (customer, seller, admin), unlike removeSeller() in
+ * sellers.service.js which is seller-only and doesn't free mobile/email.
+ *
+ * Never a raw `prisma.user.delete()`: a user's Orders/Payments/SupportMessages/
+ * StoreMessages/Reviews all carry history that must survive (order history in
+ * particular already can't be hard-deleted — see products.service.js
+ * `remove()`'s identical rule), so this only marks the account deleted:
+ *   - status -> DELETED, deletedAt/deletedById stamped (audit + idempotency,
+ *     same pattern as removeSeller()),
+ *   - mobile is rewritten to a guaranteed-unique synthetic value and email is
+ *     cleared, so the exact same mobile/email can be used again on a fresh
+ *     registration (see auth.service.js `register()` — it only rejects a
+ *     mobile that still exists on some row),
+ *   - every refresh token is revoked; a still-unexpired access token is also
+ *     rejected on its very next request by authenticate() (auth.middleware.js),
+ *     which re-checks `status === 'ACTIVE'` against the DB on every call — so
+ *     no separate access-token blocklist is needed,
+ *   - orders, payments, support/store chat messages, reviews, notifications
+ *     are all left completely untouched.
+ * A deleted SELLER's store/products are archived exactly like removeSeller()
+ * does, so this can't be a second path into a state removeSeller() disagrees
+ * with.
+ */
+async function deleteUser(targetId, actor) {
+  if (targetId === actor.id) throw ApiError.badRequest('امکان حذف حساب خودتان وجود ندارد');
+
+  const target = await prisma.user.findUnique({ where: { id: targetId }, include: { role: true, store: true } });
+  if (!target) throw ApiError.notFound('کاربر یافت نشد');
+  // Only a real DELETED account blocks another delete. BANNED/SUSPENDED
+  // (including a seller previously banned by removeSeller(), which also
+  // stamps deletedAt for its own audit trail) must remain deletable through
+  // this generic endpoint — deleting them here correctly promotes them to
+  // the real DELETED state.
+  if (target.status === 'DELETED') throw ApiError.conflict('این کاربر قبلاً حذف شده است');
+
+  // Absolute protection, matching removeSeller()'s identical rule: the
+  // super_admin account can never be soft-deleted through any admin-panel
+  // action, no matter who's asking — otherwise the platform could end up
+  // with no super_admin left able to log in.
+  if (target.role.key === 'SUPER_ADMIN') {
+    throw ApiError.forbidden('امکان حذف مدیر اصلی سایت وجود ندارد');
+  }
+  // An ADMIN account may only be removed by a super_admin (wildcard '*') —
+  // a plain admin can never delete another admin, even though both hold
+  // USERS_DELETE (enforced here, not just at the route, since the route only
+  // knows the permission was granted, not who the specific target is).
+  const isSuperAdmin = actor.permissions.includes('*');
+  if (target.role.key === 'ADMIN' && !isSuperAdmin) {
+    throw ApiError.forbidden('فقط مدیر اصلی سایت می‌تواند حساب یک ادمین را حذف کند');
+  }
+
+  // Frees the mobile number for a brand-new registration with the same
+  // value: mobile is NOT NULL + @unique, so (unlike email) it can't just be
+  // cleared — it's rewritten to a value guaranteed unique (embeds the user's
+  // own id) and clearly synthetic/non-guessable as a real mobile number.
+  const freedMobile = `deleted:${target.mobile}:${target.id}`;
+
+  const updated = await prisma.$transaction(async (tx) => {
+    // Same idempotency/race pattern as removeSeller(): the plain read above
+    // happens before this transaction starts, so two concurrent delete
+    // requests for the same user could both pass it. The actual claim is a
+    // conditional updateMany re-checked at write-time — only the request
+    // that still finds status !== 'DELETED' at the moment of the write wins.
+    const claim = await tx.user.updateMany({
+      where: { id: targetId, status: { not: 'DELETED' } },
+      data: {
+        status: 'DELETED',
+        deletedAt: new Date(),
+        deletedById: actor.id,
+        mobile: freedMobile,
+        email: null,
+      },
+    });
+    if (claim.count === 0) {
+      throw ApiError.conflict('این کاربر قبلاً حذف شده است');
+    }
+
+    // Kill every active session immediately.
+    await tx.refreshToken.updateMany({ where: { userId: targetId, revoked: false }, data: { revoked: true } });
+
+    // Mirrors removeSeller(): a deleted SELLER's store/products must also
+    // stop being publicly visible (GET /products / GET /stores already hide
+    // ARCHIVED/SUSPENDED, per products.service.js / stores.service.js list()).
+    let sId = null;
+    if (target.role.key === 'SELLER' && target.store) {
+      sId = target.store.id;
+      await tx.storeProduct.updateMany({ where: { storeId: sId }, data: { status: 'ARCHIVED', isActive: false } });
+      await tx.store.update({ where: { id: sId }, data: { status: 'SUSPENDED' } });
+    }
+
+    const user = await tx.user.findUnique({ where: { id: targetId }, include: { role: true } });
+    return { user, storeId: sId };
+  });
+
+  await logAdminActivity(actor.id, `حذف کاربر «${target.name}»`, {
+    code: 'DELETE_USER',
+    targetUserId: targetId,
+    targetRole: target.role.key,
+    storeId: updated.storeId,
+    // Kept here (not on the User row) purely for the audit trail — the
+    // actual row's mobile/email are now the freed/cleared values above.
+    originalMobile: target.mobile,
+    originalEmail: target.email,
+  });
+
+  return toPublicUser(updated.user);
 }
 
 /**
@@ -231,6 +349,7 @@ module.exports = {
   updateSelf,
   list,
   updateStatus,
+  deleteUser,
   createStaffUser,
   MAX_ADMINS,
   updateAvatar,

@@ -362,6 +362,7 @@ img { max-width: 100%; display: block; }
 .product-price { font-size: 14.5px; font-weight: 700; color: var(--primary); }
 .product-price span { font-size: 10px; font-weight: 400; color: var(--gray-400); }
 .product-shops { font-size: 10.5px; color: var(--gray-400); margin-top: 3px; }
+.product-offer-count { font-size: 10.5px; color: var(--primary); margin-top: 2px; font-weight: 600; }
 .stars-row { display: flex; align-items: center; gap: 4px; margin-top: 5px; }
 .stars { display: flex; gap: 1px; color: var(--gold); }
 .stars svg { width: 11px; height: 11px; }
@@ -622,6 +623,20 @@ img { max-width: 100%; display: block; }
 .btn-wish.liked { background: var(--red); border-color: var(--red); color: #fff; }
 .btn-wish.liked svg { stroke: #fff; fill: #fff; }
 .spec-table { background: var(--white); border-radius: var(--radius); padding: 16px; margin-top: 16px; border: 1px solid var(--gray-200); }
+
+/* ── چند-فروشنده در صفحه جزئیات محصول (#pdOffersList) — همان کلاس‌های
+   price-row/shop-n/price-n/avail بالا برای هر فروشنده تکرار می‌شود، فقط
+   یک دکمهٔ کوچک «افزودن به سبد» مخصوص هر offer اضافه شده است. */
+.pd-offer-row { gap: 10px; }
+.pd-offer-row .shop-n { flex: 1; min-width: 0; }
+.pd-offer-row .shop-n span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pd-offer-addcart { flex-shrink: 0; width: 34px; height: 34px; border-radius: 10px; border: none; background: var(--primary); color: #fff; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: background 0.15s, transform 0.15s; }
+.pd-offer-addcart svg { width: 16px; height: 16px; stroke: #fff; fill: none; stroke-width: 2; }
+.pd-offer-addcart:hover { background: var(--primary-dark); transform: translateY(-1px); }
+/* ردیف «انتخاب‌شده» (selectPdOffer در index.html) — همان offer که دکمهٔ سراسری
+   «افزودن به سبد»/آیکن «علاقه‌مندی» بالای صفحه الان به آن اشاره می‌کنند. */
+.pd-offer-row.selected { background: rgba(109,40,217,0.05); border-radius: 10px; margin: 0 -10px; padding-left: 10px; padding-right: 10px; }
+.pd-offer-row.selected .shop-n span { color: var(--primary); }
 .spec-row { display: flex; gap: 14px; padding: 9px 0; border-bottom: 1px solid var(--gray-100); font-size: 12.5px; }
 .spec-row:last-child { border-bottom: none; }
 .spec-k { color: var(--gray-400); min-width: 90px; }
@@ -1467,6 +1482,8 @@ body:has(#page-auth.active) .navbar { display: none; }
   .product-detail { grid-template-columns: 1fr; gap: 20px; }
   .product-images { position: static; }
   .product-page { padding: 14px 16px; }
+  .pd-offer-row { flex-wrap: wrap; }
+  .pd-offer-row .shop-n { flex: 1 1 100%; }
 
   .chat-layout { grid-template-columns: 1fr; height: auto; }
   .chat-sidebar { display: none; }

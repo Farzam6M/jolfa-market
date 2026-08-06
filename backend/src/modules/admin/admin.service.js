@@ -36,9 +36,9 @@ async function getOverviewStats() {
     prisma.store.count({ where: activeStoreWhere }),
     prisma.user.count(),
     prisma.user.count({ where: { createdAt: { gte: weekAgo } } }),
-    prisma.product.count({ where: activeProductWhere }),
-    prisma.product.count({ where: { ...activeProductWhere, updatedAt: { gte: weekAgo } } }),
-    prisma.product.count({ where: { status: 'PENDING' } }),
+    prisma.storeProduct.count({ where: activeProductWhere }),
+    prisma.storeProduct.count({ where: { ...activeProductWhere, updatedAt: { gte: weekAgo } } }),
+    prisma.storeProduct.count({ where: { status: 'PENDING' } }),
     prisma.store.count({ where: { status: 'PENDING' } }),
     prisma.sellerApplication.count({ where: { status: 'PENDING' } }),
   ]);

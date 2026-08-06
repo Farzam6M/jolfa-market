@@ -59,6 +59,12 @@ enum UserStatus {
   ACTIVE
   SUSPENDED
   BANNED
+  // Set by the general admin-panel "Delete User" action (DELETE /users/:id,
+  // users.service.js#deleteUser) — a distinct terminal state from
+  // SUSPENDED/BANNED ("Block User"), since a deleted account also has its
+  // mobile/email freed for re-registration and can never be reactivated
+  // (see the no-restore-flow rule already enforced in updateStatus()).
+  DELETED
 }
 
 model User {
@@ -78,12 +84,14 @@ model User {
   lockedUntil      DateTime?
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
-  // Soft-delete marker set by DELETE /api/admin/sellers/:sellerId (removeSeller()
-  // in sellers.service.js). The row itself is never SQL-DELETEd — a seller's
-  // Store/Product rows can carry order history that must survive (see
-  // products.service.js remove()'s identical "never hard-delete anything with
-  // order history" rule) — so deletion instead bans the account (`status`)
-  // and stamps when/by whom. Plain string, no relation, matching the existing
+  // Soft-delete marker, set by either of two admin-panel actions:
+  //   - DELETE /admin/sellers/:sellerId (removeSeller() in sellers.service.js) — seller-specific
+  //   - DELETE /users/:id (deleteUser() in users.service.js) — general, any role
+  // The row itself is never SQL-DELETEd — a user's Orders/Payments/Store/
+  // Product rows can carry history that must survive (see products.service.js
+  // remove()'s identical "never hard-delete anything with order history"
+  // rule) — so deletion instead marks the account (`status: DELETED`) and
+  // stamps when/by whom. Plain string, no relation, matching the existing
   // reviewedById convention on Product / SellerApplication.
   deletedAt      DateTime?
   deletedById    String?
@@ -206,7 +214,7 @@ model Store {
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
 
-  products           Product[]
+  storeProducts      StoreProduct[]
   orderItems         OrderItem[]
   storeConversations StoreConversation[]
 
@@ -267,19 +275,64 @@ enum ProductStatus {
   ARCHIVED
 }
 
+// ──────────────────────────── Product (global) / StoreProduct (store offer) ────────────────────────────
+//
+// Product = the platform-wide catalog entry for one physical item (an "iPhone
+// 16 Pro, 256GB, Black" exists exactly once no matter how many stores sell
+// it). `identityKey` is a deterministic hash of the normalized identity
+// fields (name/brand/model/capacity/color — see products.service.js
+// buildIdentityKey()) and is the ONLY thing that decides whether a
+// newly-submitted product reuses an existing Product row or creates a new
+// one. `slug` is unique too (used for the public product URL) but is NOT the
+// dedup key — two stores submitting the same product with slightly
+// different name casing/whitespace must still resolve to one Product.
+//
+// StoreProduct = one store's sellable offer of a Product: price, stock,
+// moderation status, images, wholesale tiers, warranty, etc. This is what
+// carts/orders/wishlist/reviews actually point at (`storeId`+`productId` is
+// unique — a store can only have ONE offer per global product).
 model Product {
+  id             String    @id @default(uuid())
+  categoryId     String?
+  category       Category? @relation(fields: [categoryId], references: [id])
+  name           String
+  slug           String    @unique
+  brand          String?
+  model          String?
+  capacity       String?
+  color          String?
+  description    String?
+  // Free-form spec sheet (e.g. { "چیپست": "A18 Pro", "رم": "8GB" }) — not
+  // used in identityKey generation, purely descriptive.
+  specifications Json?
+  // Deterministic fingerprint of the normalized identity fields. UNIQUE —
+  // this is the actual dedup mechanism (see point 2/3 of products.service.js).
+  identityKey    String    @unique
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  storeProducts StoreProduct[]
+  reviews       Review[]
+
+  @@index([categoryId])
+  @@map("products")
+}
+
+model StoreProduct {
   id             String        @id @default(uuid())
   storeId        String
   store          Store         @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  categoryId     String?
-  category       Category?     @relation(fields: [categoryId], references: [id])
-  name           String
-  slug           String        @unique
-  brand          String?
-  description    String?
+  productId      String
+  product        Product       @relation(fields: [productId], references: [id], onDelete: Restrict)
   price          Decimal       @db.Decimal(12, 0)
   compareAtPrice Decimal?      @db.Decimal(12, 0)
   stock          Int           @default(0)
+  warranty       String?
+  shippingTime   String?
+  // Percentage off `price`, 0-100. Purely informational/display — `price`
+  // itself is always the authoritative charge amount; this does not
+  // recompute price automatically.
+  discount       Int?
   type           ProductType   @default(RETAIL)
   status         ProductStatus @default(PENDING)
   // Seller-controlled visibility toggle — independent from `status` (admin moderation).
@@ -298,39 +351,39 @@ model Product {
   wholesaleTiers WholesaleTier[]
   cartItems     CartItem[]
   wishlistItems WishlistItem[]
-  reviews       Review[]
   orderItems    OrderItem[]
 
+  @@unique([storeId, productId])
   @@index([storeId])
-  @@index([categoryId])
+  @@index([productId])
   @@index([status])
   // Every public/customer listing query filters on both of these together
   // (status = APPROVED AND isActive = true) — a composite index lets that
   // filter be satisfied by a single index scan instead of one index scan
   // plus a row-by-row isActive re-check.
   @@index([status, isActive])
-  @@map("products")
+  @@map("store_products")
 }
 
 model ProductImage {
-  id        String   @id @default(uuid())
-  productId String
-  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
-  url       String
-  position  Int      @default(0)
+  id             String       @id @default(uuid())
+  storeProductId String
+  storeProduct   StoreProduct @relation(fields: [storeProductId], references: [id], onDelete: Cascade)
+  url            String
+  position       Int          @default(0)
 
-  @@index([productId])
+  @@index([storeProductId])
   @@map("product_images")
 }
 
 model WholesaleTier {
-  id        String  @id @default(uuid())
-  productId String
-  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
-  minQty    Int
-  price     Decimal @db.Decimal(12, 0)
+  id             String       @id @default(uuid())
+  storeProductId String
+  storeProduct   StoreProduct @relation(fields: [storeProductId], references: [id], onDelete: Cascade)
+  minQty         Int
+  price          Decimal      @db.Decimal(12, 0)
 
-  @@index([productId])
+  @@index([storeProductId])
   @@map("wholesale_tiers")
 }
 
@@ -347,27 +400,27 @@ model Cart {
 }
 
 model CartItem {
-  id            String  @id @default(uuid())
-  cartId        String
-  cart          Cart    @relation(fields: [cartId], references: [id], onDelete: Cascade)
-  productId     String
-  product       Product @relation(fields: [productId], references: [id], onDelete: Cascade)
-  qty           Int     @default(1)
-  priceSnapshot Decimal @db.Decimal(12, 0)
+  id             String       @id @default(uuid())
+  cartId         String
+  cart           Cart         @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  storeProductId String
+  storeProduct   StoreProduct @relation(fields: [storeProductId], references: [id], onDelete: Cascade)
+  qty            Int          @default(1)
+  priceSnapshot  Decimal      @db.Decimal(12, 0)
 
-  @@unique([cartId, productId])
+  @@unique([cartId, storeProductId])
   @@map("cart_items")
 }
 
 model WishlistItem {
-  id        String   @id @default(uuid())
-  userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  productId String
-  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
-  createdAt DateTime @default(now())
+  id             String       @id @default(uuid())
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  storeProductId String
+  storeProduct   StoreProduct @relation(fields: [storeProductId], references: [id], onDelete: Cascade)
+  createdAt      DateTime     @default(now())
 
-  @@unique([userId, productId])
+  @@unique([userId, storeProductId])
   @@map("wishlist_items")
 }
 
@@ -433,19 +486,20 @@ model Order {
 }
 
 model OrderItem {
-  id        String  @id @default(uuid())
-  orderId   String
-  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  productId String
-  product   Product @relation(fields: [productId], references: [id])
-  storeId   String
-  store     Store   @relation(fields: [storeId], references: [id])
-  nameSnapshot  String
-  priceSnapshot Decimal @db.Decimal(12, 0)
-  qty       Int
+  id             String       @id @default(uuid())
+  orderId        String
+  order          Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  storeProductId String
+  storeProduct   StoreProduct @relation(fields: [storeProductId], references: [id])
+  storeId        String
+  store          Store        @relation(fields: [storeId], references: [id])
+  nameSnapshot   String
+  priceSnapshot  Decimal      @db.Decimal(12, 0)
+  qty            Int
 
   @@index([orderId])
   @@index([storeId])
+  @@index([storeProductId])
   @@map("order_items")
 }
 
@@ -469,7 +523,13 @@ model Payment {
   method          PaymentMethod
   amount          Decimal       @db.Decimal(12, 0)
   status          PaymentStatus @default(PENDING)
-  transactionRef  String?
+  // Unique so two payment attempts (e.g. a customer retrying after an
+  // abandoned/failed gateway session) can never end up sharing one ref —
+  // see initGatewayPayment/confirmGateway in payments.service.js. NULL for
+  // WALLET/CASH_ON_DELIVERY payments, which never carry a gateway ref;
+  // Postgres allows unlimited NULLs under a unique constraint, so this
+  // doesn't restrict those methods.
+  transactionRef  String?       @unique
   paidAt          DateTime?
   createdAt       DateTime      @default(now())
 

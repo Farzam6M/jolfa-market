@@ -62,11 +62,14 @@ async function makeStore(sellerId, name) {
 }
 
 async function makeProduct(storeId, name) {
-  return prisma.product.create({
+  const slug = `${name.toLowerCase().replace(/\s+/g, '-')}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const product = await prisma.product.create({
+    data: { name, slug, identityKey: slug },
+  });
+  return prisma.storeProduct.create({
     data: {
       storeId,
-      name,
-      slug: `${name.toLowerCase().replace(/\s+/g, '-')}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      productId: product.id,
       price: 100000,
       status: 'APPROVED',
       isActive: true,
@@ -162,7 +165,7 @@ describe('DELETE /admin/sellers/:sellerId', () => {
       .set('Authorization', admin.auth);
 
     expect(res.status).toBe(200);
-    const updatedProduct = await prisma.product.findUnique({ where: { id: product.id } });
+    const updatedProduct = await prisma.storeProduct.findUnique({ where: { id: product.id } });
     expect(updatedProduct).not.toBeNull(); // row still exists — not hard-deleted
     expect(updatedProduct.status).toBe('ARCHIVED');
     expect(updatedProduct.isActive).toBe(false);
@@ -173,7 +176,8 @@ describe('DELETE /admin/sellers/:sellerId', () => {
     const seller = await makeUser('SELLER');
     const customer = await makeUser('CUSTOMER');
     const store = await makeStore(seller.user.id, 'Store With Orders');
-    const product = await makeProduct(store.id, 'Ordered Product');
+    const productName = 'Ordered Product';
+    const product = await makeProduct(store.id, productName);
 
     const order = await prisma.order.create({
       data: {
@@ -185,9 +189,9 @@ describe('DELETE /admin/sellers/:sellerId', () => {
         status: 'DELIVERED',
         items: {
           create: [{
-            productId: product.id,
+            storeProductId: product.id,
             storeId: store.id,
-            nameSnapshot: product.name,
+            nameSnapshot: productName,
             priceSnapshot: 100000,
             qty: 1,
           }],
@@ -211,7 +215,7 @@ describe('DELETE /admin/sellers/:sellerId', () => {
     const stillPaid = await prisma.payment.findUnique({ where: { id: payment.id } });
     expect(stillPaid.status).toBe('SUCCESS');
 
-    const archivedProduct = await prisma.product.findUnique({ where: { id: product.id } });
+    const archivedProduct = await prisma.storeProduct.findUnique({ where: { id: product.id } });
     expect(archivedProduct.status).toBe('ARCHIVED');
   });
 

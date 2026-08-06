@@ -85,8 +85,8 @@ async function remove(id, actor) {
   if (!category) throw ApiError.notFound('دسته‌بندی یافت نشد');
 
   const categoryIds = [id, ...category.children.map((c) => c.id)];
-  const activeProductCount = await prisma.product.count({
-    where: { categoryId: { in: categoryIds }, isActive: true, status: { not: 'ARCHIVED' } },
+  const activeProductCount = await prisma.storeProduct.count({
+    where: { product: { categoryId: { in: categoryIds } }, isActive: true, status: { not: 'ARCHIVED' } },
   });
   if (activeProductCount > 0) {
     throw ApiError.conflict(`این دسته‌بندی ${activeProductCount} محصول فعال دارد؛ ابتدا محصولات را جابه‌جا یا غیرفعال کنید`);
