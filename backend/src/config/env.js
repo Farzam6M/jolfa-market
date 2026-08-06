@@ -78,6 +78,17 @@ module.exports = {
     resendCooldownSec: parseInt(process.env.VERIFICATION_RESEND_COOLDOWN_SEC || '60', 10),
   },
 
+  // OTP codes (registration, and — reusing the same otp_codes table/purpose
+  // enum — future login-by-OTP and OTP password-reset). Same shape as
+  // `verification` above on purpose, since the semantics (expiry + resend
+  // cooldown) are identical; `maxAttempts` additionally bounds brute-force
+  // guesses against a single issued code.
+  otp: {
+    expiresMin: parseInt(process.env.OTP_CODE_EXPIRES_MIN || '5', 10),
+    maxAttempts: parseInt(process.env.OTP_MAX_ATTEMPTS || '5', 10),
+    resendCooldownSec: parseInt(process.env.OTP_RESEND_COOLDOWN_SEC || '60', 10),
+  },
+
   // HMAC secret shared with the payment gateway to sign its callback/webhook
   // payload. Deliberately NOT a requiredSecret() — no gateway provider is
   // wired in yet, so this stays undefined in dev. The callback route itself

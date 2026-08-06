@@ -51,6 +51,11 @@ const resetPassword = asyncHandler(async (req, res) => {
   res.json(new ApiResponse(null, 'رمز عبور با موفقیت بازیابی شد'));
 });
 
+const sendOtp = asyncHandler(async (req, res) => {
+  await authService.sendOtp(req.body);
+  res.json(new ApiResponse(null, 'کد تأیید ارسال شد'));
+});
+
 const sendVerification = asyncHandler(async (req, res) => {
   await authService.sendVerification(req.user.id, req.params.type);
   res.json(new ApiResponse(null, 'کد تأیید ارسال شد'));
@@ -88,6 +93,7 @@ module.exports = {
   resetPassword,
   sendVerification,
   confirmVerification,
+  sendOtp,
   listSessions,
   revokeSession,
   revokeAllSessions,

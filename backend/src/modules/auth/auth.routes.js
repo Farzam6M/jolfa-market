@@ -7,7 +7,14 @@ const {
   registerSchema, loginSchema, refreshSchema, changePasswordSchema,
   forgotPasswordSchema, resetPasswordSchema,
   verificationTypeParamSchema, verifyConfirmSchema, sessionIdParamSchema,
+  sendOtpSchema,
 } = require('./auth.validation');
+
+// Issues an OTP for a given (mobile, purpose). Currently only purpose=register
+// is consumed anywhere (by POST /register below); purpose=login and
+// purpose=password-reset are accepted by validation already so this same
+// endpoint can back those flows later without changes here.
+router.post('/otp/send', authLimiter, validate({ body: sendOtpSchema }), controller.sendOtp);
 
 router.post('/register', authLimiter, validate({ body: registerSchema }), controller.register);
 router.post('/login', authLimiter, validate({ body: loginSchema }), controller.login);

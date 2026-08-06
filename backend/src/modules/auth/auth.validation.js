@@ -12,10 +12,27 @@ const strongPasswordSchema = z
   .regex(/[A-Z]/, 'رمز عبور باید حداقل شامل یک حرف بزرگ انگلیسی باشد')
   .regex(/[0-9]/, 'رمز عبور باید حداقل شامل یک عدد باشد');
 
+// Same purpose set as the Prisma `OtpPurpose` enum, spelled the way a client
+// would send it in a request body/URL (kebab-case), mapped to the Prisma
+// enum's UPPER_SNAKE_CASE inside auth.service.js — matches the existing
+// verificationTypeParamSchema convention just below.
+const otpPurposeSchema = z.enum(['register', 'login', 'password-reset'], {
+  errorMap: () => ({ message: 'هدف OTP باید یکی از register، login یا password-reset باشد' }),
+});
+
+const sendOtpSchema = z.object({
+  mobile: mobileSchema,
+  purpose: otpPurposeSchema,
+});
+
 const registerSchema = z.object({
   name: z.string().min(2, 'نام باید حداقل ۲ کاراکتر باشد').max(80),
   mobile: mobileSchema,
   password: strongPasswordSchema,
+  // Must be a previously-issued, still-valid OTP for this mobile with
+  // purpose=register (see POST /auth/otp/send) — verified and consumed
+  // inside authService.register() before the User row is created.
+  otpCode: z.string().min(4, 'کد تأیید نامعتبر است').max(10),
 });
 
 const loginSchema = z.object({
@@ -74,4 +91,6 @@ module.exports = {
   verificationTypeParamSchema,
   verifyConfirmSchema,
   sessionIdParamSchema,
+  otpPurposeSchema,
+  sendOtpSchema,
 };

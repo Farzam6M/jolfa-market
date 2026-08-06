@@ -47,10 +47,118 @@ async function issueTokenPair(user, meta = {}) {
   return { accessToken, refreshToken };
 }
 
-/** New customer self-registration. Sellers/admins are created through dedicated flows (seller application, admin creation). */
-async function register({ name, mobile, password }, meta = {}) {
+// Client-facing (kebab-case) purpose -> Prisma `OtpPurpose` enum value.
+// Mirrors VERIFICATION_TYPE_MAP's convention just below. LOGIN and
+// PASSWORD_RESET aren't wired to a flow yet (only REGISTER is, in this
+// step) but are mapped now so sendOtp()/verifyAndConsumeOtp() need no
+// changes when those flows are added later — only new routes/controller
+// actions consuming them.
+const OTP_PURPOSE_MAP = { register: 'REGISTER', login: 'LOGIN', 'password-reset': 'PASSWORD_RESET' };
+
+/**
+ * Issues (or re-issues, subject to a cooldown) an OTP for the given mobile
+ * number + purpose. Mocked delivery — goes through the same `sendSms`
+ * choke point as every other SMS in this codebase (see utils/messaging.js).
+ *
+ * For purpose=register specifically, this also rejects already-registered
+ * numbers up front so an SMS is never wasted on a mobile that register()
+ * would reject anyway — register() still repeats its own check (defense in
+ * depth, and it's the check that actually matters since this one is only a
+ * courtesy/early-exit).
+ */
+async function sendOtp({ mobile, purpose: purposeParam }) {
+  const purpose = OTP_PURPOSE_MAP[purposeParam];
+
+  if (purpose === 'REGISTER') {
+    const existing = await prisma.user.findUnique({ where: { mobile } });
+    if (existing) throw ApiError.conflict('این شماره موبایل قبلاً ثبت شده است');
+  }
+
+  const last = await prisma.otpCode.findFirst({
+    where: { mobile, purpose },
+    orderBy: { createdAt: 'desc' },
+  });
+  const cooldownMs = env.otp.resendCooldownSec * 1000;
+  if (last && Date.now() - last.createdAt.getTime() < cooldownMs) {
+    throw ApiError.badRequest('برای ارسال مجدد کد کمی صبر کنید');
+  }
+
+  // Invalidate any still-outstanding codes for this (mobile, purpose) before
+  // issuing a new one — same "only the latest code is ever valid" rule
+  // forgotPassword() applies to password_reset_tokens.
+  await prisma.otpCode.updateMany({ where: { mobile, purpose, consumed: false }, data: { consumed: true } });
+
+  const code = generateNumericCode(6);
+  await prisma.otpCode.create({
+    data: {
+      mobile,
+      purpose,
+      codeHash: hashToken(code),
+      maxAttempts: env.otp.maxAttempts,
+      expiresAt: new Date(Date.now() + env.otp.expiresMin * 60 * 1000),
+    },
+  });
+
+  await sendSms(mobile, `کد تأیید شما: ${code}`);
+}
+
+/**
+ * Verifies an OTP for (mobile, purpose) and atomically consumes it so it
+ * can never be reused — same atomic-claim pattern (updateMany + count
+ * check) used for password-reset tokens and email/mobile verification
+ * codes elsewhere in this file, to guard against a concurrent-request race
+ * double-spending one code. Internal helper (not a route by itself) so
+ * every future OTP-gated flow (login, password-reset) can call it exactly
+ * like register() does below.
+ *
+ * Wrong-code attempts increment the row's `attempts` counter; once it
+ * reaches `maxAttempts` the code is dead even if the correct value is
+ * supplied afterwards, and the caller must request a fresh one via sendOtp().
+ */
+async function verifyAndConsumeOtp(mobile, purposeParam, code) {
+  const purpose = OTP_PURPOSE_MAP[purposeParam];
+  const invalid = () => ApiError.badRequest('کد تأیید نامعتبر یا منقضی شده است');
+
+  const record = await prisma.otpCode.findFirst({
+    where: { mobile, purpose, consumed: false },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!record) throw invalid();
+  if (record.expiresAt < new Date()) throw invalid();
+  if (record.attempts >= record.maxAttempts) {
+    throw ApiError.badRequest('تعداد تلاش‌های مجاز برای این کد به پایان رسیده است — یک کد جدید درخواست کنید');
+  }
+
+  if (record.codeHash !== hashToken(code)) {
+    await prisma.otpCode.update({ where: { id: record.id }, data: { attempts: { increment: 1 } } });
+    throw invalid();
+  }
+
+  const claim = await prisma.otpCode.updateMany({
+    where: { id: record.id, consumed: false },
+    data: { consumed: true },
+  });
+  if (claim.count === 0) throw invalid(); // lost a race to another concurrent verify call
+
+  return true;
+}
+
+/**
+ * New customer self-registration. Sellers/admins are created through
+ * dedicated flows (seller application, admin creation).
+ *
+ * Now OTP-gated: `otpCode` must be a still-valid, unconsumed code
+ * previously issued by sendOtp({ purpose: 'register' }) for this exact
+ * mobile. It is verified and consumed BEFORE the User row is created — if
+ * verification fails, no account is created and none of the post-creation
+ * side effects (cart/wallet creation, admin notification, activity log,
+ * token issuance) run.
+ */
+async function register({ name, mobile, password, otpCode }, meta = {}) {
   const existing = await prisma.user.findUnique({ where: { mobile } });
   if (existing) throw ApiError.conflict('این شماره موبایل قبلاً ثبت شده است');
+
+  await verifyAndConsumeOtp(mobile, 'register', otpCode);
 
   const role = await prisma.role.findUnique({ where: { key: 'CUSTOMER' } });
   if (!role) throw ApiError.internal('نقش پیش‌فرض کاربر یافت نشد — seed را اجرا کنید');
@@ -353,6 +461,7 @@ module.exports = {
   resetPassword,
   sendVerification,
   confirmVerification,
+  sendOtp,
   listSessions,
   revokeSession,
   revokeAllSessions,

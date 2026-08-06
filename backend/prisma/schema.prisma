@@ -171,6 +171,37 @@ model VerificationToken {
   @@map("verification_tokens")
 }
 
+enum OtpPurpose {
+  REGISTER
+  LOGIN
+  PASSWORD_RESET
+}
+
+// Stand-alone OTP store for flows that happen BEFORE a User row exists
+// (registration-by-OTP) as well as flows resolved by mobile on an existing
+// user (OTP login, OTP password-reset). Deliberately has NO relation to
+// User — unlike VerificationToken above, which verifies an
+// already-created account's email/mobile — because at REGISTER time there
+// is no userId yet to attach to. All three purposes share this one table,
+// keyed by (mobile, purpose); the app layer resolves/creates the User as
+// appropriate for whichever purpose is being completed.
+model OtpCode {
+  id          String     @id @default(uuid())
+  mobile      String
+  purpose     OtpPurpose
+  codeHash    String
+  // Per-code brute-force guard (separate from the resend cooldown, which is
+  // enforced in application code the same way VerificationToken's is).
+  attempts    Int        @default(0)
+  maxAttempts Int        @default(5)
+  consumed    Boolean    @default(false)
+  expiresAt   DateTime
+  createdAt   DateTime   @default(now())
+
+  @@index([mobile, purpose])
+  @@map("otp_codes")
+}
+
 model Address {
   id         String   @id @default(uuid())
   userId     String
