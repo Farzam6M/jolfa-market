@@ -280,18 +280,28 @@ export function initHeroSlider(mountEl) {
     }, AUTOPLAY_MS);
   }
 
-  /** Asks the browser to scroll the target slide into view. No pixel math —
-   *  scrollIntoView lets the browser compute the destination itself. */
+  /** Scrolls only the horizontal track container to the target slide — never
+   *  the page. scrollIntoView() was used here before, but it walks up every
+   *  scrollable ancestor (not just the track) to decide what needs to move;
+   *  since .jhs-track has overflow-y:hidden (it can't scroll vertically),
+   *  the next scrollable ancestor it finds is the page itself. If the Hero
+   *  section was scrolled out of view, that made scrollIntoView() yank the
+   *  whole page back to the top on every slide change (including autoplay).
+   *  scrollTo() on the track itself only ever touches the track's own
+   *  horizontal scroll position, so the page's scroll position is never
+   *  touched. The pixel delta is still measured by the browser (via
+   *  getBoundingClientRect), not hardcoded from slide widths, so this stays
+   *  correct in RTL too. */
   function goToIndex(index) {
     const total = state.slides.length;
     if (total === 0) return;
     const nextIndex = ((index % total) + total) % total;
     const targetEl = track.children[nextIndex];
     if (!targetEl) return;
-    targetEl.scrollIntoView({
+    const deltaLeft = targetEl.getBoundingClientRect().left - track.getBoundingClientRect().left;
+    track.scrollTo({
+      left: track.scrollLeft + deltaLeft,
       behavior: prefersReducedMotion ? 'auto' : 'smooth',
-      inline: 'start',
-      block: 'nearest',
     });
     // IntersectionObserver will confirm/update activeIndex once the scroll
     // settles; setting it here too keeps dots/aria in sync immediately for

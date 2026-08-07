@@ -4267,6 +4267,15 @@ function updatePasswordRequirements(password) {
   });
 }
 
+/* عنوان/زیرعنوان بالای فرم Auth بر اساس تب فعال (ورود/ثبت‌نام) — تک‌منبع
+   حقیقت؛ switchAuthTab (و به‌تبع آن backToLogin/resetForgotPasswordState که
+   حالت پیش‌فرض «ورود» را برمی‌گردانند) از همین شیء می‌خوانند تا این متن‌ها
+   در چند جای مختلف hard-code نشوند. */
+const AUTH_TAB_TEXT = {
+  login: { title: 'خوش آمدید', subtitle: 'وارد حساب کاربری خود شوید' },
+  register: { title: 'ثبت‌نام در جلفا مارکت', subtitle: 'برای خرید و دسترسی به امکانات، اطلاعات خود را وارد کنید' }
+};
+
 /* ── Registration (OTP-backed, ۲ مرحله‌ای): مرحله ۱ نام/موبایل/رمز عبور را
       می‌گیرد و از طریق POST /auth/otp/send (purpose=register) کد تایید
       می‌فرستد؛ مرحله ۲ همان کد را می‌گیرد و POST /auth/register را با
@@ -4405,6 +4414,11 @@ function resetRegisterFormState() {
     const el = document.getElementById(id);
     if (el) el.value = '';
   });
+  /* Password Strength indicators (چک‌مارک‌های regPasswordReqs) هم باید به
+     حالت اولیه (همه غیرفعال) برگردند؛ همان تابع موجودی که هنگام تایپ رمز
+     این چک‌مارک‌ها را به‌روزرسانی می‌کند، با رشتهٔ خالی صدا زده می‌شود تا
+     منطق toggle تکراری نشود. */
+  if (typeof updatePasswordRequirements === 'function') updatePasswordRequirements('');
 }
 
 /* مرحله ۲ → ثبت‌نام نهایی: کد OTP وارد‌شده به همراه اطلاعات نگه‌داشته‌شدهٔ
@@ -6048,8 +6062,8 @@ function backToLogin() {
   document.getElementById('authDividerWrap').style.display = 'flex';
   document.getElementById('authSocialWrap').style.display = 'flex';
   document.getElementById('loginForm').style.display = 'block';
-  document.getElementById('authTitle').textContent = 'خوش آمدید';
-  document.getElementById('authSubtitle').textContent = 'وارد حساب کاربری خود شوید';
+  document.getElementById('authTitle').textContent = AUTH_TAB_TEXT.login.title;
+  document.getElementById('authSubtitle').textContent = AUTH_TAB_TEXT.login.subtitle;
   document.querySelectorAll('.auth-tab').forEach(t => t.classList.remove('act'));
   document.querySelector('.auth-tab').classList.add('act');
 }
@@ -6086,9 +6100,9 @@ function resetForgotPasswordState() {
      این فقط از طریق backToLogin به‌صورت دستی این مقادیر را برمی‌گرداند)
      اکنون بدون نیاز به کد اضافی، همیشه یک state تمیز می‌گیرد. */
   const authTitleEl = document.getElementById('authTitle');
-  if (authTitleEl) authTitleEl.textContent = 'خوش آمدید';
+  if (authTitleEl) authTitleEl.textContent = AUTH_TAB_TEXT.login.title;
   const authSubtitleEl = document.getElementById('authSubtitle');
-  if (authSubtitleEl) authSubtitleEl.textContent = 'وارد حساب کاربری خود شوید';
+  if (authSubtitleEl) authSubtitleEl.textContent = AUTH_TAB_TEXT.login.subtitle;
   const authTabsWrapEl = document.getElementById('authTabsWrap');
   if (authTabsWrapEl) authTabsWrapEl.style.display = 'flex';
   const authDividerWrapEl = document.getElementById('authDividerWrap');
@@ -7456,14 +7470,35 @@ async function sendAdminSupportReply() {
   pushNotification('i-headset', 'پشتیبانی به پیام شما پاسخ داد', notifTargetUser(ticket.user_id), { type: 'user-support' });
 }
 
+/* پاک‌سازی کامل state فرم Login: مقدار loginMobile/loginPassword را خالی
+   می‌کند. فرم Login هیچ indicator/validation-state مانای دیگری (مثل
+   Password Strength در Register) در DOM ندارد — خطاهای ورود فقط toast
+   لحظه‌ای هستند و ماندگار نیستند، پس نیازی به پاک‌سازی جداگانه‌ای ندارند. */
+function resetLoginFormState() {
+  ['loginMobile', 'loginPassword'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+}
+
 /* Auth */
 function switchAuthTab(el, t) {
   resetForgotPasswordState();
   resetRegisterFormState();
+  resetLoginFormState();
   document.querySelectorAll('.auth-tab').forEach(x=>x.classList.remove('act'));
   el.classList.add('act');
   document.getElementById('loginForm').style.display=t==='login'?'block':'none';
   document.getElementById('registerForm').style.display=t==='register'?'block':'none';
+  /* عنوان/زیرعنوان بالای فرم را متناسب با تب فعال از تک‌منبع AUTH_TAB_TEXT
+     تنظیم می‌کند (resetForgotPasswordState بالاتر آن را به‌طور پیش‌فرض روی
+     متن Login گذاشته بود؛ اینجا در صورت فعال‌بودن تب Register، بازنویسی
+     می‌شود). */
+  const text = AUTH_TAB_TEXT[t] || AUTH_TAB_TEXT.login;
+  const authTitleEl = document.getElementById('authTitle');
+  if (authTitleEl) authTitleEl.textContent = text.title;
+  const authSubtitleEl = document.getElementById('authSubtitle');
+  if (authSubtitleEl) authSubtitleEl.textContent = text.subtitle;
 }
 
 /* Seller dashboard tabs */
