@@ -1319,6 +1319,28 @@ body:has(#page-auth.active) .navbar { display: none; }
   .dash-mi .badge-mini { display: none; }
   .dash-main { padding: 18px; }
   .commission-rule-grid { grid-template-columns: 1fr; }
+  /* FIX 1 — Dashboard tables were only made scrollable below 768px; between
+     769px and 1024px they could still overflow or become unusable. */
+  .dash-table { display: block; overflow-x: auto; white-space: nowrap; }
+  /* FIX 4 — Brands page inline 6-column grid overrides the responsive
+     .cats-grid rules (inline styles win), so give this tablet range its
+     own sane column count for that page only. */
+  #page-brands .cats-grid { grid-template-columns: repeat(4, 1fr) !important; }
+  /* FIX 3 — Auth page collapses to one column only below 768px, leaving
+     769–1024px unnecessarily compressed as two narrow columns. Stack it
+     like mobile but keep the visual panel (mobile hides it) for a proper
+     tablet layout. */
+  .auth-page { grid-template-columns: 1fr; padding: 16px; gap: 20px; }
+  .auth-left { margin: 0; min-height: 220px; }
+  .auth-right { padding: 20px; }
+}
+
+/* FIX 5 — Product detail stays two columns until 768px; 769–900px is the
+   cramped sub-range (tablet portrait), so drop to a single column there
+   only, leaving both the wider tablet range and desktop untouched. */
+@media (max-width: 900px) and (min-width: 769px) {
+  .product-detail { grid-template-columns: 1fr; gap: 24px; }
+  .product-images { position: static; }
 }
 
 @media (max-width: 768px) {
@@ -1538,6 +1560,12 @@ body:has(#page-auth.active) .navbar { display: none; }
   .app-review-docs { grid-template-columns: 1fr; }
   .status-card { padding: 30px 20px; }
   .dash-table { display: block; overflow-x: auto; white-space: nowrap; }
+  /* FIX 2 — Monthly chart month labels (Admin & Seller dashboards) sit in a
+     single fixed flex row; on narrow mobile widths they get clipped because
+     .dash-main hides horizontal overflow. Wrap them onto multiple lines
+     instead so every label stays visible. */
+  .chart-month-labels { flex-wrap: wrap; justify-content: flex-start !important; row-gap: 6px; column-gap: 10px; }
+  .chart-month-labels span { flex: 0 0 auto; }
 
   .about-grid { grid-template-columns: 1fr; }
   .content-page { padding: 24px 16px; }
