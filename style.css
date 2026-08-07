@@ -1486,9 +1486,10 @@ body:has(#page-auth.active) .navbar { display: none; }
   .pd-offer-row .shop-n { flex: 1 1 100%; }
 
   .chat-layout { grid-template-columns: 1fr; height: auto; }
+  body:has(#page-chat.active) .chat-layout { height: auto; }
   .chat-sidebar { display: none; }
   .chat-sidebar.mobile-show { display: flex; position: fixed; top: 54px; left: 0; right: 0; bottom: 60px; z-index: 150; }
-  .chat-window { height: calc(100vh - 54px - 60px); }
+  .chat-window { height: calc(100vh - 54px - 60px); height: calc(100dvh - 54px - 60px); }
   .chat-info-panel { display: none; }
   .chat-info-panel.mobile-show { display: flex; flex-direction: column; position: fixed; top: 54px; left: 0; right: 0; bottom: 60px; z-index: 150; }
   .chat-info-toggle { display: flex; }
