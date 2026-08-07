@@ -2647,18 +2647,18 @@
           </div>
         </div>
 
-        <!-- Forgot password: step 1 - enter mobile/email -->
+        <!-- Forgot password: step 1 - enter mobile -->
         <div id="forgotForm" style="display:none;">
-          <div class="form-group"><label class="form-label">شماره موبایل یا ایمیل</label><input type="text" class="form-input" id="forgotContact" placeholder="09123478659"></div>
+          <div class="form-group"><label class="form-label">شماره موبایل</label><input type="text" class="form-input" id="forgotContact" placeholder="09123478659"></div>
           <button class="btn-auth" onclick="sendResetCode()">ارسال کد بازیابی</button>
           <div style="text-align:center;margin-top:16px;"><span class="auth-back-link" onclick="backToLogin()">بازگشت به ورود</span></div>
         </div>
 
-        <!-- Forgot password: step 2 - verify code -->
+        <!-- Forgot password: step 2 - enter reset token received via SMS -->
         <div id="resetCodeForm" style="display:none;">
-          <p style="font-size:12.5px;color:var(--gray-500);margin-bottom:16px;">کد تایید ارسال شده به <b id="resetContactDisplay" style="color:var(--text);"></b> را وارد کنید</p>
-          <div class="form-group"><label class="form-label">کد تایید</label><input type="text" class="form-input" id="resetCodeInput" placeholder="کد ۴ رقمی را وارد کنید" maxlength="4"></div>
-          <button class="btn-auth" onclick="verifyResetCode()">تایید کد</button>
+          <p style="font-size:12.5px;color:var(--gray-500);margin-bottom:16px;">کد بازیابی ارسال شده به <b id="resetContactDisplay" style="color:var(--text);"></b> را وارد کنید</p>
+          <div class="form-group"><label class="form-label">کد بازیابی</label><input type="text" class="form-input" id="resetCodeInput" placeholder="کد بازیابی ارسال‌شده را وارد کنید"></div>
+          <button class="btn-auth" onclick="verifyResetCode()">ادامه</button>
           <div style="text-align:center;margin-top:16px;"><span class="auth-back-link" onclick="backToLogin()">بازگشت به ورود</span></div>
         </div>
 
@@ -5996,6 +5996,7 @@ function togglePasswordVisibility(inputId, eyeEl) {
   }
 }
 function showForgotPassword() {
+  resetForgotPasswordState();
   document.getElementById('authTabsWrap').style.display = 'none';
   document.getElementById('authDividerWrap').style.display = 'none';
   document.getElementById('authSocialWrap').style.display = 'none';
@@ -6003,10 +6004,11 @@ function showForgotPassword() {
   document.getElementById('registerForm').style.display = 'none';
   document.getElementById('forgotForm').style.display = 'block';
   document.getElementById('authTitle').textContent = 'بازیابی رمز عبور';
-  document.getElementById('authSubtitle').textContent = 'شماره موبایل یا ایمیل خود را وارد کنید تا کد بازیابی برایتان ارسال شود';
+  document.getElementById('authSubtitle').textContent = 'شماره موبایل خود را وارد کنید تا کد بازیابی برایتان ارسال شود';
 }
 function backToLogin() {
-  ['forgotForm','resetCodeForm','newPasswordForm'].forEach(id => document.getElementById(id).style.display = 'none');
+  resetForgotPasswordState();
+  document.getElementById('registerForm').style.display = 'none';
   document.getElementById('authTabsWrap').style.display = 'flex';
   document.getElementById('authDividerWrap').style.display = 'flex';
   document.getElementById('authSocialWrap').style.display = 'flex';
@@ -6016,31 +6018,101 @@ function backToLogin() {
   document.querySelectorAll('.auth-tab').forEach(t => t.classList.remove('act'));
   document.querySelector('.auth-tab').classList.add('act');
 }
-function sendResetCode() {
+/* ── Forgot password: مقادیر موقت بین مراحل — فقط در حافظهٔ JS نگهداری
+      می‌شوند (نه localStorage/sessionStorage)؛ با ورود موفق یا بازگشت به
+      فرم ورود (backToLogin) پاک می‌شوند تا token/شماره پس از پایان فرآیند
+      در حافظه باقی نماند. ── */
+let _pendingResetMobile = null;
+let _pendingResetToken = null;
+
+/* پاک‌سازی کامل state فرآیند forgot/reset password: مقادیر موقت +
+   مخفی‌کردن هر سه فرم (forgotForm/resetCodeForm/newPasswordForm) + خالی‌
+   کردن ورودی‌های مربوطه. تمام توابعی که صفحه/فرم auth را عوض می‌کنند
+   (showForgotPassword, backToLogin, switchAuthTab) این تابع را صدا می‌زنند
+   تا هیچ‌گاه چند فرم هم‌زمان نمایش داده نشوند و ورود دوبارهٔ کاربر به
+   Forgot Password همیشه از مرحله اول شروع شود. */
+function resetForgotPasswordState() {
+  _pendingResetMobile = null;
+  _pendingResetToken = null;
+  ['forgotForm', 'resetCodeForm', 'newPasswordForm'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = 'none';
+  });
+  ['forgotContact', 'resetCodeInput', 'newPass1', 'newPass2'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+}
+
+/* مرحله ۱: فقط mobile ارسال می‌شود — بک‌اند از ایمیل پشتیبانی نمی‌کند.
+   پاسخ موفق همیشه یکسان است (چه شماره ثبت‌نام شده باشد چه نه؛ ضد
+   Account Enumeration در سمت بک‌اند) پس همیشه همان یک پیام عمومی نشان
+   داده می‌شود. */
+async function sendResetCode() {
   const val = document.getElementById('forgotContact').value.trim();
-  if (!val) { toast('لطفا شماره موبایل یا ایمیل را وارد کنید'); return; }
+  if (!val) { toast('لطفا شماره موبایل خود را وارد کنید'); return; }
+  const btn = document.querySelector('#forgotForm .btn-auth');
+  if (btn) btn.disabled = true;
+  try {
+    await authApiFetch('/auth/forgot-password', { method: 'POST', body: { mobile: val }, skipAuth: true });
+  } catch (err) {
+    toast(err.message || 'ارسال کد بازیابی ناموفق بود');
+    return;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+  _pendingResetMobile = val;
   document.getElementById('resetContactDisplay').textContent = val;
   document.getElementById('forgotForm').style.display = 'none';
   document.getElementById('resetCodeForm').style.display = 'block';
-  document.getElementById('authTitle').textContent = 'کد تایید';
-  document.getElementById('authSubtitle').textContent = 'کد ارسال شده را وارد کنید';
-  toast('کد بازیابی ارسال شد');
+  document.getElementById('authTitle').textContent = 'کد بازیابی';
+  document.getElementById('authSubtitle').textContent = 'در صورت وجود حساب کاربری، کد بازیابی ارسال شد';
+  toast('در صورت وجود حساب کاربری با این شماره، کد بازیابی ارسال شد');
 }
+
+/* مرحله ۲: بک‌اند endpoint جدایی برای «فقط تایید token» ندارد — token اینجا
+   فقط در یک متغیر موقت JS نگه داشته می‌شود و اعتبارسنجی واقعی آن هنگام
+   submitNewPassword (فراخوانی POST /auth/reset-password) انجام می‌گیرد. */
 function verifyResetCode() {
-  const code = document.getElementById('resetCodeInput').value.trim();
-  if (code.length < 4) { toast('کد تایید ۴ رقمی را کامل وارد کنید'); return; }
+  const token = document.getElementById('resetCodeInput').value.trim();
+  if (!token) { toast('لطفا کد بازیابی ارسال‌شده را وارد کنید'); return; }
+  _pendingResetToken = token;
+  document.getElementById('resetCodeInput').value = '';
   document.getElementById('resetCodeForm').style.display = 'none';
   document.getElementById('newPasswordForm').style.display = 'block';
   document.getElementById('authTitle').textContent = 'تعیین رمز عبور جدید';
   document.getElementById('authSubtitle').textContent = 'یک رمز عبور جدید برای حساب خود انتخاب کنید';
-  toast('کد تایید شد');
 }
-function submitNewPassword() {
+
+/* مرحله ۳: اعتبارسنجی واقعی token + تعیین رمز جدید، همه در یک فراخوانی
+   POST /auth/reset-password. اگر token نامعتبر/منقضی/مصرف‌شده باشد،
+   خطای واقعی بک‌اند (err.message) نمایش داده می‌شود. */
+async function submitNewPassword() {
+  if (!_pendingResetToken) { toast('لطفا ابتدا کد بازیابی را وارد کنید'); backToLogin(); return; }
   const p1 = document.getElementById('newPass1').value;
   const p2 = document.getElementById('newPass2').value;
   if (p1.length < 8) { toast('رمز عبور باید حداقل ۸ کاراکتر باشد'); return; }
   if (p1 !== p2) { toast('رمز عبور و تکرار آن یکسان نیست'); return; }
-  toast('🎉 رمز عبور با موفقیت تغییر کرد');
+  const btn = document.querySelector('#newPasswordForm .btn-auth');
+  if (btn) btn.disabled = true;
+  try {
+    await authApiFetch('/auth/reset-password', {
+      method: 'POST',
+      body: { token: _pendingResetToken, newPassword: p1, confirmNewPassword: p2 },
+      skipAuth: true,
+    });
+  } catch (err) {
+    toast(err.message || 'بازیابی رمز عبور ناموفق بود');
+    /* توکن نامعتبر/منقضی/مصرف‌شده باشد یا هر خطای دیگر بک‌اند، کاربر را
+       در حالت نیمه‌کاره (نیمه reset) نگه نمی‌داریم — state موقت پاک و به
+       یک فرم ورود تمیز برمی‌گردیم. برای شروع دوباره باید از مرحله اول
+       (showForgotPassword) اقدام شود. */
+    backToLogin();
+    return;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+  toast('🎉 رمز عبور با موفقیت بازیابی شد — اکنون وارد شوید');
   backToLogin();
 }
 
@@ -7331,6 +7403,7 @@ async function sendAdminSupportReply() {
 
 /* Auth */
 function switchAuthTab(el, t) {
+  resetForgotPasswordState();
   document.querySelectorAll('.auth-tab').forEach(x=>x.classList.remove('act'));
   el.classList.add('act');
   document.getElementById('loginForm').style.display=t==='login'?'block':'none';
