@@ -51,6 +51,11 @@ const resetPassword = asyncHandler(async (req, res) => {
   res.json(new ApiResponse(null, 'رمز عبور با موفقیت بازیابی شد'));
 });
 
+const verifyResetToken = asyncHandler(async (req, res) => {
+  await authService.verifyResetToken(req.body);
+  res.json(new ApiResponse(null, 'توکن بازیابی معتبر است'));
+});
+
 const sendOtp = asyncHandler(async (req, res) => {
   await authService.sendOtp(req.body);
   res.json(new ApiResponse(null, 'کد تأیید ارسال شد'));
@@ -91,6 +96,7 @@ module.exports = {
   changePassword,
   forgotPassword,
   resetPassword,
+  verifyResetToken,
   sendVerification,
   confirmVerification,
   sendOtp,

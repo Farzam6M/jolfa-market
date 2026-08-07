@@ -60,6 +60,10 @@ const forgotPasswordSchema = z.object({
   mobile: mobileSchema,
 });
 
+const verifyResetTokenSchema = z.object({
+  token: z.string().min(10, 'توکن بازیابی نامعتبر است'),
+});
+
 const resetPasswordSchema = z.object({
   token: z.string().min(10, 'توکن بازیابی نامعتبر است'),
   newPassword: strongPasswordSchema,
@@ -88,6 +92,7 @@ module.exports = {
   changePasswordSchema,
   forgotPasswordSchema,
   resetPasswordSchema,
+  verifyResetTokenSchema,
   verificationTypeParamSchema,
   verifyConfirmSchema,
   sessionIdParamSchema,

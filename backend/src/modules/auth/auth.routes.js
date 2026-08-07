@@ -5,7 +5,7 @@ const { authenticate } = require('../../middlewares/auth.middleware');
 const { authLimiter, otpLimiter } = require('../../middlewares/rateLimit.middleware');
 const {
   registerSchema, loginSchema, refreshSchema, changePasswordSchema,
-  forgotPasswordSchema, resetPasswordSchema,
+  forgotPasswordSchema, resetPasswordSchema, verifyResetTokenSchema,
   verificationTypeParamSchema, verifyConfirmSchema, sessionIdParamSchema,
   sendOtpSchema,
 } = require('./auth.validation');
@@ -25,6 +25,7 @@ router.get('/me', authenticate, controller.me);
 router.post('/change-password', authenticate, validate({ body: changePasswordSchema }), controller.changePassword);
 router.post('/forgot-password', authLimiter, validate({ body: forgotPasswordSchema }), controller.forgotPassword);
 router.post('/reset-password', authLimiter, validate({ body: resetPasswordSchema }), controller.resetPassword);
+router.post('/verify-reset-token', authLimiter, validate({ body: verifyResetTokenSchema }), controller.verifyResetToken);
 
 router.post(
   '/verification/:type/send',

@@ -350,6 +350,22 @@ async function forgotPassword({ mobile }) {
   await logSecurityEvent(user.id, 'FORGOT_PASSWORD_REQUEST', `درخواست بازیابی رمز عبور «${user.name}»`);
 }
 
+/**
+ * Read-only check of a password-reset token, used by the "enter new password"
+ * screen before the user commits to typing one in. Deliberately does NOT
+ * consume/claim the token — resetPassword() below remains the only place a
+ * token is marked used. Every failure path (not found, expired, already
+ * used) throws the same generic error so the response can't be used to
+ * enumerate token state.
+ */
+async function verifyResetToken({ token }) {
+  const tokenHash = hashToken(token);
+  const record = await prisma.passwordResetToken.findUnique({ where: { tokenHash } });
+  if (!record || record.used || record.expiresAt < new Date()) {
+    throw ApiError.badRequest('توکن بازیابی نامعتبر یا منقضی شده است');
+  }
+}
+
 /** Consumes a password-reset token exactly once (atomic claim guards against race conditions on concurrent requests). */
 async function resetPassword({ token, newPassword }) {
   const tokenHash = hashToken(token);
@@ -477,6 +493,7 @@ module.exports = {
   changePassword,
   forgotPassword,
   resetPassword,
+  verifyResetToken,
   sendVerification,
   confirmVerification,
   sendOtp,
