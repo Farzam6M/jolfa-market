@@ -6042,6 +6042,24 @@ function resetForgotPasswordState() {
     const el = document.getElementById(id);
     if (el) el.value = '';
   });
+  const resetContactDisplayEl = document.getElementById('resetContactDisplay');
+  if (resetContactDisplayEl) resetContactDisplayEl.textContent = '';
+  /* عنوان/زیرعنوان و تب‌ها/divider/social را هم به حالت پیش‌فرض (اولین
+     بازدید) برمی‌گرداند. showForgotPassword/backToLogin بعد از این
+     فراخوانی مقدار دلخواه خودشان را دوباره ست می‌کنند؛ اما switchAuthTab
+     (که مسیر بازگشت به login از طریق popstate/کلیک روی تب است و پیش از
+     این فقط از طریق backToLogin به‌صورت دستی این مقادیر را برمی‌گرداند)
+     اکنون بدون نیاز به کد اضافی، همیشه یک state تمیز می‌گیرد. */
+  const authTitleEl = document.getElementById('authTitle');
+  if (authTitleEl) authTitleEl.textContent = 'خوش آمدید';
+  const authSubtitleEl = document.getElementById('authSubtitle');
+  if (authSubtitleEl) authSubtitleEl.textContent = 'وارد حساب کاربری خود شوید';
+  const authTabsWrapEl = document.getElementById('authTabsWrap');
+  if (authTabsWrapEl) authTabsWrapEl.style.display = 'flex';
+  const authDividerWrapEl = document.getElementById('authDividerWrap');
+  if (authDividerWrapEl) authDividerWrapEl.style.display = 'flex';
+  const authSocialWrapEl = document.getElementById('authSocialWrap');
+  if (authSocialWrapEl) authSocialWrapEl.style.display = 'flex';
 }
 
 /* مرحله ۱: فقط mobile ارسال می‌شود — بک‌اند از ایمیل پشتیبانی نمی‌کند.
@@ -6070,12 +6088,23 @@ async function sendResetCode() {
   toast('در صورت وجود حساب کاربری با این شماره، کد بازیابی ارسال شد');
 }
 
-/* مرحله ۲: بک‌اند endpoint جدایی برای «فقط تایید token» ندارد — token اینجا
-   فقط در یک متغیر موقت JS نگه داشته می‌شود و اعتبارسنجی واقعی آن هنگام
-   submitNewPassword (فراخوانی POST /auth/reset-password) انجام می‌گیرد. */
-function verifyResetCode() {
+/* مرحله ۲: token با فراخوانی POST /auth/verify-reset-token در بک‌اند
+   اعتبارسنجی می‌شود. اگر معتبر بود، در _pendingResetToken ذخیره و فرم
+   newPassword نمایش داده می‌شود؛ در غیر این صورت خطای بک‌اند نمایش داده
+   شده و کاربر در همین مرحله (resetCodeForm) باقی می‌ماند. */
+async function verifyResetCode() {
   const token = document.getElementById('resetCodeInput').value.trim();
   if (!token) { toast('لطفا کد بازیابی ارسال‌شده را وارد کنید'); return; }
+  const btn = document.querySelector('#resetCodeForm .btn-auth');
+  if (btn) btn.disabled = true;
+  try {
+    await authApiFetch('/auth/verify-reset-token', { method: 'POST', body: { token }, skipAuth: true });
+  } catch (err) {
+    toast(err.message || 'کد بازیابی نامعتبر است');
+    return;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
   _pendingResetToken = token;
   document.getElementById('resetCodeInput').value = '';
   document.getElementById('resetCodeForm').style.display = 'none';
