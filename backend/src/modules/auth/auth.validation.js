@@ -65,7 +65,12 @@ const verifyResetTokenSchema = z.object({
 });
 
 const resetPasswordSchema = z.object({
-  token: z.string().min(10, 'توکن بازیابی نامعتبر است'),
+  mobile: mobileSchema,
+  // Must be a previously-issued, still-valid OTP for this mobile with
+  // purpose=password-reset (see POST /auth/forgot-password) — verified and
+  // consumed inside authService.resetPassword(), same convention as
+  // registerSchema's otpCode.
+  otpCode: z.string().min(4, 'کد تأیید نامعتبر است').max(10),
   newPassword: strongPasswordSchema,
   confirmNewPassword: z.string().min(1, 'تکرار رمز عبور جدید الزامی است'),
 }).refine((data) => data.newPassword === data.confirmNewPassword, {

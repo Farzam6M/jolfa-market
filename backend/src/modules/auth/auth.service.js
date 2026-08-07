@@ -4,7 +4,7 @@ const ApiError = require('../../utils/ApiError');
 const { hashPassword, comparePassword } = require('../../utils/password');
 const {
   signAccessToken, signRefreshToken, verifyRefreshToken, hashToken, hashOtpCode,
-  generateSecureToken, generateNumericCode, refreshExpiryMs,
+  generateNumericCode, refreshExpiryMs,
 } = require('../../utils/tokens');
 const { sendSms, sendEmail } = require('../../utils/messaging');
 const { logAdminActivity } = require('../admin/admin.service');
@@ -329,34 +329,27 @@ async function changePassword(userId, { currentPassword, newPassword, refreshTok
  * Starts password recovery. Never reveals whether the mobile number is
  * registered (anti-enumeration) — the controller always returns the same
  * generic message regardless of what this function does internally.
+ *
+ * Now OTP-based (unified with the register flow): instead of minting a
+ * PasswordResetToken row, this issues a PASSWORD_RESET-purpose OTP through
+ * the same sendOtp() used by POST /auth/otp/send for registration. The
+ * PasswordResetToken model/table is left untouched (not removed) — it's
+ * simply no longer written to from this flow.
  */
 async function forgotPassword({ mobile }) {
   const user = await prisma.user.findUnique({ where: { mobile } });
   if (!user) return; // silently no-op — avoids leaking account existence
 
-  // Invalidate any still-outstanding reset tokens before issuing a new one.
-  await prisma.passwordResetToken.updateMany({ where: { userId: user.id, used: false }, data: { used: true } });
-
-  const rawToken = generateSecureToken();
-  await prisma.passwordResetToken.create({
-    data: {
-      userId: user.id,
-      tokenHash: hashToken(rawToken),
-      expiresAt: new Date(Date.now() + env.passwordReset.expiresMin * 60 * 1000),
-    },
-  });
-
-  await sendSms(user.mobile, `کد/لینک بازیابی رمز عبور شما: ${rawToken}`);
+  await sendOtp({ mobile, purpose: 'password-reset' });
   await logSecurityEvent(user.id, 'FORGOT_PASSWORD_REQUEST', `درخواست بازیابی رمز عبور «${user.name}»`);
 }
 
 /**
- * Read-only check of a password-reset token, used by the "enter new password"
- * screen before the user commits to typing one in. Deliberately does NOT
- * consume/claim the token — resetPassword() below remains the only place a
- * token is marked used. Every failure path (not found, expired, already
- * used) throws the same generic error so the response can't be used to
- * enumerate token state.
+ * Read-only check of a password-reset token. Left unchanged/untouched: it
+ * still reads the PasswordResetToken table (not removed, per scope), it's
+ * just no longer fed by forgotPassword() above, since that now issues an
+ * OTP instead of a token. Kept so the existing route/controller/export
+ * surface doesn't break.
  */
 async function verifyResetToken({ token }) {
   const tokenHash = hashToken(token);
@@ -366,26 +359,28 @@ async function verifyResetToken({ token }) {
   }
 }
 
-/** Consumes a password-reset token exactly once (atomic claim guards against race conditions on concurrent requests). */
-async function resetPassword({ token, newPassword }) {
-  const tokenHash = hashToken(token);
-  const record = await prisma.passwordResetToken.findUnique({ where: { tokenHash } });
-  if (!record || record.used || record.expiresAt < new Date()) {
-    throw ApiError.badRequest('توکن بازیابی نامعتبر یا منقضی شده است');
-  }
+/**
+ * Completes password recovery using a PASSWORD_RESET OTP (mobile + code)
+ * instead of a PasswordResetToken. Reuses verifyAndConsumeOtp() — same
+ * atomic-consume/attempt-limit/expiry guarantees the register flow already
+ * relies on. The mobile-existence check mirrors forgotPassword()'s
+ * anti-enumeration behavior: it fails with the same generic "invalid code"
+ * message an unknown mobile or wrong code would produce, so a caller can't
+ * distinguish "no such account" from "bad OTP".
+ */
+async function resetPassword({ mobile, otpCode, newPassword }) {
+  const invalidCode = () => ApiError.badRequest('کد تأیید نامعتبر یا منقضی شده است');
 
-  // Atomically claim the token — updateMany's count tells us if we won the race.
-  const claim = await prisma.passwordResetToken.updateMany({
-    where: { id: record.id, used: false },
-    data: { used: true },
-  });
-  if (claim.count === 0) throw ApiError.badRequest('توکن بازیابی نامعتبر یا منقضی شده است');
+  const user = await prisma.user.findUnique({ where: { mobile } });
+  if (!user) throw invalidCode();
+
+  await verifyAndConsumeOtp(mobile, 'password-reset', otpCode);
 
   const passwordHash = await hashPassword(newPassword);
-  await prisma.user.update({ where: { id: record.userId }, data: { passwordHash } });
-  await prisma.refreshToken.updateMany({ where: { userId: record.userId }, data: { revoked: true } });
+  await prisma.user.update({ where: { id: user.id }, data: { passwordHash } });
+  await prisma.refreshToken.updateMany({ where: { userId: user.id }, data: { revoked: true } });
 
-  await logSecurityEvent(record.userId, 'RESET_PASSWORD', 'بازیابی رمز عبور با موفقیت انجام شد');
+  await logSecurityEvent(user.id, 'RESET_PASSWORD', 'بازیابی رمز عبور با موفقیت انجام شد');
 }
 
 const VERIFICATION_TYPE_MAP = { email: 'EMAIL', mobile: 'MOBILE' };
