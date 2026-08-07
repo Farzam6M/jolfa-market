@@ -10427,8 +10427,17 @@ function updateMobileDashState(panelSelector, el, opts) {
   if (!silent) dashboard.classList.add('mobile-detail');
   const hdTitle = dashboard.querySelector('.dash-mobile-hd-title');
   if (hdTitle) hdTitle.textContent = dashMiLabel(el);
-  const main = dashboard.querySelector('.dash-main');
-  if (main) main.scrollTop = 0;
+  /* NOTE: .dash-main is not itself a scroll container — the whole app
+     scrolls at the document/body level (see #appShell). Setting
+     .dash-main.scrollTop here was a no-op left over from an earlier
+     layout and never actually reset the visible scroll position: if the
+     user had scrolled down the section list before tapping an item, the
+     full-screen detail view (with its sticky back-header) opened wherever
+     the page happened to be scrolled to, instead of at its own top. Reset
+     the real scrolling context (the window) instead — but only when we
+     just switched screens (!silent); silent/programmatic refreshes of the
+     already-open detail screen must not yank the user's scroll position. */
+  if (!silent) window.scrollTo(0, 0);
 }
 
 /* Resets a panel to its landing list view — used when first entering the
@@ -10442,6 +10451,11 @@ function resetMobileDashToList(panelSelector) {
 function closeMobileDashDetail(btn) {
   const dashboard = btn.closest('.dashboard');
   if (dashboard) dashboard.classList.remove('mobile-detail');
+  /* Same reasoning as updateMobileDashState: the page scrolls at the
+     window level, so returning to the section list should reset that
+     scroll too, or the list can reappear already scrolled past its top
+     (e.g. after scrolling through long detail content). */
+  window.scrollTo(0, 0);
 }
 
 /* ══════════════════ WALLET ENGINE ══════════════════ */
