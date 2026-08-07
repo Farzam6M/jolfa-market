@@ -6291,6 +6291,21 @@ function buildCustomSelect(select) {
 }
 
 function openDropdown(field) {
+  /* FIX — viewport collision: the panel normally opens downward
+     (top: calc(100% + 8px)); when there isn't enough room below the
+     trigger (near the bottom of the screen, or with the mobile keyboard
+     open) flip it upward instead via the .drop-up class, which style.css
+     switches to bottom-anchored positioning. */
+  const panel = field.querySelector('.filter-dropdown');
+  if (panel) {
+    const rect = field.getBoundingClientRect();
+    const viewportH = window.innerHeight || document.documentElement.clientHeight;
+    const panelH = panel.offsetHeight || 260;
+    const spaceBelow = viewportH - rect.bottom;
+    const spaceAbove = rect.top;
+    if (spaceBelow < panelH + 8 && spaceAbove > spaceBelow) field.classList.add('drop-up');
+    else field.classList.remove('drop-up');
+  }
   field.classList.add('open');
   const t = field.querySelector('.filter-trigger');
   if (t) t.setAttribute('aria-expanded', 'true');
@@ -10333,6 +10348,46 @@ function toggleMainNav() {
   // the header node is never removed from the DOM in this SPA, so
   // there is no dangling reference to leak.
   window.addEventListener('scroll', onScroll, { passive: true });
+})();
+
+/* ── BUGFIX: mobile bottom nav was rendering near the top of the page ──
+   Root cause: `.nav-actions` (the fixed bottom tab bar on mobile) lives in
+   the markup inside `.nav-top` → `.navbar`. `.navbar` animates its
+   scroll-hide effect via `transform: translateY(...)` (see initSmartHeader
+   above). Per spec, a `transform` on an ancestor makes that ancestor the
+   containing block for any `position: fixed` descendant instead of the
+   viewport — so `.nav-actions`' `bottom: 0` was resolving against the
+   header's own short, top-pinned box, not the real viewport bottom, which
+   is why the bar appeared up near the top. It would also have slid away
+   together with the header on scroll-hide, which isn't correct for a
+   bottom tab bar that must always stay put.
+   Fix: below the mobile breakpoint, physically move `.nav-actions` to be
+   a direct child of <body> — a sibling of `.navbar`, not a descendant —
+   so its fixed positioning resolves against the actual viewport and it's
+   no longer affected by the header's transform. `.nav-actions` is itself
+   `position: fixed` so removing it from `.nav-top`'s flow changes nothing
+   visually there. Desktop is restored to the original nesting inside
+   `.nav-top` exactly as before, so desktop layout is untouched. */
+(function initMobileNavActionsPortal() {
+  if (window.__navActionsPortalInit) return;
+  window.__navActionsPortalInit = true;
+
+  const navActions = document.querySelector('.nav-actions');
+  const navTop = document.querySelector('.nav-top');
+  if (!navActions || !navTop) return;
+
+  const mq = window.matchMedia('(max-width: 768px)');
+
+  function sync() {
+    if (mq.matches) {
+      if (navActions.parentNode !== document.body) document.body.appendChild(navActions);
+    } else if (navActions.parentNode !== navTop) {
+      navTop.appendChild(navActions);
+    }
+  }
+  sync();
+  if (mq.addEventListener) mq.addEventListener('change', sync);
+  else mq.addListener(sync); // older Safari fallback
 })();
 
 function toggleChatSidebar() {

@@ -226,6 +226,13 @@ img { max-width: 100%; display: block; }
 .notif-del svg { width: 11px; height: 11px; stroke: currentColor; fill: none; stroke-width: 2.4; }
 .notif-item:hover .notif-del, .notif-full-item:hover .notif-del { opacity: 1; }
 .notif-del:hover { background: #FEE2E2; color: #B91C1C; }
+/* FIX — touch devices don't reliably provide :hover, which left this
+   control effectively invisible/unusable on mobile. Keep it visible by
+   default on touch/mobile viewports while leaving the desktop
+   hover-to-reveal behavior above untouched. */
+@media (max-width: 768px), (hover: none) and (pointer: coarse) {
+  .notif-del { opacity: 1; }
+}
 .notif-empty { padding: 20px 10px; text-align: center; font-size: 12px; color: var(--gray-400); }
 /* Main menu — its own row, separated from the top row by a very
    faint hairline divider. Items are centered as a group with generous
@@ -467,6 +474,11 @@ img { max-width: 100%; display: block; }
 .custom-select.open .filter-dropdown {
   opacity: 1; visibility: visible; transform: translateY(0) scale(1);
 }
+/* FIX — viewport collision: when JS determines there isn't enough space
+   below the trigger, it adds .drop-up so the panel opens upward instead. */
+.custom-select.drop-up .filter-dropdown {
+  top: auto; bottom: calc(100% + 8px); transform-origin: bottom right;
+}
 .filter-option {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
   padding: 9px 10px; border-radius: 9px; font-size: 12.5px; color: var(--text);
@@ -517,6 +529,7 @@ img { max-width: 100%; display: block; }
 .form-select-wrap .filter-trigger-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .form-select-wrap .filter-chevron { margin-right: 0; }
 .form-select-wrap .filter-dropdown { left: 0; right: 0; width: auto; max-width: none; transform-origin: top center; }
+.form-select-wrap.custom-select.drop-up .filter-dropdown { transform-origin: bottom center; }
 
 .btn-apply-filter { display: flex; align-items: center; justify-content: center; gap: 6px; background: var(--white); color: var(--text); border-radius: 10px; padding: 9px 16px; height: 34px; font-size: 12.5px; font-weight: 700; cursor: pointer; border: 1.5px solid var(--gray-200); transition: all 0.18s; box-shadow: var(--shadow-sm); }
 .btn-apply-filter:hover { border-color: var(--primary-light); background: var(--primary-lighter); }
@@ -949,7 +962,14 @@ img { max-width: 100%; display: block; }
 .map-modal-box { background: var(--white); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); width: 100%; max-width: 560px; max-height: 100%; overflow-y: auto; display: flex; flex-direction: column; }
 .map-modal-hd { display: flex; align-items: center; justify-content: space-between; padding: 16px 18px; border-bottom: 1px solid var(--gray-200); }
 .map-modal-hd h3 { font-size: 15px; }
-.map-modal-close { cursor: pointer; color: var(--gray-400); }
+/* FIX — touch target: the clickable area was just the 18x18px SVG itself;
+   enlarge it to a practical mobile tap size while keeping the icon's
+   visible size and centering unchanged. */
+.map-modal-close {
+  cursor: pointer; color: var(--gray-400);
+  display: flex; align-items: center; justify-content: center;
+  min-width: 44px; min-height: 44px;
+}
 #mapPickerDiv { width: 100%; height: 340px; }
 .map-modal-ft { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 14px 18px; border-top: 1px solid var(--gray-200); }
 .map-modal-hint { font-size: 12px; color: var(--gray-500); }
@@ -2159,5 +2179,24 @@ body.menu-open .drawer-link:nth-child(8) { animation-delay: .43s; }
   .nav-actions .nav-profile {
     backdrop-filter: none !important;
     -webkit-backdrop-filter: none !important;
+  }
+}
+
+/* ---- FIX: iOS Safari auto-zoom on input focus ----
+   iOS Safari zooms the page in whenever a focused input/select/textarea
+   has an effective font-size below 16px. Several controls across the site
+   are set below that threshold for their compact desktop look; bump them
+   to 16px on mobile/touch viewports only (placed last so it wins the
+   cascade over the earlier same-specificity mobile rules above), leaving
+   desktop sizing and the overall design untouched. */
+@media (max-width: 768px), (hover: none) and (pointer: coarse) {
+  .form-input,
+  .form-select,
+  .form-textarea,
+  .nav-search input,
+  .chat-inp-wrap input,
+  .promo-input input,
+  .admin-login-box input {
+    font-size: 16px;
   }
 }
