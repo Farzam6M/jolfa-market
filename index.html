@@ -3307,6 +3307,11 @@ async function renderAdminOverviewStats() {
   const productsEl = document.getElementById('statActiveProducts');
   const pendingEl = document.getElementById('statPendingApproval');
   if (!storesEl && !usersEl && !productsEl && !pendingEl) return;
+  /* page-admin در DOM همیشه حاضر است (SPA تک‌صفحه‌ای)، پس بدون این گارد
+     مهمان/کاربر غیرادمین هم روی هر بار لود صفحه به /admin/overview بدون
+     توکن درخواست می‌زد و خطای 401 «توکن ارسال نشده» toast می‌شد. */
+  const user = getCurrentUser();
+  if (!user || (user.role !== 'admin' && user.role !== 'super_admin')) return;
 
   const stats = await fetchAdminOverviewFromApi();
   if (!stats) return;
@@ -3337,6 +3342,11 @@ async function fetchAdminActivityLogFromApi() {
 async function renderRecentActivity() {
   const host = document.getElementById('adminRecentActivity');
   if (!host) return;
+  /* همان دلیل renderAdminOverviewStats: page-admin همیشه در DOM هست، پس بدون
+     این گارد این تابع هم برای مهمان/غیرادمین بدون توکن به /admin/activity-log
+     می‌زد و توست خطای احراز هویت نشان می‌داد. */
+  const user = getCurrentUser();
+  if (!user || (user.role !== 'admin' && user.role !== 'super_admin')) return;
   const log = await fetchAdminActivityLogFromApi();
   if (!log.length) {
     host.innerHTML = '<div class="pending-note"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> هنوز فعالیتی ثبت نشده است</div>';
