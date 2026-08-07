@@ -3003,7 +3003,7 @@ function nav(p) {
   const el = document.getElementById('page-'+p);
   if (el) el.classList.add('active');
   document.body.setAttribute('data-page', p);
-  window.scrollTo(0,0);
+  window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
   document.querySelectorAll('.chat-sidebar, .dash-sb').forEach(s => s.classList.remove('mobile-show'));
   closeMainNav();
   /* Header nav-link highlight is synced for EVERY page here (not just
@@ -10437,7 +10437,7 @@ function updateMobileDashState(panelSelector, el, opts) {
      the real scrolling context (the window) instead — but only when we
      just switched screens (!silent); silent/programmatic refreshes of the
      already-open detail screen must not yank the user's scroll position. */
-  if (!silent) window.scrollTo(0, 0);
+  if (!silent) window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
 }
 
 /* Resets a panel to its landing list view — used when first entering the
@@ -10455,7 +10455,7 @@ function closeMobileDashDetail(btn) {
      window level, so returning to the section list should reset that
      scroll too, or the list can reappear already scrolled past its top
      (e.g. after scrolling through long detail content). */
-  window.scrollTo(0, 0);
+  window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
 }
 
 /* ══════════════════ WALLET ENGINE ══════════════════ */
