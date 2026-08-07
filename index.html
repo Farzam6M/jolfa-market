@@ -2654,11 +2654,11 @@
           <div style="text-align:center;margin-top:16px;"><span class="auth-back-link" onclick="backToLogin()">بازگشت به ورود</span></div>
         </div>
 
-        <!-- Forgot password: step 2 - enter reset token received via SMS -->
+        <!-- Forgot password: step 2 - enter 6-digit OTP received via SMS -->
         <div id="resetCodeForm" style="display:none;">
           <p style="font-size:12.5px;color:var(--gray-500);margin-bottom:16px;">کد بازیابی ارسال شده به <b id="resetContactDisplay" style="color:var(--text);"></b> را وارد کنید</p>
-          <div class="form-group"><label class="form-label">کد بازیابی</label><input type="text" class="form-input" id="resetCodeInput" placeholder="کد بازیابی ارسال‌شده را وارد کنید"></div>
-          <button class="btn-auth" onclick="verifyResetCode()">ادامه</button>
+          <div class="form-group"><label class="form-label">کد تایید</label><input type="text" class="form-input" id="resetCodeInput" placeholder="کد ۶ رقمی ارسال‌شده را وارد کنید" maxlength="6" inputmode="numeric"></div>
+          <button class="btn-auth" onclick="confirmResetOtp()">ادامه</button>
           <div style="text-align:center;margin-top:16px;"><span class="auth-back-link" onclick="backToLogin()">بازگشت به ورود</span></div>
         </div>
 
@@ -6030,10 +6030,10 @@ function backToLogin() {
 }
 /* ── Forgot password: مقادیر موقت بین مراحل — فقط در حافظهٔ JS نگهداری
       می‌شوند (نه localStorage/sessionStorage)؛ با ورود موفق یا بازگشت به
-      فرم ورود (backToLogin) پاک می‌شوند تا token/شماره پس از پایان فرآیند
+      فرم ورود (backToLogin) پاک می‌شوند تا otpCode/شماره پس از پایان فرآیند
       در حافظه باقی نماند. ── */
 let _pendingResetMobile = null;
-let _pendingResetToken = null;
+let _pendingResetOtp = null;
 
 /* پاک‌سازی کامل state فرآیند forgot/reset password: مقادیر موقت +
    مخفی‌کردن هر سه فرم (forgotForm/resetCodeForm/newPasswordForm) + خالی‌
@@ -6043,7 +6043,7 @@ let _pendingResetToken = null;
    Forgot Password همیشه از مرحله اول شروع شود. */
 function resetForgotPasswordState() {
   _pendingResetMobile = null;
-  _pendingResetToken = null;
+  _pendingResetOtp = null;
   ['forgotForm', 'resetCodeForm', 'newPasswordForm'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.style.display = 'none';
@@ -6098,24 +6098,14 @@ async function sendResetCode() {
   toast('در صورت وجود حساب کاربری با این شماره، کد بازیابی ارسال شد');
 }
 
-/* مرحله ۲: token با فراخوانی POST /auth/verify-reset-token در بک‌اند
-   اعتبارسنجی می‌شود. اگر معتبر بود، در _pendingResetToken ذخیره و فرم
-   newPassword نمایش داده می‌شود؛ در غیر این صورت خطای بک‌اند نمایش داده
-   شده و کاربر در همین مرحله (resetCodeForm) باقی می‌ماند. */
-async function verifyResetCode() {
-  const token = document.getElementById('resetCodeInput').value.trim();
-  if (!token) { toast('لطفا کد بازیابی ارسال‌شده را وارد کنید'); return; }
-  const btn = document.querySelector('#resetCodeForm .btn-auth');
-  if (btn) btn.disabled = true;
-  try {
-    await authApiFetch('/auth/verify-reset-token', { method: 'POST', body: { token }, skipAuth: true });
-  } catch (err) {
-    toast(err.message || 'کد بازیابی نامعتبر است');
-    return;
-  } finally {
-    if (btn) btn.disabled = false;
-  }
-  _pendingResetToken = token;
+/* مرحله ۲: کد OTP شش‌رقمی فقط در سمت کلاینت (خالی نبودن) بررسی و در
+   _pendingResetOtp ذخیره می‌شود؛ اعتبارسنجی واقعی OTP دیگر در این مرحله
+   انجام نمی‌شود (endpoint جدا و token حذف شده‌اند) و همراه با رمز عبور
+   جدید، یک‌جا در مرحله ۳ به بک‌اند ارسال می‌شود. */
+function confirmResetOtp() {
+  const otp = document.getElementById('resetCodeInput').value.trim();
+  if (!otp) { toast('لطفا کد بازیابی ارسال‌شده را وارد کنید'); return; }
+  _pendingResetOtp = otp;
   document.getElementById('resetCodeInput').value = '';
   document.getElementById('resetCodeForm').style.display = 'none';
   document.getElementById('newPasswordForm').style.display = 'block';
@@ -6123,11 +6113,12 @@ async function verifyResetCode() {
   document.getElementById('authSubtitle').textContent = 'یک رمز عبور جدید برای حساب خود انتخاب کنید';
 }
 
-/* مرحله ۳: اعتبارسنجی واقعی token + تعیین رمز جدید، همه در یک فراخوانی
-   POST /auth/reset-password. اگر token نامعتبر/منقضی/مصرف‌شده باشد،
-   خطای واقعی بک‌اند (err.message) نمایش داده می‌شود. */
+/* مرحله ۳: اعتبارسنجی واقعی OTP + تعیین رمز جدید، همه در یک فراخوانی
+   POST /auth/reset-password با mobile + otpCode + newPassword +
+   confirmNewPassword. اگر OTP نامعتبر/منقضی/مصرف‌شده باشد، خطای واقعی
+   بک‌اند (err.message) نمایش داده می‌شود. */
 async function submitNewPassword() {
-  if (!_pendingResetToken) { toast('لطفا ابتدا کد بازیابی را وارد کنید'); backToLogin(); return; }
+  if (!_pendingResetMobile || !_pendingResetOtp) { toast('لطفا ابتدا کد بازیابی را وارد کنید'); backToLogin(); return; }
   const p1 = document.getElementById('newPass1').value;
   const p2 = document.getElementById('newPass2').value;
   if (p1.length < 8) { toast('رمز عبور باید حداقل ۸ کاراکتر باشد'); return; }
@@ -6137,12 +6128,12 @@ async function submitNewPassword() {
   try {
     await authApiFetch('/auth/reset-password', {
       method: 'POST',
-      body: { token: _pendingResetToken, newPassword: p1, confirmNewPassword: p2 },
+      body: { mobile: _pendingResetMobile, otpCode: _pendingResetOtp, newPassword: p1, confirmNewPassword: p2 },
       skipAuth: true,
     });
   } catch (err) {
     toast(err.message || 'بازیابی رمز عبور ناموفق بود');
-    /* توکن نامعتبر/منقضی/مصرف‌شده باشد یا هر خطای دیگر بک‌اند، کاربر را
+    /* OTP نامعتبر/منقضی/مصرف‌شده باشد یا هر خطای دیگر بک‌اند، کاربر را
        در حالت نیمه‌کاره (نیمه reset) نگه نمی‌داریم — state موقت پاک و به
        یک فرم ورود تمیز برمی‌گردیم. برای شروع دوباره باید از مرحله اول
        (showForgotPassword) اقدام شود. */
