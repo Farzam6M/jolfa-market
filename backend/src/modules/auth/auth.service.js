@@ -61,22 +61,19 @@ const OTP_PURPOSE_MAP = { register: 'REGISTER', login: 'LOGIN', 'password-reset'
  * choke point as every other SMS in this codebase (see utils/messaging.js).
  *
  * For purpose=register specifically, if the mobile is already registered
- * this silently no-ops (no OTP is created, no SMS is sent) instead of
- * throwing a distinct "already registered" error — the controller always
- * responds with the same generic success message either way. This is the
- * same anti-enumeration pattern forgotPassword() below already uses for
- * password recovery: without it, this endpoint would let anyone check
- * whether an arbitrary mobile number has an account just by reading the
- * response. register() still repeats its own existing-mobile check before
- * actually creating the account (defense in depth, and it's the check
- * that actually matters).
+ * this throws a conflict error (no OTP is created, no SMS is sent) instead
+ * of silently no-oping — the register flow's UI only advances to the
+ * OTP-entry step on a successful response, so a silent no-op used to leave
+ * the user stuck on a step that would never receive a code. register()
+ * still repeats its own existing-mobile check before actually creating the
+ * account (defense in depth, and it's the check that actually matters).
  */
 async function sendOtp({ mobile, purpose: purposeParam }) {
   const purpose = OTP_PURPOSE_MAP[purposeParam];
 
   if (purpose === 'REGISTER') {
     const existing = await prisma.user.findUnique({ where: { mobile } });
-    if (existing) return; // anti-enumeration: same apparent success as a real send
+    if (existing) throw ApiError.conflict('این شماره قبلاً ثبت‌نام کرده است. لطفاً وارد شوید.');
   }
 
   const last = await prisma.otpCode.findFirst({
