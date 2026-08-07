@@ -3,7 +3,7 @@ const env = require('../../config/env');
 const ApiError = require('../../utils/ApiError');
 const { hashPassword, comparePassword } = require('../../utils/password');
 const {
-  signAccessToken, signRefreshToken, verifyRefreshToken, hashToken,
+  signAccessToken, signRefreshToken, verifyRefreshToken, hashToken, hashOtpCode,
   generateSecureToken, generateNumericCode, refreshExpiryMs,
 } = require('../../utils/tokens');
 const { sendSms, sendEmail } = require('../../utils/messaging');
@@ -60,18 +60,23 @@ const OTP_PURPOSE_MAP = { register: 'REGISTER', login: 'LOGIN', 'password-reset'
  * number + purpose. Mocked delivery — goes through the same `sendSms`
  * choke point as every other SMS in this codebase (see utils/messaging.js).
  *
- * For purpose=register specifically, this also rejects already-registered
- * numbers up front so an SMS is never wasted on a mobile that register()
- * would reject anyway — register() still repeats its own check (defense in
- * depth, and it's the check that actually matters since this one is only a
- * courtesy/early-exit).
+ * For purpose=register specifically, if the mobile is already registered
+ * this silently no-ops (no OTP is created, no SMS is sent) instead of
+ * throwing a distinct "already registered" error — the controller always
+ * responds with the same generic success message either way. This is the
+ * same anti-enumeration pattern forgotPassword() below already uses for
+ * password recovery: without it, this endpoint would let anyone check
+ * whether an arbitrary mobile number has an account just by reading the
+ * response. register() still repeats its own existing-mobile check before
+ * actually creating the account (defense in depth, and it's the check
+ * that actually matters).
  */
 async function sendOtp({ mobile, purpose: purposeParam }) {
   const purpose = OTP_PURPOSE_MAP[purposeParam];
 
   if (purpose === 'REGISTER') {
     const existing = await prisma.user.findUnique({ where: { mobile } });
-    if (existing) throw ApiError.conflict('این شماره موبایل قبلاً ثبت شده است');
+    if (existing) return; // anti-enumeration: same apparent success as a real send
   }
 
   const last = await prisma.otpCode.findFirst({
@@ -93,7 +98,10 @@ async function sendOtp({ mobile, purpose: purposeParam }) {
     data: {
       mobile,
       purpose,
-      codeHash: hashToken(code),
+      // Keyed hash (see hashOtpCode()) — a plain hashToken() here would be
+      // an unsalted SHA-256 of a 6-digit value, trivially reversible via a
+      // precomputed table if this table ever leaked.
+      codeHash: hashOtpCode(mobile, purpose, code),
       maxAttempts: env.otp.maxAttempts,
       expiresAt: new Date(Date.now() + env.otp.expiresMin * 60 * 1000),
     },
@@ -118,6 +126,7 @@ async function sendOtp({ mobile, purpose: purposeParam }) {
 async function verifyAndConsumeOtp(mobile, purposeParam, code) {
   const purpose = OTP_PURPOSE_MAP[purposeParam];
   const invalid = () => ApiError.badRequest('کد تأیید نامعتبر یا منقضی شده است');
+  const attemptsExhausted = () => ApiError.badRequest('تعداد تلاش‌های مجاز برای این کد به پایان رسیده است — یک کد جدید درخواست کنید');
 
   const record = await prisma.otpCode.findFirst({
     where: { mobile, purpose, consumed: false },
@@ -125,12 +134,21 @@ async function verifyAndConsumeOtp(mobile, purposeParam, code) {
   });
   if (!record) throw invalid();
   if (record.expiresAt < new Date()) throw invalid();
-  if (record.attempts >= record.maxAttempts) {
-    throw ApiError.badRequest('تعداد تلاش‌های مجاز برای این کد به پایان رسیده است — یک کد جدید درخواست کنید');
-  }
+  if (record.attempts >= record.maxAttempts) throw attemptsExhausted();
 
-  if (record.codeHash !== hashToken(code)) {
-    await prisma.otpCode.update({ where: { id: record.id }, data: { attempts: { increment: 1 } } });
+  if (record.codeHash !== hashOtpCode(mobile, purpose, code)) {
+    // Atomic, conditional increment: the WHERE clause (attempts < maxAttempts)
+    // is evaluated by the database as part of the same UPDATE, so it can never
+    // let attempts run past maxAttempts the way a plain `update()` with
+    // `{ increment: 1 }` could if several wrong-code requests for the same
+    // code raced each other (each would read the same pre-increment value
+    // and all pass the earlier `attempts >= maxAttempts` check before any of
+    // them had written their increment back).
+    const attemptClaim = await prisma.otpCode.updateMany({
+      where: { id: record.id, attempts: { lt: record.maxAttempts } },
+      data: { attempts: { increment: 1 } },
+    });
+    if (attemptClaim.count === 0) throw attemptsExhausted(); // exhausted by a concurrent request
     throw invalid();
   }
 

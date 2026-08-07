@@ -2,7 +2,7 @@ const router = require('express').Router();
 const controller = require('./auth.controller');
 const validate = require('../../middlewares/validate.middleware');
 const { authenticate } = require('../../middlewares/auth.middleware');
-const { authLimiter } = require('../../middlewares/rateLimit.middleware');
+const { authLimiter, otpLimiter } = require('../../middlewares/rateLimit.middleware');
 const {
   registerSchema, loginSchema, refreshSchema, changePasswordSchema,
   forgotPasswordSchema, resetPasswordSchema,
@@ -14,7 +14,7 @@ const {
 // is consumed anywhere (by POST /register below); purpose=login and
 // purpose=password-reset are accepted by validation already so this same
 // endpoint can back those flows later without changes here.
-router.post('/otp/send', authLimiter, validate({ body: sendOtpSchema }), controller.sendOtp);
+router.post('/otp/send', otpLimiter, validate({ body: sendOtpSchema }), controller.sendOtp);
 
 router.post('/register', authLimiter, validate({ body: registerSchema }), controller.register);
 router.post('/login', authLimiter, validate({ body: loginSchema }), controller.login);

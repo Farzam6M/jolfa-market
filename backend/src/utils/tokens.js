@@ -33,6 +33,32 @@ function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
+/**
+ * HMAC key for hashOtpCode() below. Prefers a dedicated OTP_HASH_SECRET
+ * (env.otp.hashSecret) so it can be rotated independently of the JWT
+ * secrets; falls back to combining the two JWT secrets (both already
+ * `requiredSecret()`-enforced at startup) so existing deployments that
+ * haven't set OTP_HASH_SECRET yet keep working without a forced env
+ * change, while the key is still unique to this deployment.
+ */
+function otpHashKey() {
+  return env.otp.hashSecret || `${env.jwt.accessSecret}:${env.jwt.refreshSecret}`;
+}
+
+/**
+ * Hashes an OTP code for storage (otp_codes.codeHash). Unlike hashToken()
+ * above — fine for the high-entropy, random refresh/reset tokens it
+ * protects — a 6-digit OTP only has ~1,000,000 possible values, so a
+ * plain unsalted SHA-256 hash of it is trivially reversible via a
+ * precomputed table if the otp_codes table ever leaks. This is keyed
+ * (HMAC, never derivable without the server secret) and bound to
+ * (mobile, purpose) so the same code never hashes identically for two
+ * different numbers/purposes.
+ */
+function hashOtpCode(mobile, purpose, code) {
+  return crypto.createHmac('sha256', otpHashKey()).update(`${mobile}:${purpose}:${code}`).digest('hex');
+}
+
 /** Cryptographically-random opaque token (password reset links, etc). Only the hash is persisted. */
 function generateSecureToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString('hex');
@@ -53,6 +79,7 @@ module.exports = {
   verifyAccessToken,
   verifyRefreshToken,
   hashToken,
+  hashOtpCode,
   generateSecureToken,
   generateNumericCode,
   refreshExpiryMs,

@@ -87,6 +87,21 @@ module.exports = {
     expiresMin: parseInt(process.env.OTP_CODE_EXPIRES_MIN || '5', 10),
     maxAttempts: parseInt(process.env.OTP_MAX_ATTEMPTS || '5', 10),
     resendCooldownSec: parseInt(process.env.OTP_RESEND_COOLDOWN_SEC || '60', 10),
+    // Dedicated rate limit for POST /auth/otp/send (see otpLimiter in
+    // rateLimit.middleware.js) — deliberately separate from the shared
+    // authLimiter (login/register/forgot-password/reset-password) so
+    // exhausting one never blocks the other, and tighter by default
+    // since issuing an OTP costs a real SMS.
+    requestWindowMin: parseInt(process.env.OTP_REQUEST_WINDOW_MIN || '10', 10),
+    requestMaxPerWindow: parseInt(process.env.OTP_REQUEST_MAX_PER_WINDOW || '5', 10),
+    // Optional dedicated secret for hashing OTP codes at rest (see
+    // utils/tokens.js hashOtpCode()). Deliberately NOT a requiredSecret()
+    // — unset falls back to deriving an equivalent HMAC key from the JWT
+    // secrets (see otpHashKey() in tokens.js) so existing deployments
+    // keep working without a forced env change. Set this explicitly in
+    // production if you want OTP hashing rotatable independently of the
+    // JWT secrets.
+    hashSecret: process.env.OTP_HASH_SECRET || null,
   },
 
   // HMAC secret shared with the payment gateway to sign its callback/webhook
