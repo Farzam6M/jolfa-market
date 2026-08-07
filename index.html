@@ -4370,9 +4370,12 @@ async function resendRegisterOtp() {
   toast('کد تایید مجدداً ارسال شد');
 }
 
-/* انصراف از مرحله OTP و بازگشت به مرحله ۱ برای ویرایش نام/موبایل/رمز عبور —
-   اطلاعات موقت پاک و تایمر cooldown متوقف می‌شود. */
-function cancelRegisterOtpStep() {
+/* هستهٔ مشترک بازگشت به مرحله ۱: تایمر/کول‌داون OTP را متوقف می‌کند،
+   _pendingRegisterData را پاک و نمایش را از step2 به step1 برمی‌گرداند —
+   اما مقدار inputهای نام/موبایل/رمز عبور را دست‌نخورده نگه می‌دارد (چون
+   هم «ویرایش اطلاعات» و هم reset کامل هر دو از این هسته استفاده می‌کنند،
+   ولی فقط reset کامل باید آن مقادیر را هم پاک کند — درست پایین‌تر). */
+function _resetRegisterStepState() {
   if (_registerOtpTimerId) { clearInterval(_registerOtpTimerId); _registerOtpTimerId = null; }
   _registerOtpCooldownEnd = 0;
   _pendingRegisterData = null;
@@ -4380,6 +4383,28 @@ function cancelRegisterOtpStep() {
   const step1 = document.getElementById('registerStep1');
   if (step2) step2.style.display = 'none';
   if (step1) step1.style.display = 'block';
+}
+
+/* انصراف از مرحله OTP و بازگشت به مرحله ۱ برای ویرایش نام/موبایل/رمز عبور —
+   اطلاعات موقت پاک و تایمر cooldown متوقف می‌شود؛ عمداً مقدار inputهای
+   مرحله ۱ را پاک نمی‌کند چون هدف این دکمه دقیقاً «ویرایش» همان اطلاعات
+   قبلاً واردشده است، نه شروع دوباره از صفر. */
+function cancelRegisterOtpStep() {
+  _resetRegisterStepState();
+}
+
+/* پاک‌سازی کامل state فرم Registration: علاوه بر هرچه cancelRegisterOtpStep
+   انجام می‌دهد (توقف تایمر OTP + پاک‌کردن _pendingRegisterData + بازگشت به
+   registerStep1)، مقدار واقعی inputهای regName/regMobile/regPassword/
+   regOtpCode را هم خالی می‌کند. دقیقاً هم‌الگو با resetForgotPasswordState()
+   — تا فرم ثبت‌نام هروقت کاربر از آن خارج شود (تعویض به تب ورود و ...)
+   کاملاً از نو (خالی، در step1) شروع شود، بدون باقی‌ماندن اطلاعات قبلی در DOM. */
+function resetRegisterFormState() {
+  _resetRegisterStepState();
+  ['regName', 'regMobile', 'regPassword', 'regOtpCode'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
 }
 
 /* مرحله ۲ → ثبت‌نام نهایی: کد OTP وارد‌شده به همراه اطلاعات نگه‌داشته‌شدهٔ
@@ -7434,6 +7459,7 @@ async function sendAdminSupportReply() {
 /* Auth */
 function switchAuthTab(el, t) {
   resetForgotPasswordState();
+  resetRegisterFormState();
   document.querySelectorAll('.auth-tab').forEach(x=>x.classList.remove('act'));
   el.classList.add('act');
   document.getElementById('loginForm').style.display=t==='login'?'block':'none';
