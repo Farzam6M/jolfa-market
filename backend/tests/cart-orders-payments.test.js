@@ -825,4 +825,89 @@ describe('Payments', () => {
       .send({ addressId: foreignAddress.id });
     expect(res.status).toBe(404);
   });
+
+  test('wallet payment with sufficient balance debits the wallet, confirms the order, and logs a transaction', async () => {
+    const walletCustomer = await makeUser('CUSTOMER', '52300000' + Math.floor(Math.random() * 9));
+    await prisma.wallet.create({ data: { userId: walletCustomer.user.id, balance: 50000 } });
+
+    const product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 15000, stock: 5 });
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', walletCustomer.auth).send({ productId: product.id, qty: 1 });
+    const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', walletCustomer.auth).send({});
+
+    const pay = await api.post(`${PREFIX}/payments`).set('Authorization', walletCustomer.auth)
+      .send({ orderId: order.body.data.id, method: 'WALLET' });
+    expect(pay.status).toBe(201);
+    expect(pay.body.data.status).toBe('SUCCESS');
+    expect(Number(pay.body.data.amount)).toBe(15000);
+
+    const wallet = await prisma.wallet.findUnique({ where: { userId: walletCustomer.user.id } });
+    expect(Number(wallet.balance)).toBe(35000); // 50000 - 15000
+
+    const updatedOrder = await prisma.order.findUnique({ where: { id: order.body.data.id } });
+    expect(updatedOrder.status).toBe('CONFIRMED');
+
+    const txLog = await prisma.walletTransaction.findFirst({ where: { walletId: wallet.id, refId: order.body.data.id } });
+    expect(txLog).not.toBeNull();
+    expect(txLog.type).toBe('DEBIT');
+    expect(Number(txLog.amount)).toBe(15000);
+  });
+
+  test('wallet payment with insufficient balance is rejected and leaves balance/order untouched', async () => {
+    const poorCustomer = await makeUser('CUSTOMER', '52310000' + Math.floor(Math.random() * 9));
+    await prisma.wallet.create({ data: { userId: poorCustomer.user.id, balance: 5000 } });
+
+    const product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 15000, stock: 5 });
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', poorCustomer.auth).send({ productId: product.id, qty: 1 });
+    const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', poorCustomer.auth).send({});
+
+    const pay = await api.post(`${PREFIX}/payments`).set('Authorization', poorCustomer.auth)
+      .send({ orderId: order.body.data.id, method: 'WALLET' });
+    expect(pay.status).toBe(400);
+    expect(pay.body.message).toBe('موجودی کیف پول کافی نیست');
+
+    const wallet = await prisma.wallet.findUnique({ where: { userId: poorCustomer.user.id } });
+    expect(Number(wallet.balance)).toBe(5000); // untouched — the failed attempt must not partially debit
+
+    // The order-status claim inside payWithWallet's transaction rolled back
+    // along with the wallet check, so the order is still payable.
+    const stillOrder = await prisma.order.findUnique({ where: { id: order.body.data.id } });
+    expect(stillOrder.status).toBe('PENDING');
+  });
+
+  test('two simultaneous wallet payments for two different orders, where balance covers only one: exactly one succeeds and the wallet balance never goes negative', async () => {
+    const raceCustomer = await makeUser('CUSTOMER', '52320000' + Math.floor(Math.random() * 9));
+    // Balance covers exactly one 15000 order, not both.
+    await prisma.wallet.create({ data: { userId: raceCustomer.user.id, balance: 15000 } });
+
+    const productA = await makeApprovedProduct(seller.auth, admin.auth, category.id, { name: 'محصول کیف پول رقابتی A', price: 15000, stock: 5 });
+    const productB = await makeApprovedProduct(seller.auth, admin.auth, category.id, { name: 'محصول کیف پول رقابتی B', price: 15000, stock: 5 });
+
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', raceCustomer.auth).send({ productId: productA.id, qty: 1 });
+    const orderA = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', raceCustomer.auth).send({});
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', raceCustomer.auth).send({ productId: productB.id, qty: 1 });
+    const orderB = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', raceCustomer.auth).send({});
+
+    const [res1, res2] = await Promise.all([
+      api.post(`${PREFIX}/payments`).set('Authorization', raceCustomer.auth)
+        .send({ orderId: orderA.body.data.id, method: 'WALLET' }),
+      api.post(`${PREFIX}/payments`).set('Authorization', raceCustomer.auth)
+        .send({ orderId: orderB.body.data.id, method: 'WALLET' }),
+    ]);
+    const statuses = [res1.status, res2.status].sort();
+    expect(statuses).toEqual([201, 400]); // exactly one winner, one loser — never both succeeding
+
+    const wallet = await prisma.wallet.findUnique({ where: { userId: raceCustomer.user.id } });
+    expect(Number(wallet.balance)).toBe(0); // debited exactly once, never negative
+
+    const orders = await prisma.order.findMany({ where: { id: { in: [orderA.body.data.id, orderB.body.data.id] } } });
+    const confirmedCount = orders.filter((o) => o.status === 'CONFIRMED').length;
+    const pendingCount = orders.filter((o) => o.status === 'PENDING').length;
+    expect(confirmedCount).toBe(1);
+    expect(pendingCount).toBe(1);
+
+    const paymentCount = await prisma.payment.count({
+      where: { orderId: { in: [orderA.body.data.id, orderB.body.data.id] }, status: 'SUCCESS' },
+    });
+    expect(paymentCount).toBe(1); // only the winning order actually got a SUCCESS payment record
+  });
 });

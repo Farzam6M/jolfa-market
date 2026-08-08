@@ -13,11 +13,32 @@ async function payWithWallet(order, userId) {
     const claimed = await tx.order.updateMany({ where: { id: order.id, status: 'PENDING' }, data: { status: 'CONFIRMED' } });
     if (claimed.count === 0) throw ApiError.conflict('این سفارش قبلاً پرداخت شده یا در وضعیت دیگری است');
 
-    const wallet = await tx.wallet.findUnique({ where: { userId } });
-    if (!wallet || Number(wallet.balance) < Number(order.total)) {
+    // Atomic debit: the previous implementation did findUnique (read balance)
+    // then a separate update({decrement}) (write) — a read-check-write that
+    // is not atomic under Postgres's default Read Committed isolation. Two
+    // concurrent payWithWallet calls for two different orders could both
+    // read the same starting balance, both see it as "enough", and both
+    // proceed to decrement, driving balance negative. This single
+    // conditional updateMany (balance: {gte: amount}) makes "is there enough
+    // balance" and "debit it" one atomic database operation — the same
+    // compare-and-swap pattern already used for stock (checkout, see
+    // orders.service.js) and for the order/payment status claims above and
+    // in confirmGateway(). Wallet.userId is @unique, so this always targets
+    // at most one row.
+    //
+    // Not-found and insufficient-balance are intentionally not
+    // distinguished here (same as before): whether the wallet is missing or
+    // its balance is too low, count will be 0 and the same message is
+    // thrown, preserving the exact error behavior of the prior
+    // implementation.
+    const debited = await tx.wallet.updateMany({
+      where: { userId, balance: { gte: order.total } },
+      data: { balance: { decrement: order.total } },
+    });
+    if (debited.count !== 1) {
       throw ApiError.badRequest('موجودی کیف پول کافی نیست');
     }
-    await tx.wallet.update({ where: { id: wallet.id }, data: { balance: { decrement: order.total } } });
+    const wallet = await tx.wallet.findUnique({ where: { userId } });
     await tx.walletTransaction.create({
       data: {
         walletId: wallet.id, type: 'DEBIT', amount: order.total, reason: `پرداخت سفارش ${order.orderNumber}`, refId: order.id,
