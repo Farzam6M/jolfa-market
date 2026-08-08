@@ -250,6 +250,7 @@ model Store {
   orderItems         OrderItem[]
   storeConversations StoreConversation[]
   commissionRules    CommissionRule[]
+  settlements        OrderItemSettlement[]
 
   @@index([status])
   @@map("stores")
@@ -513,6 +514,7 @@ model Order {
 
   items    OrderItem[]
   payments Payment[]
+  settlements OrderItemSettlement[]
 
   @@index([userId])
   @@index([status])
@@ -530,6 +532,8 @@ model OrderItem {
   nameSnapshot   String
   priceSnapshot  Decimal      @db.Decimal(12, 0)
   qty            Int
+
+  settlement OrderItemSettlement?
 
   @@index([orderId])
   @@index([storeId])
@@ -659,7 +663,64 @@ model CommissionRule {
   @@index([isActive])
   // Speeds up the CAMPAIGN date-window lookup in resolveCommissionRate().
   @@index([scope, isActive, campaignStartAt, campaignEndAt])
+
+  settlements OrderItemSettlement[]
+
   @@map("commission_rules")
+}
+
+// ──────────────────────── Order Settlement (Seller Payout) ────────────────────────
+//
+// One row per OrderItem, created exactly once — the moment (and only the
+// moment) that item's order makes the real SENT -> DELIVERED transition
+// (see settleDeliveredOrder() in orders.service.js). `orderItemId` is
+// @unique specifically so that property IS the idempotency guarantee at
+// the database level: a retried/duplicated delivery confirmation can never
+// create a second settlement row (and therefore can never credit a
+// seller's wallet twice) for the same order item, even if the in-app
+// SENT-only status guard were somehow raced.
+//
+// Every money/rate field here is a SNAPSHOT taken at settlement time —
+// commissionRate, grossAmount, commissionAmount, and sellerEarning never
+// change afterwards, even if the CommissionRule that produced them is
+// later edited or deactivated. commissionRuleId is kept only for audit
+// traceability (which rule fired) and is nullable / ON DELETE SET NULL so
+// a rule being removed later can never take a historical settlement's
+// numbers down with it.
+model OrderItemSettlement {
+  id     String @id @default(uuid())
+
+  orderItemId String    @unique
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  // Denormalized from OrderItem for cheap "all settlements for this order /
+  // this seller's store" queries without joining through OrderItem every time.
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  storeId String
+  store   Store  @relation(fields: [storeId], references: [id], onDelete: Restrict)
+
+  // Snapshot of the commission rate actually applied (Decimal(5,2), matches
+  // CommissionRule.rate) — independent of whatever that rule's rate is today.
+  commissionRate    Decimal @db.Decimal(5, 2)
+  // gross = OrderItem.priceSnapshot * OrderItem.qty
+  grossAmount       Decimal @db.Decimal(12, 0)
+  // commission = round(gross * commissionRate / 100)
+  commissionAmount  Decimal @db.Decimal(12, 0)
+  // sellerEarning = gross - commission — this is exactly what gets credited
+  // to the seller's wallet.
+  sellerEarning     Decimal @db.Decimal(12, 0)
+
+  // Traceability only — never re-read to recompute past settlements.
+  commissionRuleId String?
+  commissionRule   CommissionRule? @relation(fields: [commissionRuleId], references: [id], onDelete: SetNull)
+
+  settledAt DateTime @default(now())
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+  @@index([storeId])
+  @@index([commissionRuleId])
+  @@map("order_item_settlements")
 }
 
 // ──────────────────────────── Support Chat / Store Chat ────────────────────────────

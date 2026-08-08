@@ -17,8 +17,12 @@
 --
 -- sellerId/categoryId are both nullable FKs (ON DELETE RESTRICT — a Store
 -- or Category still referenced by a commission rule can't be deleted out
--- from under it, mirroring the existing RESTRICT convention used for
--- stores.mainCategoryId). createdById is required and always taken from the
+-- from under it). Note: an earlier version of this comment said this
+-- mirrored the RESTRICT convention used for stores.mainCategoryId — that
+-- column was already dropped by the 20260805222847_cleanup_schema_changes
+-- migration before this one was written, so that reference was stale;
+-- corrected here in-place since it does not affect the SQL actually run.
+-- createdById is required and always taken from the
 -- authenticated actor server-side (see commission-rules.service.js#create),
 -- never from the request body.
 
