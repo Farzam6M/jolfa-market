@@ -114,6 +114,7 @@ model User {
   notificationDismissals NotificationDismissal[]
   notificationReads    NotificationRead[]
   adminActivityLogs    AdminActivityLog[]
+  commissionRulesCreated CommissionRule[]
 
   @@index([roleId])
   @@map("users")
@@ -248,6 +249,7 @@ model Store {
   storeProducts      StoreProduct[]
   orderItems         OrderItem[]
   storeConversations StoreConversation[]
+  commissionRules    CommissionRule[]
 
   @@index([status])
   @@map("stores")
@@ -289,6 +291,7 @@ model Category {
   parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id])
   children Category[] @relation("CategoryTree")
   products Product[]
+  commissionRules CommissionRule[]
 
   @@index([isActive])
   @@map("categories")
@@ -596,6 +599,67 @@ model WalletTransaction {
 
   @@index([walletId])
   @@map("wallet_transactions")
+}
+
+// ──────────────────────────── Commission Rules ────────────────────────────
+//
+// Commission is dynamic per-order — there is NO fixed commission percentage
+// hardcoded anywhere in the application. `rate` on the applicable active
+// CommissionRule (chosen by resolveCommissionRate() in
+// commission-rules.service.js, see the priority ordering documented there)
+// is always the source of truth. The GLOBAL default is itself a row in this
+// table, not a fallback constant, and at least one active GLOBAL rule must
+// exist at all times (enforced in the service layer — see
+// assertNotRemovingLastActiveGlobal()).
+//
+// Scope semantics:
+//   GLOBAL   — the platform-wide default. sellerId/categoryId must be null.
+//   SELLER   — overrides GLOBAL for one Store. sellerId required, categoryId null.
+//   CATEGORY — overrides GLOBAL for one Category. categoryId required, sellerId null.
+//   CAMPAIGN — a time-boxed override, highest priority of all scopes while its
+//              [campaignStartAt, campaignEndAt] window contains `now`. May
+//              optionally be narrowed to one seller and/or one category;
+//              campaignStartAt/campaignEndAt are required for this scope only.
+//
+// `priority` is a same-scope tie-breaker only (e.g. two simultaneously
+// active CAMPAIGN rules) — it does NOT reorder the GLOBAL/CATEGORY/
+// SELLER/CAMPAIGN tiers themselves, which is fixed. See resolveCommissionRate().
+enum CommissionScope {
+  GLOBAL
+  SELLER
+  CATEGORY
+  CAMPAIGN
+}
+
+model CommissionRule {
+  id               String          @id @default(uuid())
+  scope            CommissionScope
+  // Nullable FK -> Store. Required (non-null) for SELLER scope; optional
+  // narrowing field for CAMPAIGN scope; must be null for GLOBAL/CATEGORY.
+  sellerId         String?
+  seller           Store?          @relation(fields: [sellerId], references: [id], onDelete: Restrict)
+  // Nullable FK -> Category. Required (non-null) for CATEGORY scope; optional
+  // narrowing field for CAMPAIGN scope; must be null for GLOBAL/SELLER.
+  categoryId       String?
+  category         Category?       @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  // Only set (and only meaningful) for CAMPAIGN scope; null for every other scope.
+  campaignStartAt  DateTime?
+  campaignEndAt    DateTime?
+  rate             Decimal         @db.Decimal(5, 2)
+  priority         Int             @default(0)
+  isActive         Boolean         @default(true)
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  createdById      String
+  createdBy        User            @relation(fields: [createdById], references: [id])
+
+  @@index([scope])
+  @@index([sellerId])
+  @@index([categoryId])
+  @@index([isActive])
+  // Speeds up the CAMPAIGN date-window lookup in resolveCommissionRate().
+  @@index([scope, isActive, campaignStartAt, campaignEndAt])
+  @@map("commission_rules")
 }
 
 // ──────────────────────────── Support Chat / Store Chat ────────────────────────────

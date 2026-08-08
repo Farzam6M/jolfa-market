@@ -15,5 +15,10 @@ router.use('/chat', require('../modules/support-chat/support-chat.routes'));
 router.use('/notifications', require('../modules/notifications/notifications.routes'));
 router.use('/hero', require('../modules/hero/hero.routes'));
 router.use('/admin', require('../modules/admin/admin.routes'));
+// Its own module/router (mirrors the categories/hero pattern) rather than
+// being folded into admin.routes.js, which is reserved for the
+// dashboard/activity-log/admin-account-management concerns unrelated to
+// commission rule CRUD.
+router.use('/admin/commission-rules', require('../modules/commission-rules/commission-rules.routes'));
 
 module.exports = router;
