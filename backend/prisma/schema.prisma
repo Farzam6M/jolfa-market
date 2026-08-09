@@ -120,6 +120,7 @@ model User {
   payoutRequestsRequested PayoutRequest[] @relation("PayoutRequestsRequested")
   payoutRequestsApproved  PayoutRequest[] @relation("PayoutRequestsApproved")
   payoutRequestsProcessed PayoutRequest[] @relation("PayoutRequestsProcessed")
+  sellerPayoutLiabilities SellerPayoutLiability[]
 
   @@index([roleId])
   @@map("users")
@@ -256,6 +257,7 @@ model Store {
   storeConversations StoreConversation[]
   commissionRules    CommissionRule[]
   settlements        OrderItemSettlement[]
+  payoutLiabilities  SellerPayoutLiability[]
 
   @@index([status])
   @@map("stores")
@@ -521,6 +523,7 @@ model Order {
   payments Payment[]
   settlements OrderItemSettlement[]
   refunds  PaymentRefund[]
+  payoutLiabilities SellerPayoutLiability[]
 
   @@index([userId])
   @@index([status])
@@ -877,6 +880,54 @@ model PayoutRequest {
   @@index([sellerId])
   @@index([status])
   @@map("payout_requests")
+}
+
+// ──────────────────── Seller Payout Liability (Phase 5 fix) ────────────────────
+//
+// Purely additive. Handles the gap where a customer refund's seller-wallet
+// clawback (orders.service.js#refundDeliveredOrder) can't be fully covered
+// because the seller already withdrew the money via a PayoutRequest.
+// Wallet.balance must NEVER go negative (see every wallet mutation in this
+// codebase), so refundDeliveredOrder collects whatever IS currently in the
+// seller's wallet (down to zero) and records whatever's left uncollected
+// here instead of blocking the customer's refund on it.
+//
+// One row per (order, store) shortfall — created only when a clawback
+// couldn't be fully collected. Append-only, same as every other financial
+// ledger table here (OrderItemSettlement, OrderItemSettlementReversal,
+// PaymentRefund): never updated in place except the OUTSTANDING ->
+// RECOVERED status flip once reconciled (e.g. deducted from a future
+// settlement credit or payout) — recovery flow itself is intentionally
+// NOT implemented yet (out of scope: no settlement/commission changes),
+// this table only makes the debt visible and auditable so it CAN be
+// reconciled later.
+enum SellerLiabilityStatus {
+  OUTSTANDING
+  RECOVERED
+}
+
+model SellerPayoutLiability {
+  id       String @id @default(uuid())
+  sellerId String
+  seller   User   @relation(fields: [sellerId], references: [id], onDelete: Restrict)
+  orderId  String
+  order    Order  @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  storeId  String
+  store    Store  @relation(fields: [storeId], references: [id], onDelete: Restrict)
+
+  // The uncollected portion of one store's refund clawback for this order —
+  // i.e. amount - (whatever the wallet actually had to give at refund time).
+  amount Decimal                @db.Decimal(12, 0)
+  status SellerLiabilityStatus  @default(OUTSTANDING)
+  reason String?
+
+  createdAt   DateTime  @default(now())
+  recoveredAt DateTime?
+
+  @@index([sellerId])
+  @@index([orderId])
+  @@index([status])
+  @@map("seller_payout_liabilities")
 }
 
 // ──────────────────────────── Support Chat / Store Chat ────────────────────────────

@@ -34,6 +34,7 @@
  */
 const request = require('supertest');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const app = require('../src/app');
 const { prisma } = require('../src/config/database');
 const { signAccessToken } = require('../src/utils/tokens');
@@ -132,6 +133,37 @@ describe('POST /payouts (create — reserve)', () => {
 
     const count = await prisma.payoutRequest.count({ where: { idempotencyKey } });
     expect(count).toBe(1);
+  });
+
+  test('idempotencyKey: concurrent creates with the same key resolve to exactly one payout and one DEBIT, never a raw duplicate-key error', async () => {
+    const racer = await makeUser('SELLER', '53080000' + Math.floor(Math.random() * 9));
+    await prisma.wallet.create({ data: { userId: racer.user.id, balance: 200000 } });
+    const walletBefore = await prisma.wallet.findUnique({ where: { userId: racer.user.id } });
+
+    const idempotencyKey = crypto.randomUUID();
+    const payload = { amount: 50000, idempotencyKey, ...validBank() };
+
+    const [a, b] = await Promise.all([
+      api.post(`${PREFIX}/payouts`).set('Authorization', racer.auth).send(payload),
+      api.post(`${PREFIX}/payouts`).set('Authorization', racer.auth).send(payload),
+    ]);
+
+    // Neither concurrent request should surface a raw duplicate-key error —
+    // both must resolve to the SAME logical (idempotent) result.
+    expect(a.status).toBe(201);
+    expect(b.status).toBe(201);
+    expect(a.body.data.id).toBe(b.body.data.id);
+
+    const count = await prisma.payoutRequest.count({ where: { idempotencyKey } });
+    expect(count).toBe(1); // exactly one PayoutRequest row, never two
+
+    const walletAfter = await prisma.wallet.findUnique({ where: { userId: racer.user.id } });
+    expect(Number(walletAfter.balance)).toBe(Number(walletBefore.balance) - 50000); // reserved exactly once
+
+    const debits = await prisma.walletTransaction.findMany({
+      where: { walletId: walletAfter.id, refId: a.body.data.id, type: 'DEBIT' },
+    });
+    expect(debits.length).toBe(1); // exactly one DEBIT, never two
   });
 
   test('rejects an invalid IBAN with 400', async () => {

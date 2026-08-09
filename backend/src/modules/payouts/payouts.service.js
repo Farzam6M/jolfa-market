@@ -19,6 +19,18 @@ const { logAdminActivity } = require('../admin/admin.service');
  * tied to one logical "withdraw" button press); one is generated
  * server-side when omitted.
  *
+ * Concurrency: the upfront `findUnique` above is only a fast-path check —
+ * it does NOT close the race window. Two requests sharing the same
+ * idempotencyKey can both observe "not found" and both enter the
+ * transaction below; the DB-level `@unique` on idempotencyKey is the real
+ * guard (same "findFirst-then-create, unique constraint is the real
+ * guard" pattern as products.service.js#findOrCreateProduct /
+ * #upsertStoreOffer). The loser's `payoutRequest.create` throws P2002
+ * BEFORE the wallet debit runs, so its transaction rolls back with no
+ * reservation ever taken — it is then caught below and turned into a
+ * graceful idempotent-replay return of the winner's row, exactly like a
+ * sequential retry, instead of surfacing the raw duplicate-key error.
+ *
  * Wallet debit uses the same atomic conditional updateMany
  * (balance: {gte: amount}) compare-and-swap pattern as every other
  * wallet-affecting flow in this codebase (payments.service.js#payWithWallet,
@@ -40,43 +52,58 @@ async function createPayout(sellerId, payload, actor) {
     return existing; // Idempotent replay — no second reservation, no duplicate row.
   }
 
-  return prisma.$transaction(async (tx) => {
-    const payoutRequest = await tx.payoutRequest.create({
-      data: {
-        sellerId,
-        amount: payload.amount,
-        idempotencyKey,
-        bankAccountHolder: payload.bankAccountHolder,
-        bankIban: payload.bankIban,
-        bankCardNumber: payload.bankCardNumber || null,
-        bankName: payload.bankName || null,
-        requestedById: actor.id,
-      },
-    });
+  try {
+    return await prisma.$transaction(async (tx) => {
+      const payoutRequest = await tx.payoutRequest.create({
+        data: {
+          sellerId,
+          amount: payload.amount,
+          idempotencyKey,
+          bankAccountHolder: payload.bankAccountHolder,
+          bankIban: payload.bankIban,
+          bankCardNumber: payload.bankCardNumber || null,
+          bankName: payload.bankName || null,
+          requestedById: actor.id,
+        },
+      });
 
-    // Atomic reserve: debit only succeeds if the wallet exists AND has
-    // enough balance — see function-level comment above.
-    const debited = await tx.wallet.updateMany({
-      where: { userId: sellerId, balance: { gte: payload.amount } },
-      data: { balance: { decrement: payload.amount } },
+      // Atomic reserve: debit only succeeds if the wallet exists AND has
+      // enough balance — see function-level comment above.
+      const debited = await tx.wallet.updateMany({
+        where: { userId: sellerId, balance: { gte: payload.amount } },
+        data: { balance: { decrement: payload.amount } },
+      });
+      if (debited.count !== 1) {
+        throw ApiError.badRequest('موجودی کیف پول برای برداشت کافی نیست');
+      }
+
+      const wallet = await tx.wallet.findUnique({ where: { userId: sellerId } });
+      await tx.walletTransaction.create({
+        data: {
+          walletId: wallet.id,
+          type: 'DEBIT',
+          amount: payload.amount,
+          reason: `رزرو مبلغ درخواست برداشت ${payoutRequest.id}`,
+          refId: payoutRequest.id,
+        },
+      });
+
+      return payoutRequest;
     });
-    if (debited.count !== 1) {
-      throw ApiError.badRequest('موجودی کیف پول برای برداشت کافی نیست');
+  } catch (err) {
+    // Lost the create race to a concurrent request with the SAME
+    // idempotencyKey (see function-level comment). This transaction never
+    // reached the wallet debit, so nothing was reserved on this side —
+    // just hand back the winner's row as an idempotent replay.
+    if (err.code === 'P2002' && err.meta?.target?.includes('idempotencyKey')) {
+      const winner = await prisma.payoutRequest.findUnique({ where: { idempotencyKey } });
+      if (winner) {
+        if (winner.sellerId !== sellerId) throw ApiError.conflict('کلید idempotency قبلاً برای درخواست دیگری استفاده شده است');
+        return winner;
+      }
     }
-
-    const wallet = await tx.wallet.findUnique({ where: { userId: sellerId } });
-    await tx.walletTransaction.create({
-      data: {
-        walletId: wallet.id,
-        type: 'DEBIT',
-        amount: payload.amount,
-        reason: `رزرو مبلغ درخواست برداشت ${payoutRequest.id}`,
-        refId: payoutRequest.id,
-      },
-    });
-
-    return payoutRequest;
-  });
+    throw err;
+  }
 }
 
 /** Seller's own payout requests (WALLET_WITHDRAW_SELF, ownership enforced by scoping to sellerId). */

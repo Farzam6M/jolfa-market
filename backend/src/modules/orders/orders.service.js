@@ -558,15 +558,21 @@ async function updateStatus(orderId, status, actor) {
  * same rounding), just run backwards for the returned quantity. The
  * OrderItemSettlement row itself is only ever read here, never written.
  *
- * All-or-nothing (decision #3): every affected store's seller wallet is
- * debited by an atomic conditional updateMany (balance: {gte: amount}),
- * the same compare-and-swap pattern used everywhere else in this codebase
- * for wallet mutations (payWithWallet's debit, settleDeliveredOrder's
- * credit). If ANY store's seller has insufficient balance, an ApiError is
- * thrown and the whole $transaction — including any other store's debit
- * already applied in this same call, plus the reversal rows and the
- * customer-side refund below — rolls back completely: no partial refund is
- * ever left behind.
+ * Wallet clawback is all-or-nothing only in the sense that this whole
+ * $transaction is: every affected store's seller wallet is debited by an
+ * atomic conditional updateMany (balance: {gte: amount}), the same
+ * compare-and-swap pattern used everywhere else in this codebase for
+ * wallet mutations (payWithWallet's debit, settleDeliveredOrder's credit).
+ * Unlike a plain money mutation though, the CUSTOMER refund is not allowed
+ * to fail just because a seller's wallet can no longer cover the full
+ * clawback (e.g. the seller already withdrew it via a PayoutRequest) — see
+ * SellerPayoutLiability's model comment. So when the full-amount debit
+ * misses, this collects whatever the wallet currently holds (down to, but
+ * never below, zero) and records the uncollected remainder as an additive
+ * SellerPayoutLiability row instead of throwing. Any OTHER kind of failure
+ * (bad line, over-refund, a genuine concurrent-modification race caught by
+ * Serializable) still throws and rolls back the whole transaction — no
+ * partial refund is ever left behind for those cases.
  *
  * Runs at Serializable isolation specifically so that two concurrent
  * refund requests against the SAME item (which each read
@@ -637,26 +643,82 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
         });
       }
 
-      // Pass 2 — the all-or-nothing money movement. Any failure from here
-      // on rolls back everything above too (nothing was written yet).
+      // Pass 2 — the money movement. The customer refund must be able to
+      // complete even if a seller's wallet can no longer fully cover their
+      // clawback (e.g. they already withdrew it via a PayoutRequest — see
+      // SellerPayoutLiability's model comment). So this collects as much
+      // as the wallet currently holds (fast-path: the full amount, exactly
+      // as before) and tracks any uncollected remainder as an additive
+      // liability rather than throwing and rolling back the whole refund.
       // eslint-disable-next-line no-restricted-syntax
       for (const [storeId, { sellerId, amount }] of storeDebits) {
+        // Fast path — unchanged from before: full atomic conditional debit.
         // eslint-disable-next-line no-await-in-loop
         const debited = await tx.wallet.updateMany({
           where: { userId: sellerId, balance: { gte: amount } },
           data: { balance: { decrement: amount } },
         });
+
+        let collected = amount;
+        let shortfall = 0;
+
         if (debited.count !== 1) {
-          throw ApiError.conflict('موجودی کیف پول فروشنده برای استرداد این سفارش کافی نیست');
+          // Wallet can't cover the full clawback — collect whatever it
+          // currently has (never below zero) and track the rest as a
+          // liability. Still a single atomic conditional updateMany (same
+          // compare-and-swap pattern as everywhere else), just against the
+          // wallet's own current balance instead of the full `amount`, so
+          // it can never drive the balance negative even under a
+          // concurrent debit racing this one (a genuine race here aborts
+          // the whole Serializable transaction with P2034, caught below).
+          // eslint-disable-next-line no-await-in-loop
+          const wallet = await tx.wallet.findUnique({ where: { userId: sellerId } });
+          if (!wallet) throw ApiError.internal('کیف پول فروشنده برای استرداد یافت نشد');
+
+          collected = Math.min(Number(wallet.balance), amount);
+          shortfall = amount - collected;
+
+          if (collected > 0) {
+            // eslint-disable-next-line no-await-in-loop
+            const partial = await tx.wallet.updateMany({
+              where: { userId: sellerId, balance: { gte: collected } },
+              data: { balance: { decrement: collected } },
+            });
+            if (partial.count !== 1) {
+              throw ApiError.conflict('استرداد دیگری هم‌زمان روی کیف پول این فروشنده در حال انجام است؛ لطفاً دوباره تلاش کنید');
+            }
+          }
         }
-        // eslint-disable-next-line no-await-in-loop
-        const sellerWallet = await tx.wallet.findUnique({ where: { userId: sellerId } });
-        // eslint-disable-next-line no-await-in-loop
-        await tx.walletTransaction.create({
-          data: {
-            walletId: sellerWallet.id, type: 'DEBIT', amount, reason: `استرداد سفارش ${order.orderNumber}`, refId: storeId,
-          },
-        });
+
+        if (collected > 0) {
+          // eslint-disable-next-line no-await-in-loop
+          const sellerWallet = await tx.wallet.findUnique({ where: { userId: sellerId } });
+          // eslint-disable-next-line no-await-in-loop
+          await tx.walletTransaction.create({
+            data: {
+              walletId: sellerWallet.id,
+              type: 'DEBIT',
+              amount: collected,
+              reason: shortfall > 0
+                ? `استرداد جزئی سفارش ${order.orderNumber} (مابقی به‌عنوان بدهی فروشنده ثبت شد)`
+                : `استرداد سفارش ${order.orderNumber}`,
+              refId: storeId,
+            },
+          });
+        }
+
+        if (shortfall > 0) {
+          // eslint-disable-next-line no-await-in-loop
+          await tx.sellerPayoutLiability.create({
+            data: {
+              sellerId,
+              orderId: order.id,
+              storeId,
+              amount: shortfall,
+              reason: `کسری کیف پول هنگام استرداد سفارش ${order.orderNumber} — قابل واریز مجدد از تسویه‌ها/برداشت‌های بعدی`,
+            },
+          });
+        }
       }
 
       // Customer-side refund: WALLET credits immediately, GATEWAY only

@@ -18,11 +18,14 @@
  *     own idempotencyKey guard, exercised here directly.
  *
  *  B) Delivered-order refund (orders.service.js#refundDeliveredOrder) —
- *     full or partial, per-item, all-or-nothing across every affected
- *     seller's wallet, at Serializable isolation. The original
+ *     full or partial, per-item, at Serializable isolation. The original
  *     OrderItemSettlement snapshot is only ever read, never mutated;
  *     commission reversal is bookkeeping-only (OrderItemSettlementReversal
- *     row), never a wallet movement.
+ *     row), never a wallet movement. The customer-side refund always
+ *     completes: if a seller's wallet can't fully cover its clawback
+ *     (e.g. already withdrawn via a payout — see payouts.test.js), the
+ *     shortfall is collected down to zero and the uncollected remainder is
+ *     tracked as a SellerPayoutLiability instead of blocking the refund.
  *
  * Requires a real Postgres database (DATABASE_URL), migrated + seeded:
  *   NODE_ENV=test npm test
@@ -447,12 +450,13 @@ describe('Delivered-order refund (settlement clawback)', () => {
     expect(reversal).toBeNull(); // rejected batch left nothing behind
   });
 
-  test('insufficient seller balance rejects the refund and rolls back all money movement', async () => {
+  test('insufficient seller balance no longer blocks the refund: the customer is still made whole, the wallet is drained to zero (never negative), and the uncollected remainder becomes an OUTSTANDING SellerPayoutLiability', async () => {
     const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
     await payWallet(customer.auth, order.id);
     await advanceToDelivered(order.id, admin.auth);
     const orderWithItems = await prisma.order.findUnique({ where: { id: order.id }, include: { items: true } });
     const item = orderWithItems.items[0];
+    const settlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item.id } });
 
     // Drain the seller's wallet so it can't cover the clawback.
     await prisma.wallet.update({ where: { userId: seller.user.id }, data: { balance: 0 } });
@@ -460,20 +464,126 @@ describe('Delivered-order refund (settlement clawback)', () => {
 
     const res = await api.post(`${PREFIX}/orders/${order.id}/refund`).set('Authorization', admin.auth)
       .send({ items: [{ orderItemId: item.id, qty: 1 }] });
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(200); // the customer refund succeeds despite the seller shortfall
 
     const sellerWallet = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
-    expect(Number(sellerWallet.balance)).toBe(0); // untouched, never driven negative
+    expect(Number(sellerWallet.balance)).toBe(0); // drained to zero, never negative
 
     const customerWalletAfter = await prisma.wallet.findUnique({ where: { userId: customer.user.id } });
-    expect(Number(customerWalletAfter.balance)).toBe(Number(customerWalletBefore.balance)); // customer never credited either
+    expect(Number(customerWalletAfter.balance)).toBe(Number(customerWalletBefore.balance) + Number(settlement.grossAmount)); // customer made whole
 
-    const settlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item.id } });
     const reversal = await prisma.orderItemSettlementReversal.findFirst({ where: { settlementId: settlement.id } });
-    expect(reversal).toBeNull();
+    expect(reversal).not.toBeNull(); // the refund itself still recorded normally
+
+    const liability = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: order.id, sellerId: seller.user.id } });
+    expect(liability).not.toBeNull();
+    expect(liability.status).toBe('OUTSTANDING');
+    expect(Number(liability.amount)).toBe(Number(settlement.sellerEarning)); // the whole clawback was uncollected (wallet started at 0)
+
+    // No WalletTransaction DEBIT was recorded for this refund — nothing was actually collectible.
+    const debit = await prisma.walletTransaction.findFirst({
+      where: { walletId: sellerWallet.id, refId: item.storeId, reason: { contains: order.orderNumber } },
+    });
+    expect(debit).toBeNull();
   });
 
-  test('in a multi-seller refund, one seller\'s insufficient balance rolls back the OTHER seller\'s already-applied debit too', async () => {
+  test('a partial shortfall collects what the wallet has, debits exactly that, and records only the remainder as a liability', async () => {
+    const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
+    await payWallet(customer.auth, order.id);
+    await advanceToDelivered(order.id, admin.auth);
+    const orderWithItems = await prisma.order.findUnique({ where: { id: order.id }, include: { items: true } });
+    const item = orderWithItems.items[0];
+    const settlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item.id } });
+    const clawback = Number(settlement.sellerEarning);
+    const partialBalance = Math.floor(clawback / 3); // leave the wallet able to cover only part of the clawback
+
+    await prisma.wallet.update({ where: { userId: seller.user.id }, data: { balance: partialBalance } });
+    const customerWalletBefore = await prisma.wallet.findUnique({ where: { userId: customer.user.id } });
+
+    const res = await api.post(`${PREFIX}/orders/${order.id}/refund`).set('Authorization', admin.auth)
+      .send({ items: [{ orderItemId: item.id, qty: 1 }] });
+    expect(res.status).toBe(200);
+
+    const sellerWallet = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+    expect(Number(sellerWallet.balance)).toBe(0); // fully drained, never negative
+
+    const customerWalletAfter = await prisma.wallet.findUnique({ where: { userId: customer.user.id } });
+    expect(Number(customerWalletAfter.balance)).toBe(Number(customerWalletBefore.balance) + Number(settlement.grossAmount));
+
+    const debit = await prisma.walletTransaction.findFirst({
+      where: { walletId: sellerWallet.id, refId: item.storeId, reason: { contains: order.orderNumber } },
+    });
+    expect(debit).not.toBeNull();
+    expect(Number(debit.amount)).toBe(partialBalance); // collected exactly what was available
+
+    const liability = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: order.id, sellerId: seller.user.id } });
+    expect(liability).not.toBeNull();
+    expect(Number(liability.amount)).toBe(clawback - partialBalance); // exactly the uncollected remainder
+  });
+
+  test('retrying the same over-refund is rejected by the existing quantity guard, so a shortfall refund is never double-applied', async () => {
+    const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
+    await payWallet(customer.auth, order.id);
+    await advanceToDelivered(order.id, admin.auth);
+    const orderWithItems = await prisma.order.findUnique({ where: { id: order.id }, include: { items: true } });
+    const item = orderWithItems.items[0];
+
+    await prisma.wallet.update({ where: { userId: seller.user.id }, data: { balance: 0 } });
+
+    const first = await api.post(`${PREFIX}/orders/${order.id}/refund`).set('Authorization', admin.auth)
+      .send({ items: [{ orderItemId: item.id, qty: 1 }] });
+    expect(first.status).toBe(200);
+
+    // Same item, already fully refunded — the pre-existing over-refund guard rejects it, same as before this fix.
+    const retry = await api.post(`${PREFIX}/orders/${order.id}/refund`).set('Authorization', admin.auth)
+      .send({ items: [{ orderItemId: item.id, qty: 1 }] });
+    expect(retry.status).toBe(409);
+
+    const settlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item.id } });
+    const reversals = await prisma.orderItemSettlementReversal.findMany({ where: { settlementId: settlement.id } });
+    expect(reversals.length).toBe(1); // exactly one refund effect, never two
+
+    const liabilities = await prisma.sellerPayoutLiability.findMany({ where: { orderId: order.id, sellerId: seller.user.id } });
+    expect(liabilities.length).toBe(1); // exactly one liability row, never duplicated
+  });
+
+  test('seller withdraws their full settlement via a payout, then a later refund on the same order still succeeds and the shortfall is tracked', async () => {
+    const withdrawOrder = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
+    await payWallet(customer.auth, withdrawOrder.id);
+    await advanceToDelivered(withdrawOrder.id, admin.auth);
+    const orderWithItems = await prisma.order.findUnique({ where: { id: withdrawOrder.id }, include: { items: true } });
+    const item = orderWithItems.items[0];
+    const settlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item.id } });
+
+    // Seller withdraws exactly what this order settled — a legitimate Phase 5 payout.
+    const sellerWalletBeforePayout = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+    const payout = await api.post(`${PREFIX}/payouts`).set('Authorization', seller.auth).send({
+      amount: Number(sellerWalletBeforePayout.balance),
+      bankAccountHolder: 'علی رضایی',
+      bankIban: 'IR820540102680020817909002',
+    });
+    expect(payout.status).toBe(201);
+    const sellerWalletAfterPayout = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+    expect(Number(sellerWalletAfterPayout.balance)).toBe(0);
+
+    const customerWalletBefore = await prisma.wallet.findUnique({ where: { userId: customer.user.id } });
+    const refundRes = await api.post(`${PREFIX}/orders/${withdrawOrder.id}/refund`).set('Authorization', admin.auth)
+      .send({ items: [{ orderItemId: item.id, qty: 1 }] });
+    expect(refundRes.status).toBe(200); // customer refund succeeds even though the seller already withdrew the money
+
+    const customerWalletAfter = await prisma.wallet.findUnique({ where: { userId: customer.user.id } });
+    expect(Number(customerWalletAfter.balance)).toBe(Number(customerWalletBefore.balance) + Number(settlement.grossAmount));
+
+    const sellerWalletFinal = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+    expect(Number(sellerWalletFinal.balance)).toBe(0); // never went negative
+
+    const liability = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: withdrawOrder.id, sellerId: seller.user.id } });
+    expect(liability).not.toBeNull();
+    expect(liability.status).toBe('OUTSTANDING');
+    expect(Number(liability.amount)).toBe(Number(settlement.sellerEarning));
+  });
+
+  test('in a multi-seller refund, one seller\'s shortfall never affects the OTHER seller\'s normal debit', async () => {
     const order = await addToCartAndCheckout(customer.auth, [
       { storeProduct: product, qty: 1 },
       { storeProduct: product2, qty: 1 },
@@ -483,6 +593,7 @@ describe('Delivered-order refund (settlement clawback)', () => {
     const orderWithItems = await prisma.order.findUnique({ where: { id: order.id }, include: { items: true } });
     const item1 = orderWithItems.items.find((i) => i.storeId === product.storeId);
     const item2 = orderWithItems.items.find((i) => i.storeId === product2.storeId);
+    const settlement1 = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item1.id } });
 
     const seller1WalletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
     // seller1 can afford it; seller2 cannot.
@@ -490,14 +601,19 @@ describe('Delivered-order refund (settlement clawback)', () => {
 
     const res = await api.post(`${PREFIX}/orders/${order.id}/refund`).set('Authorization', admin.auth)
       .send({ items: [{ orderItemId: item1.id, qty: 1 }, { orderItemId: item2.id, qty: 1 }] });
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(200); // the whole refund succeeds — seller2's shortfall no longer blocks seller1's normal debit
 
     const seller1WalletAfter = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
-    expect(Number(seller1WalletAfter.balance)).toBe(Number(seller1WalletBefore.balance)); // rolled back even though seller1 alone could have afforded it
+    expect(Number(seller1WalletAfter.balance)).toBe(Number(seller1WalletBefore.balance) - Number(settlement1.sellerEarning)); // seller1 debited normally, in full
 
-    const settlement1 = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item1.id } });
-    const reversal1 = await prisma.orderItemSettlementReversal.findFirst({ where: { settlementId: settlement1.id } });
-    expect(reversal1).toBeNull(); // nothing left behind for either store
+    const seller2Wallet = await prisma.wallet.findUnique({ where: { userId: seller2.user.id } });
+    expect(Number(seller2Wallet.balance)).toBe(0); // seller2 drained, never negative
+
+    const liability1 = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: order.id, sellerId: seller.user.id } });
+    expect(liability1).toBeNull(); // seller1 had no shortfall
+
+    const liability2 = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: order.id, sellerId: seller2.user.id } });
+    expect(liability2).not.toBeNull(); // seller2's uncollected clawback is tracked
   });
 
   test('two concurrent refund requests for the same item: only one succeeds, never a double refund', async () => {
