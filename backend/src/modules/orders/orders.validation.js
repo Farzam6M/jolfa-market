@@ -13,4 +13,12 @@ const updateStatusSchema = z.object({
   status: z.enum(['CONFIRMED', 'PREPARING', 'SENT', 'DELIVERED', 'CANCELLED']),
 });
 
-module.exports = { checkoutSchema, updateStatusSchema };
+// GET /orders/settlements (seller, scoped to their own store — see
+// orders.service.js#listSettlementsForStore). Pagination follows the same
+// convention as products.validation.js's listQuerySchema.
+const listSettlementsQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20),
+});
+
+module.exports = { checkoutSchema, updateStatusSchema, listSettlementsQuerySchema };

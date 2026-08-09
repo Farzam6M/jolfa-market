@@ -261,6 +261,40 @@ async function listForStore(userId, { page = 1, pageSize = 20 } = {}) {
 }
 
 /**
+ * Settlement history for the logged-in seller's own store — Phase 3 (Seller
+ * Settlement Visibility). Reuses the same store-ownership lookup as
+ * listForStore, then reads OrderItemSettlement directly (rather than
+ * deriving it from OrderItem/CommissionRule) since settlement rows are
+ * already the point-in-time snapshot of what was actually paid out — see
+ * settleDeliveredOrder below and the "Historical snapshot" note there.
+ * Scoped to `storeId: store.id` at the query level, so a seller can never
+ * see another store's settlements no matter what query params are sent.
+ */
+async function listSettlementsForStore(userId, { page = 1, pageSize = 20 } = {}) {
+  const store = await prisma.store.findUnique({ where: { sellerId: userId } });
+  if (!store) throw ApiError.notFound('فروشگاهی برای این کاربر یافت نشد');
+
+  const where = { storeId: store.id };
+  const [items, total] = await Promise.all([
+    prisma.orderItemSettlement.findMany({
+      where,
+      include: {
+        order: { select: { id: true, orderNumber: true } },
+        orderItem: { select: { id: true, nameSnapshot: true, priceSnapshot: true, qty: true } },
+        commissionRule: { select: { id: true, scope: true } },
+      },
+      orderBy: { settledAt: 'desc' },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+    }),
+    prisma.orderItemSettlement.count({ where }),
+  ]);
+  return {
+    items, total, page, pageSize,
+  };
+}
+
+/**
  * Settles seller earnings for a DELIVERED order: creates exactly one
  * OrderItemSettlement row per OrderItem (a commission snapshot + the
  * seller's net earning) and credits each seller's wallet with that
@@ -463,5 +497,5 @@ async function updateStatus(orderId, status, actor) {
 }
 
 module.exports = {
-  checkout, getById, listMine, listForStore, updateStatus, ORDER_TRANSITIONS, SELLER_ALLOWED_STATUS_TARGETS, STATUS_LABELS,
+  checkout, getById, listMine, listForStore, listSettlementsForStore, updateStatus, ORDER_TRANSITIONS, SELLER_ALLOWED_STATUS_TARGETS, STATUS_LABELS,
 };

@@ -20,5 +20,9 @@ router.use('/admin', require('../modules/admin/admin.routes'));
 // dashboard/activity-log/admin-account-management concerns unrelated to
 // commission rule CRUD.
 router.use('/admin/commission-rules', require('../modules/commission-rules/commission-rules.routes'));
+// Same rationale as commission-rules above: read-only reporting over
+// OrderItemSettlement, kept out of admin.routes.js which is reserved for
+// dashboard/activity-log/admin-account-management concerns.
+router.use('/admin/commission-report', require('../modules/commission-report/commission-report.routes'));
 
 module.exports = router;

@@ -4,12 +4,16 @@ const validate = require('../../middlewares/validate.middleware');
 const { authenticate } = require('../../middlewares/auth.middleware');
 const { requirePermission, requireAnyPermission } = require('../../middlewares/rbac.middleware');
 const { PERMISSIONS } = require('../roles/permissions.constants');
-const { checkoutSchema, updateStatusSchema } = require('./orders.validation');
+const { checkoutSchema, updateStatusSchema, listSettlementsQuerySchema } = require('./orders.validation');
 
 router.use(authenticate);
 router.post('/checkout', requirePermission(PERMISSIONS.ORDERS_CREATE_SELF), validate({ body: checkoutSchema }), controller.checkout);
 router.get('/mine', requirePermission(PERMISSIONS.ORDERS_READ_SELF), controller.listMine);
 router.get('/store', requirePermission(PERMISSIONS.ORDERS_READ_STORE), controller.listForStore);
+// Must be declared before /:id or express would try to match "settlements"
+// as an order id. Seller-only, scoped to their own store — see
+// orders.service.js#listSettlementsForStore.
+router.get('/settlements', requirePermission(PERMISSIONS.ORDERS_READ_STORE), validate({ query: listSettlementsQuerySchema }), controller.listSettlementsForStore);
 router.get('/:id', controller.getById); // ownership checked in service (customer / store owner / staff)
 // Reachable by admin (orders:update:status, unrestricted) OR seller
 // (orders:update:status:store, scoped to their own store's orders and to
