@@ -21,4 +21,19 @@ const listSettlementsQuerySchema = z.object({
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
 });
 
-module.exports = { checkoutSchema, updateStatusSchema, listSettlementsQuerySchema };
+// POST /orders/:id/refund (admin, ORDERS_REFUND — see
+// orders.service.js#refundDeliveredOrder). No idempotencyKey field here:
+// the service generates its own per-call, since duplicate-request safety
+// for this endpoint comes from the over-refund check running at
+// Serializable isolation, not from a client-supplied key.
+const refundOrderSchema = z.object({
+  items: z.array(z.object({
+    orderItemId: z.string().uuid('شناسه قلم سفارش نامعتبر است'),
+    qty: z.number().int('تعداد باید عدد صحیح باشد').positive('تعداد باید بزرگ‌تر از صفر باشد'),
+  })).min(1, 'حداقل یک قلم برای استرداد لازم است'),
+  reason: z.string().max(500).optional(),
+});
+
+module.exports = {
+  checkoutSchema, updateStatusSchema, listSettlementsQuerySchema, refundOrderSchema,
+};

@@ -115,6 +115,7 @@ model User {
   notificationReads    NotificationRead[]
   adminActivityLogs    AdminActivityLog[]
   commissionRulesCreated CommissionRule[]
+  paymentRefundsRequested PaymentRefund[]
 
   @@index([roleId])
   @@map("users")
@@ -515,6 +516,7 @@ model Order {
   items    OrderItem[]
   payments Payment[]
   settlements OrderItemSettlement[]
+  refunds  PaymentRefund[]
 
   @@index([userId])
   @@index([status])
@@ -570,6 +572,8 @@ model Payment {
   transactionRef  String?       @unique
   paidAt          DateTime?
   createdAt       DateTime      @default(now())
+
+  refunds PaymentRefund[]
 
   @@index([orderId])
   @@map("payments")
@@ -717,10 +721,82 @@ model OrderItemSettlement {
   settledAt DateTime @default(now())
   createdAt DateTime @default(now())
 
+  reversals OrderItemSettlementReversal[]
+
   @@index([orderId])
   @@index([storeId])
   @@index([commissionRuleId])
   @@map("order_item_settlements")
+}
+
+// ──────────────────────── Refund / Cancellation (Phase 4) ────────────────────────
+//
+// Purely additive on top of Phase 0-3: the original Payment/OrderItemSettlement
+// rows are NEVER mutated by a refund (except Payment.status, which only ever
+// moves SUCCESS -> REFUNDED once fully refunded — see payments.service.js).
+// Every refund, whether it moved real money (WALLET) or is still awaiting a
+// manual gateway confirmation (GATEWAY), gets exactly one PaymentRefund row.
+enum RefundStatus {
+  REQUESTED // GATEWAY refund recorded, no outbound gateway API called yet — awaiting manual confirmation via markGatewayRefundProcessed().
+  PROCESSED // Money has actually moved: WALLET refunds are PROCESSED immediately; GATEWAY refunds become PROCESSED only via the manual confirmation endpoint.
+  FAILED
+}
+
+model PaymentRefund {
+  id        String  @id @default(uuid())
+  paymentId String
+  payment   Payment @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  orderId   String
+  order     Order   @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  amount Decimal      @db.Decimal(12, 0)
+  status RefundStatus @default(REQUESTED)
+  reason String?
+
+  // DB-level idempotency guard (see payments.service.js#refundWallet /
+  // refundGateway): a second call with the same key returns the existing
+  // row instead of moving money or inserting a duplicate.
+  idempotencyKey String @unique
+
+  requestedById String
+  requestedBy   User   @relation(fields: [requestedById], references: [id])
+  processedAt   DateTime?
+  createdAt     DateTime  @default(now())
+
+  reversals OrderItemSettlementReversal[]
+
+  @@index([paymentId])
+  @@index([orderId])
+  @@map("payment_refunds")
+}
+
+// One row per (OrderItemSettlement, PaymentRefund) — a reversal of PART or
+// ALL of that settlement's quantity. The original OrderItemSettlement is
+// never updated/deleted; summing this table's refundedQty per settlementId
+// is how "how much of this item has already been refunded" is derived (see
+// orders.service.js#refundDeliveredOrder), the same append-only-ledger
+// pattern OrderItemSettlement itself uses for the original sale.
+model OrderItemSettlementReversal {
+  id           String              @id @default(uuid())
+  settlementId String
+  settlement   OrderItemSettlement @relation(fields: [settlementId], references: [id], onDelete: Restrict)
+  refundId     String
+  refund       PaymentRefund       @relation(fields: [refundId], references: [id], onDelete: Restrict)
+
+  refundedQty              Int
+  refundedGrossAmount      Decimal @db.Decimal(12, 0)
+  // Bookkeeping only — recorded so the platform's commission ledger
+  // reflects the reversal, but no wallet movement is ever made for
+  // platform commission itself (see decision doc).
+  refundedCommissionAmount Decimal @db.Decimal(12, 0)
+  refundedSellerEarning    Decimal @db.Decimal(12, 0)
+
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@index([settlementId])
+  @@index([refundId])
+  @@map("order_item_settlement_reversals")
 }
 
 // ──────────────────────────── Support Chat / Store Chat ────────────────────────────

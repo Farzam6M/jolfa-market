@@ -4,7 +4,9 @@ const validate = require('../../middlewares/validate.middleware');
 const { authenticate } = require('../../middlewares/auth.middleware');
 const { requirePermission, requireAnyPermission } = require('../../middlewares/rbac.middleware');
 const { PERMISSIONS } = require('../roles/permissions.constants');
-const { checkoutSchema, updateStatusSchema, listSettlementsQuerySchema } = require('./orders.validation');
+const {
+  checkoutSchema, updateStatusSchema, listSettlementsQuerySchema, refundOrderSchema,
+} = require('./orders.validation');
 
 router.use(authenticate);
 router.post('/checkout', requirePermission(PERMISSIONS.ORDERS_CREATE_SELF), validate({ body: checkoutSchema }), controller.checkout);
@@ -21,5 +23,9 @@ router.get('/:id', controller.getById); // ownership checked in service (custome
 // holds ONE of these two permissions — ownership, allowed target statuses,
 // and the multi-seller-order guard are all enforced in the service layer.
 router.patch('/:id/status', requireAnyPermission(PERMISSIONS.ORDERS_UPDATE_STATUS, PERMISSIONS.ORDERS_UPDATE_STATUS_STORE), validate({ body: updateStatusSchema }), controller.updateStatus);
+// Delivered-order (full/partial) refund — admin-only. Does not go through
+// updateStatus/ORDER_TRANSITIONS at all: a refunded order stays DELIVERED
+// forever (see orders.service.js#refundDeliveredOrder).
+router.post('/:id/refund', requirePermission(PERMISSIONS.ORDERS_REFUND), validate({ body: refundOrderSchema }), controller.refundOrder);
 
 module.exports = router;

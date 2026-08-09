@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const { prisma } = require('../../config/database');
 const ApiError = require('../../utils/ApiError');
 const { generateOrderNumber } = require('../../utils/orderNumber');
@@ -7,6 +8,7 @@ const { logAdminActivity } = require('../admin/admin.service');
 const { pushNotification } = require('../notifications/notifications.service');
 const { PERMISSIONS } = require('../roles/permissions.constants');
 const { resolveCommissionRate } = require('../commission-rules/commission-rules.service');
+const { refundWallet, refundGateway } = require('../payments/payments.service');
 
 const STATUS_LABELS = {
   PENDING: 'در انتظار', CONFIRMED: 'تایید شده', PREPARING: 'در حال آماده‌سازی', SENT: 'ارسال شده', DELIVERED: 'تحویل داده شده', CANCELLED: 'لغو شده',
@@ -215,7 +217,18 @@ async function getById(orderId, requester) {
     };
   }
 
-  return { ...order, items: order.items.map(flattenOrderItem) };
+  // Refund history — owner/staff only (never sent through the seller-safe
+  // projection above), same as payments/address. A cancellation refund or a
+  // delivered-order refund both produce PaymentRefund rows here.
+  const refunds = await prisma.paymentRefund.findMany({
+    where: { orderId },
+    include: { reversals: true },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  return {
+    ...order, items: order.items.map(flattenOrderItem), refunds,
+  };
 }
 
 /** Full order history for the logged-in customer. */
@@ -413,7 +426,10 @@ async function settleDeliveredOrder(tx, order) {
  * status, so a cancelled order can never leave stock permanently short.
  */
 async function updateStatus(orderId, status, actor) {
-  const order = await prisma.order.findUnique({ where: { id: orderId }, include: { items: true } });
+  // `payments` included here (in addition to `items`) so a CANCELLED
+  // transition can look for a SUCCESS payment to refund — see the
+  // Phase 4 refund block below.
+  const order = await prisma.order.findUnique({ where: { id: orderId }, include: { items: true, payments: true } });
   if (!order) throw ApiError.notFound('سفارش یافت نشد');
 
   const isAdmin = actor.permissions.includes('*') || actor.permissions.includes(PERMISSIONS.ORDERS_UPDATE_STATUS);
@@ -483,6 +499,32 @@ async function updateStatus(orderId, status, actor) {
         // eslint-disable-next-line no-await-in-loop
         await tx.storeProduct.update({ where: { id: item.storeProductId }, data: { stock: { increment: item.qty } } });
       }
+
+      // Pre-delivery cancellation refund (Phase 4). Only a payment that
+      // actually SUCCEEDED needs reversing:
+      //   - COD is never SUCCESS at this point in the flow (see
+      //     payments.service.js#payCashOnDelivery — nothing in this
+      //     codebase ever marks a COD payment SUCCESS before delivery), so
+      //     it naturally falls through with no refund, matching the
+      //     "COD was never charged" rule.
+      //   - WALLET is refunded immediately (money lives entirely in this
+      //     app).
+      //   - GATEWAY only gets a REQUESTED PaymentRefund — no gateway API
+      //     is ever called; an admin confirms the real reversal later via
+      //     PATCH /admin/payment-refunds/:id/mark-processed.
+      // idempotencyKey is deterministic per-payment (not random) so that
+      // if this exact transition were ever retried, the refund functions'
+      // own idempotency guard (PaymentRefund.idempotencyKey @unique) makes
+      // the retry a no-op instead of a second refund.
+      const succeededPayment = order.payments.find((p) => p.status === 'SUCCESS');
+      if (succeededPayment) {
+        const idempotencyKey = `cancel-refund:${succeededPayment.id}`;
+        if (succeededPayment.method === 'WALLET') {
+          await refundWallet(succeededPayment.id, succeededPayment.amount, idempotencyKey, actor, tx);
+        } else if (succeededPayment.method === 'GATEWAY') {
+          await refundGateway(succeededPayment.id, succeededPayment.amount, idempotencyKey, actor, tx);
+        }
+      }
     }
     return result;
   });
@@ -496,6 +538,179 @@ async function updateStatus(orderId, status, actor) {
   return updated;
 }
 
+/**
+ * Refunds part or all of a DELIVERED order's items (Phase 4). Admin-only
+ * (ORDERS_REFUND, enforced at the route). Does NOT touch OrderStatus — a
+ * refunded order stays DELIVERED forever; the refund lives entirely in
+ * PaymentRefund + OrderItemSettlementReversal rows layered on top.
+ *
+ * `items` is [{ orderItemId, qty }, ...] — full or partial per item, and
+ * this function may be called multiple times for the same order (multiple
+ * partial refunds) as long as the cumulative refunded qty per item never
+ * exceeds that item's original OrderItem.qty.
+ *
+ * Per requested item, using the ORIGINAL settlement's snapshot (never the
+ * live CommissionRule):
+ *   refundedGrossAmount      = OrderItem.priceSnapshot * qty
+ *   refundedCommissionAmount = round(refundedGrossAmount * settlement.commissionRate / 100)
+ *   refundedSellerEarning    = refundedGrossAmount - refundedCommissionAmount
+ * This mirrors settleDeliveredOrder's own formula exactly (same rate,
+ * same rounding), just run backwards for the returned quantity. The
+ * OrderItemSettlement row itself is only ever read here, never written.
+ *
+ * All-or-nothing (decision #3): every affected store's seller wallet is
+ * debited by an atomic conditional updateMany (balance: {gte: amount}),
+ * the same compare-and-swap pattern used everywhere else in this codebase
+ * for wallet mutations (payWithWallet's debit, settleDeliveredOrder's
+ * credit). If ANY store's seller has insufficient balance, an ApiError is
+ * thrown and the whole $transaction — including any other store's debit
+ * already applied in this same call, plus the reversal rows and the
+ * customer-side refund below — rolls back completely: no partial refund is
+ * ever left behind.
+ *
+ * Runs at Serializable isolation specifically so that two concurrent
+ * refund requests against the SAME item (which each read
+ * "already-refunded qty so far" via a plain aggregate, not a single-row
+ * compare-and-swap) can never both pass the over-refund check and jointly
+ * refund more than the item's original qty — Postgres aborts the loser
+ * with a serialization failure instead, which surfaces here as a 409.
+ */
+async function refundDeliveredOrder(orderId, items, reason, actor) {
+  if (!items || !items.length) throw ApiError.badRequest('حداقل یک قلم برای استرداد لازم است');
+
+  let result;
+  try {
+    result = await prisma.$transaction(async (tx) => {
+      const order = await tx.order.findUnique({ where: { id: orderId }, include: { payments: true } });
+      if (!order) throw ApiError.notFound('سفارش یافت نشد');
+      if (order.status !== 'DELIVERED') throw ApiError.conflict('فقط سفارش تحویل‌داده‌شده قابل استرداد است');
+
+      const payment = order.payments.find((p) => p.status === 'SUCCESS');
+      if (!payment) throw ApiError.conflict('پرداخت موفقی برای این سفارش یافت نشد یا قبلاً به‌طور کامل استرداد شده است');
+
+      // Pass 1 — validate every requested line and compute its refund
+      // amounts WITHOUT mutating anything yet, so a bad line (unknown
+      // item, over-refund, ...) anywhere in the batch fails before any
+      // wallet is touched.
+      const refundLines = [];
+      const storeDebits = new Map(); // storeId -> { sellerId, amount }
+      let totalCustomerRefund = 0;
+
+      // eslint-disable-next-line no-restricted-syntax
+      for (const line of items) {
+        if (!line.qty || line.qty <= 0) throw ApiError.badRequest('تعداد استرداد باید بزرگ‌تر از صفر باشد');
+
+        // eslint-disable-next-line no-await-in-loop
+        const orderItem = await tx.orderItem.findUnique({
+          where: { id: line.orderItemId },
+          include: {
+            settlement: { include: { reversals: true } },
+            store: { select: { sellerId: true } },
+          },
+        });
+        if (!orderItem || orderItem.orderId !== orderId) throw ApiError.notFound('قلم سفارش یافت نشد');
+        if (!orderItem.settlement) throw ApiError.conflict('این قلم سفارش هنوز تسویه نشده است');
+
+        const alreadyRefundedQty = orderItem.settlement.reversals.reduce((s, r) => s + r.refundedQty, 0);
+        const availableQty = orderItem.qty - alreadyRefundedQty;
+        if (line.qty > availableQty) {
+          throw ApiError.conflict(`تعداد درخواستی برای استرداد «${orderItem.nameSnapshot}» بیشتر از تعداد قابل استرداد باقی‌مانده است`);
+        }
+
+        const refundedGrossAmount = Number(orderItem.priceSnapshot) * line.qty;
+        const refundedCommissionAmount = Math.round((refundedGrossAmount * Number(orderItem.settlement.commissionRate)) / 100);
+        const refundedSellerEarning = refundedGrossAmount - refundedCommissionAmount;
+
+        totalCustomerRefund += refundedGrossAmount;
+
+        const { storeId } = orderItem;
+        const existingDebit = storeDebits.get(storeId) || { sellerId: orderItem.store.sellerId, amount: 0 };
+        existingDebit.amount += refundedSellerEarning;
+        storeDebits.set(storeId, existingDebit);
+
+        refundLines.push({
+          settlementId: orderItem.settlement.id,
+          refundedQty: line.qty,
+          refundedGrossAmount,
+          refundedCommissionAmount,
+          refundedSellerEarning,
+        });
+      }
+
+      // Pass 2 — the all-or-nothing money movement. Any failure from here
+      // on rolls back everything above too (nothing was written yet).
+      // eslint-disable-next-line no-restricted-syntax
+      for (const [storeId, { sellerId, amount }] of storeDebits) {
+        // eslint-disable-next-line no-await-in-loop
+        const debited = await tx.wallet.updateMany({
+          where: { userId: sellerId, balance: { gte: amount } },
+          data: { balance: { decrement: amount } },
+        });
+        if (debited.count !== 1) {
+          throw ApiError.conflict('موجودی کیف پول فروشنده برای استرداد این سفارش کافی نیست');
+        }
+        // eslint-disable-next-line no-await-in-loop
+        const sellerWallet = await tx.wallet.findUnique({ where: { userId: sellerId } });
+        // eslint-disable-next-line no-await-in-loop
+        await tx.walletTransaction.create({
+          data: {
+            walletId: sellerWallet.id, type: 'DEBIT', amount, reason: `استرداد سفارش ${order.orderNumber}`, refId: storeId,
+          },
+        });
+      }
+
+      // Customer-side refund: WALLET credits immediately, GATEWAY only
+      // records a REQUESTED PaymentRefund pending manual confirmation —
+      // see payments.service.js#refundWallet / refundGateway. One
+      // PaymentRefund row covers this whole call (possibly several
+      // items/stores); each item gets its own reversal row below linking
+      // back to it.
+      const idempotencyKey = crypto.randomUUID();
+      const refund = payment.method === 'WALLET'
+        ? await refundWallet(payment.id, totalCustomerRefund, idempotencyKey, actor, tx)
+        : await refundGateway(payment.id, totalCustomerRefund, idempotencyKey, actor, tx);
+
+      // eslint-disable-next-line no-restricted-syntax
+      for (const line of refundLines) {
+        // eslint-disable-next-line no-await-in-loop
+        await tx.orderItemSettlementReversal.create({
+          data: {
+            settlementId: line.settlementId,
+            refundId: refund.id,
+            refundedQty: line.refundedQty,
+            refundedGrossAmount: line.refundedGrossAmount,
+            refundedCommissionAmount: line.refundedCommissionAmount,
+            refundedSellerEarning: line.refundedSellerEarning,
+            reason: reason || null,
+          },
+        });
+      }
+
+      return { refund, totalCustomerRefund, itemsRefunded: refundLines.length };
+    }, { isolationLevel: 'Serializable' });
+  } catch (err) {
+    // A Serializable transaction conflict (Prisma P2034) means this refund
+    // lost a race with another concurrent refund touching the same
+    // item(s) — surfaces as a clean 409 rather than a raw Prisma error, so
+    // the loser can be safely retried by the caller once the other
+    // request's result is visible.
+    if (err.code === 'P2034') throw ApiError.conflict('استرداد دیگری هم‌زمان روی این سفارش در حال انجام است؛ لطفاً دوباره تلاش کنید');
+    throw err;
+  }
+
+  await logAdminActivity(actor.id, `استرداد سفارش ${orderId} (${result.itemsRefunded} قلم)`);
+  return result;
+}
+
 module.exports = {
-  checkout, getById, listMine, listForStore, listSettlementsForStore, updateStatus, ORDER_TRANSITIONS, SELLER_ALLOWED_STATUS_TARGETS, STATUS_LABELS,
+  checkout,
+  getById,
+  listMine,
+  listForStore,
+  listSettlementsForStore,
+  updateStatus,
+  refundDeliveredOrder,
+  ORDER_TRANSITIONS,
+  SELLER_ALLOWED_STATUS_TARGETS,
+  STATUS_LABELS,
 };

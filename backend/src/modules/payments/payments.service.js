@@ -3,6 +3,7 @@ const { prisma } = require('../../config/database');
 const ApiError = require('../../utils/ApiError');
 const logger = require('../../utils/logger');
 const { pushNotification } = require('../notifications/notifications.service');
+const { logAdminActivity } = require('../admin/admin.service');
 
 async function payWithWallet(order, userId) {
   return prisma.$transaction(async (tx) => {
@@ -181,6 +182,156 @@ async function listAll({ status, method, page = 1, pageSize = 20 } = {}) {
   return { items, total, page, pageSize };
 }
 
+/**
+ * Sum of a payment's PROCESSED refunds only — REQUESTED (still-pending
+ * gateway) refunds never count toward "has this payment been fully paid
+ * back yet", since no money has actually moved for them.
+ */
+async function sumProcessedRefunds(tx, paymentId) {
+  const agg = await tx.paymentRefund.aggregate({
+    where: { paymentId, status: 'PROCESSED' },
+    _sum: { amount: true },
+  });
+  return Number(agg._sum.amount || 0);
+}
+
+/**
+ * Refunds a WALLET payment: credits the customer's wallet immediately
+ * (money for a WALLET payment lives entirely inside this app, so there is
+ * nothing to wait on) and records the refund as PROCESSED right away.
+ *
+ * Idempotent via `idempotencyKey` (DB-@unique on PaymentRefund): a second
+ * call with the same key is a pure no-op — it returns the existing
+ * PaymentRefund row without crediting the wallet again or inserting a
+ * duplicate row. This is what stops a retried cancellation/refund request
+ * (double click, retried job, concurrent request) from double-crediting a
+ * customer.
+ *
+ * Accepts an optional `tx` (Prisma transaction client) so a caller — e.g.
+ * orders.service.js#refundDeliveredOrder, which must debit seller wallets
+ * and record settlement reversals in the SAME all-or-nothing transaction —
+ * can run this as part of a larger atomic operation. Defaults to `prisma`
+ * for standalone use (e.g. the pre-delivery cancellation path).
+ */
+async function refundWallet(paymentId, amount, idempotencyKey, actor, tx = prisma) {
+  const existing = await tx.paymentRefund.findUnique({ where: { idempotencyKey } });
+  if (existing) return existing; // Idempotent replay — no second credit, no duplicate row.
+
+  const payment = await tx.payment.findUnique({ where: { id: paymentId } });
+  if (!payment) throw ApiError.notFound('پرداخت یافت نشد');
+  if (payment.status !== 'SUCCESS') throw ApiError.conflict('فقط پرداخت موفق قابل استرداد است');
+
+  const order = await tx.order.findUnique({ where: { id: payment.orderId } });
+
+  // Atomic credit — same conditional-updateMany pattern as every other
+  // wallet mutation in this codebase (payWithWallet's debit,
+  // orders.service.js#settleDeliveredOrder's seller credit). A missing
+  // wallet (should be impossible) surfaces as count !== 1 and throws,
+  // rolling back the whole refund rather than silently losing the credit.
+  const credited = await tx.wallet.updateMany({
+    where: { userId: order.userId },
+    data: { balance: { increment: amount } },
+  });
+  if (credited.count !== 1) throw ApiError.internal('کیف پول مشتری برای استرداد یافت نشد');
+
+  const wallet = await tx.wallet.findUnique({ where: { userId: order.userId } });
+  await tx.walletTransaction.create({
+    data: {
+      walletId: wallet.id, type: 'CREDIT', amount, reason: `استرداد سفارش ${order.orderNumber}`, refId: payment.id,
+    },
+  });
+
+  const refund = await tx.paymentRefund.create({
+    data: {
+      paymentId: payment.id,
+      orderId: payment.orderId,
+      amount,
+      status: 'PROCESSED',
+      reason: 'استرداد کیف پول',
+      idempotencyKey,
+      requestedById: actor.id,
+      processedAt: new Date(),
+    },
+  });
+
+  // Only flip the Payment itself to REFUNDED once its PROCESSED refunds
+  // add up to the full original amount — a partial refund (delivered-order
+  // partial item refund) must leave the payment SUCCESS so it can still be
+  // read as "there is a successful payment behind this order".
+  const totalProcessed = await sumProcessedRefunds(tx, payment.id);
+  if (totalProcessed >= Number(payment.amount)) {
+    await tx.payment.updateMany({ where: { id: payment.id, status: { not: 'REFUNDED' } }, data: { status: 'REFUNDED' } });
+  }
+
+  return refund;
+}
+
+/**
+ * Refunds a GATEWAY payment. NEVER calls any gateway API (none is wired in
+ * — see initGatewayPayment's comment) and NEVER moves money itself: it only
+ * records a REQUESTED PaymentRefund so an admin can later confirm the real
+ * off-platform reversal via `markGatewayRefundProcessed`. Payment.status is
+ * deliberately left untouched here (still SUCCESS) — it only becomes
+ * REFUNDED once the corresponding refund(s) are actually confirmed
+ * PROCESSED.
+ *
+ * Same idempotency contract and `tx` parameter as refundWallet — see there.
+ */
+async function refundGateway(paymentId, amount, idempotencyKey, actor, tx = prisma) {
+  const existing = await tx.paymentRefund.findUnique({ where: { idempotencyKey } });
+  if (existing) return existing;
+
+  const payment = await tx.payment.findUnique({ where: { id: paymentId } });
+  if (!payment) throw ApiError.notFound('پرداخت یافت نشد');
+  if (payment.status !== 'SUCCESS') throw ApiError.conflict('فقط پرداخت موفق قابل استرداد است');
+
+  return tx.paymentRefund.create({
+    data: {
+      paymentId: payment.id,
+      orderId: payment.orderId,
+      amount,
+      status: 'REQUESTED',
+      reason: 'در انتظار تأیید استرداد درگاه پرداخت',
+      idempotencyKey,
+      requestedById: actor.id,
+    },
+  });
+}
+
+/**
+ * Admin-only manual confirmation that a GATEWAY refund actually happened
+ * on the gateway's side (no gateway webhook exists for this — see
+ * refundGateway's comment). Atomic claim (updateMany REQUESTED ->
+ * PROCESSED) so two concurrent "mark processed" calls for the same refund
+ * can only succeed once; the loser gets back the already-processed row as
+ * a graceful no-op instead of double-counting toward the payment total.
+ */
+async function markGatewayRefundProcessed(refundId, actor) {
+  return prisma.$transaction(async (tx) => {
+    const claimed = await tx.paymentRefund.updateMany({
+      where: { id: refundId, status: 'REQUESTED' },
+      data: { status: 'PROCESSED', processedAt: new Date() },
+    });
+
+    const refund = await tx.paymentRefund.findUnique({ where: { id: refundId } });
+    if (!refund) throw ApiError.notFound('درخواست استرداد یافت نشد');
+    if (claimed.count === 0) return refund; // Already PROCESSED (or was never REQUESTED) — no-op.
+
+    const payment = await tx.payment.findUnique({ where: { id: refund.paymentId } });
+    // Payment -> REFUNDED only once ALL of its PROCESSED refunds (across
+    // possibly several partial gateway confirmations) add up to the full
+    // original amount — mirrors refundWallet's same rule.
+    const totalProcessed = await sumProcessedRefunds(tx, payment.id);
+    if (totalProcessed >= Number(payment.amount)) {
+      await tx.payment.updateMany({ where: { id: payment.id, status: { not: 'REFUNDED' } }, data: { status: 'REFUNDED' } });
+    }
+    return refund;
+  }).then(async (refund) => {
+    await logAdminActivity(actor.id, `تأیید دستی استرداد درگاه پرداخت ${refund.id}`);
+    return refund;
+  });
+}
+
 module.exports = {
-  pay, confirmGateway, getWallet, listAll,
+  pay, confirmGateway, getWallet, listAll, refundWallet, refundGateway, markGatewayRefundProcessed,
 };
