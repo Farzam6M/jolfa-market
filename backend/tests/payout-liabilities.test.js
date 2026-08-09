@@ -196,15 +196,28 @@ describe('Phase 6 — Liability recovery on settlement', () => {
   });
 
   test('FIFO ordering: the older liability is recovered first even if created after a newer one in insertion order', async () => {
-    const dummyOrder = await fullyDeliverOrder(customer.auth, admin.auth, product, 1);
+    // Isolated seller/store/product/wallet (not the shared `seller`): the
+    // preceding 'partial recovery' test deliberately leaves an OUTSTANDING
+    // leftover liability on the shared seller, which would otherwise sit
+    // between this test's own older/newer liabilities in FIFO (createdAt)
+    // order and consume the settlement earning meant for `newer` — same
+    // isolation pattern as the 'concurrent settlements' test below.
+    const fifoSeller = await makeUser('SELLER', '54015000' + Math.floor(Math.random() * 9));
+    const fifoStore = await makeApprovedStore(fifoSeller.user.id, 'فروشگاه ترتیب FIFO');
+    const fifoProduct = await makeApprovedProduct(fifoSeller.auth, admin.auth, category.id, { price: 40000, stock: 999 });
+    await prisma.wallet.upsert({
+      where: { userId: fifoSeller.user.id }, update: { balance: 0 }, create: { userId: fifoSeller.user.id, balance: 0 },
+    });
+
+    const dummyOrder = await fullyDeliverOrder(customer.auth, admin.auth, fifoProduct, 1);
     const now = Date.now();
     // Insert the NEWER one first, then the OLDER one, to prove ordering is by createdAt, not insertion order.
-    const newer = await makeLiability(seller.user.id, dummyOrder.order.id, store.id, 10000, { createdAt: new Date(now) });
-    const older = await makeLiability(seller.user.id, dummyOrder.order.id, store.id, 10000, { createdAt: new Date(now - 60000) });
+    const newer = await makeLiability(fifoSeller.user.id, dummyOrder.order.id, fifoStore.id, 10000, { createdAt: new Date(now) });
+    const older = await makeLiability(fifoSeller.user.id, dummyOrder.order.id, fifoStore.id, 10000, { createdAt: new Date(now - 60000) });
 
     // sellerEarning=36000 covers older(10000) + newer(10000) fully, remainder 16000 to wallet.
-    const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
-    const { order } = await fullyDeliverOrder(customer.auth, admin.auth, product, 1);
+    const walletBefore = await prisma.wallet.findUnique({ where: { userId: fifoSeller.user.id } });
+    const { order } = await fullyDeliverOrder(customer.auth, admin.auth, fifoProduct, 1);
 
     const olderAfter = await prisma.sellerPayoutLiability.findUnique({ where: { id: older.id } });
     const newerAfter = await prisma.sellerPayoutLiability.findUnique({ where: { id: newer.id } });
@@ -216,28 +229,44 @@ describe('Phase 6 — Liability recovery on settlement', () => {
     const newerTx = await prisma.walletTransaction.findFirst({ where: { refId: newer.id, type: 'DEBIT' } });
     expect(olderTx.createdAt.getTime()).toBeLessThanOrEqual(newerTx.createdAt.getTime());
 
-    const walletAfter = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+    const walletAfter = await prisma.wallet.findUnique({ where: { userId: fifoSeller.user.id } });
     expect(Number(walletAfter.balance)).toBe(Number(walletBefore.balance) + 16000);
     void order;
   });
 
   test('recovery across multiple future settlements: a partially-recovered liability finishes recovering on a later settlement', async () => {
-    const dummyOrder = await fullyDeliverOrder(customer.auth, admin.auth, product, 1);
-    const liability = await makeLiability(seller.user.id, dummyOrder.order.id, store.id, 50000); // needs two 36000-earning settlements to clear
+    // Isolated seller/store/product/wallet (not the shared `seller`): the
+    // preceding 'partial recovery' test leaves an OUTSTANDING leftover
+    // liability on the shared seller, and this test's own `dummyOrder`
+    // settlement (needed only to obtain a valid orderId FK for
+    // makeLiability, before this test's own liability even exists) would
+    // otherwise partially recover into that leftover — corrupting the
+    // 14000/22000/0 math below, which assumes this test's own liability is
+    // the only OUTSTANDING one for its seller. Same isolation pattern as
+    // the FIFO and 'concurrent settlements' tests.
+    const multiSettleSeller = await makeUser('SELLER', '54018000' + Math.floor(Math.random() * 9));
+    const multiSettleStore = await makeApprovedStore(multiSettleSeller.user.id, 'فروشگاه تسویه چندگانه');
+    const multiSettleProduct = await makeApprovedProduct(multiSettleSeller.auth, admin.auth, category.id, { price: 40000, stock: 999 });
+    await prisma.wallet.upsert({
+      where: { userId: multiSettleSeller.user.id }, update: { balance: 0 }, create: { userId: multiSettleSeller.user.id, balance: 0 },
+    });
 
-    const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+    const dummyOrder = await fullyDeliverOrder(customer.auth, admin.auth, multiSettleProduct, 1);
+    const liability = await makeLiability(multiSettleSeller.user.id, dummyOrder.order.id, multiSettleStore.id, 50000); // needs two 36000-earning settlements to clear
 
-    await fullyDeliverOrder(customer.auth, admin.auth, product, 1); // recovers 36000, remaining 14000
+    const walletBefore = await prisma.wallet.findUnique({ where: { userId: multiSettleSeller.user.id } });
+
+    await fullyDeliverOrder(customer.auth, admin.auth, multiSettleProduct, 1); // recovers 36000, remaining 14000
     const midLiability = await prisma.sellerPayoutLiability.findUnique({ where: { id: liability.id } });
     expect(midLiability.status).toBe('OUTSTANDING');
     expect(Number(midLiability.amount)).toBe(14000);
 
-    await fullyDeliverOrder(customer.auth, admin.auth, product, 1); // recovers remaining 14000, credits 22000 remainder
+    await fullyDeliverOrder(customer.auth, admin.auth, multiSettleProduct, 1); // recovers remaining 14000, credits 22000 remainder
     const finalLiability = await prisma.sellerPayoutLiability.findUnique({ where: { id: liability.id } });
     expect(finalLiability.status).toBe('RECOVERED');
     expect(Number(finalLiability.amount)).toBe(0);
 
-    const walletAfter = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+    const walletAfter = await prisma.wallet.findUnique({ where: { userId: multiSettleSeller.user.id } });
     expect(Number(walletAfter.balance)).toBe(Number(walletBefore.balance) + 22000); // 0 + 22000 credited total across both settlements
   });
 
@@ -246,6 +275,9 @@ describe('Phase 6 — Liability recovery on settlement', () => {
     const freshStore = await makeApprovedStore(freshSeller.user.id, 'فروشگاه بدون بدهی');
     const freshProduct = await makeApprovedProduct(freshSeller.auth, admin.auth, category.id, { price: 40000, stock: 999 });
     void freshStore;
+    await prisma.wallet.upsert({
+      where: { userId: freshSeller.user.id }, update: { balance: 0 }, create: { userId: freshSeller.user.id, balance: 0 },
+    });
 
     const walletBefore = await prisma.wallet.findUnique({ where: { userId: freshSeller.user.id } });
     const { order } = await fullyDeliverOrder(customer.auth, admin.auth, freshProduct, 1);
@@ -368,6 +400,7 @@ describe('Phase 6 — Payout capped by outstanding liability', () => {
     const category = await api.post(`${PREFIX}/categories`).set('Authorization', admin.auth)
       .send({ name: 'دسته بدهی کامل', slug: `payout-full-liability-cat-${Date.now()}` });
     const product = await makeApprovedProduct(racer.auth, admin.auth, category.body.data.id, { price: 10000, stock: 999 });
+    await prisma.wallet.create({ data: { userId: racer.user.id, balance: 0 } });
     const { order } = await fullyDeliverOrder(customer.auth, admin.auth, product, 1);
     await prisma.wallet.update({ where: { userId: racer.user.id }, data: { balance: 500 } });
     await makeLiability(racer.user.id, order.id, store.id, 500);
