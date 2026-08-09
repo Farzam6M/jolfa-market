@@ -143,11 +143,17 @@ async function createDirect({ name, categoryTag, region, description, logoUrl, m
     plainPassword = password || Math.random().toString(36).slice(-8);
     const sellerRole = await prisma.role.findUnique({ where: { key: 'SELLER' } });
     const passwordHash = await hashPassword(plainPassword);
-    user = await prisma.user.create({
-      data: { name, mobile: mobileToUse, passwordHash, roleId: sellerRole.id },
-      include: { role: true },
+    // User + Wallet are one atomic creation unit — see the identical note in
+    // auth.service.js#register. The existing-customer-upgrade branch above
+    // is untouched: it never creates a User or Wallet, only updates the role.
+    user = await prisma.$transaction(async (tx) => {
+      const createdUser = await tx.user.create({
+        data: { name, mobile: mobileToUse, passwordHash, roleId: sellerRole.id },
+        include: { role: true },
+      });
+      await tx.wallet.create({ data: { userId: createdUser.id } });
+      return createdUser;
     });
-    await prisma.wallet.create({ data: { userId: user.id } });
   }
 
   const existingStore = await prisma.store.findUnique({ where: { sellerId: user.id } });

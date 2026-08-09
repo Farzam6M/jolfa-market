@@ -179,13 +179,19 @@ async function register({ name, mobile, password, otpCode }, meta = {}) {
   if (!role) throw ApiError.internal('نقش پیش‌فرض کاربر یافت نشد — seed را اجرا کنید');
 
   const passwordHash = await hashPassword(password);
-  const user = await prisma.user.create({
-    data: { name, mobile, passwordHash, roleId: role.id },
-    include: { role: true },
+  // User + Cart + Wallet are one atomic creation unit — a crash or DB error
+  // between these writes must never leave a User without a Wallet (every
+  // downstream financial invariant, e.g. settleDeliveredOrder/createPayout,
+  // assumes every User has exactly one Wallet — see Wallet model doc).
+  const user = await prisma.$transaction(async (tx) => {
+    const createdUser = await tx.user.create({
+      data: { name, mobile, passwordHash, roleId: role.id },
+      include: { role: true },
+    });
+    await tx.cart.create({ data: { userId: createdUser.id } });
+    await tx.wallet.create({ data: { userId: createdUser.id } });
+    return createdUser;
   });
-
-  await prisma.cart.create({ data: { userId: user.id } });
-  await prisma.wallet.create({ data: { userId: user.id } });
 
   await pushNotification({
     icon: 'i-users',

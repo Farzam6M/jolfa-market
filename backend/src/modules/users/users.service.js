@@ -253,11 +253,16 @@ async function createStaffUser({ name, mobile, password }, roleKey, actor) {
 
   const role = await prisma.role.findUnique({ where: { key: roleKey } });
   const passwordHash = await hashPassword(password);
-  const user = await prisma.user.create({
-    data: { name, mobile, passwordHash, roleId: role.id },
-    include: { role: true },
+  // User + Wallet are one atomic creation unit — see the identical note in
+  // auth.service.js#register.
+  const user = await prisma.$transaction(async (tx) => {
+    const createdUser = await tx.user.create({
+      data: { name, mobile, passwordHash, roleId: role.id },
+      include: { role: true },
+    });
+    await tx.wallet.create({ data: { userId: createdUser.id } });
+    return createdUser;
   });
-  await prisma.wallet.create({ data: { userId: user.id } });
   await logAdminActivity(actor.id, `ایجاد حساب ${roleKey} جدید: ${name}`);
   return toPublicUser(user);
 }
