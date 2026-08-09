@@ -309,16 +309,208 @@ describe('Admin transitions', () => {
     expect(Number(walletAfter.balance)).toBe(Number(walletStart.balance));
   });
 
-  test('mark-failed requires an APPROVED row — REQUESTED is left untouched (no-op)', async () => {
+  test('mark-failed requires an APPROVED row — REQUESTED is rejected as an invalid transition, not a silent no-op', async () => {
     const created = await api.post(`${PREFIX}/payouts`).set('Authorization', seller.auth).send({ amount: 15000, ...validBank() });
     const id = created.body.data.id;
+    const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
 
     const res = await api.patch(`${PREFIX}/admin/payouts/${id}/mark-failed`).set('Authorization', admin.auth).send({ failureReason: 'زودتر از موعد' });
-    expect(res.status).toBe(200);
-    expect(res.body.data.status).toBe('REQUESTED'); // unchanged — claim missed, no-op
+    expect(res.status).toBe(409);
+
+    const stillRequested = await prisma.payoutRequest.findUnique({ where: { id } });
+    expect(stillRequested.status).toBe('REQUESTED'); // unchanged — invalid transition, not silently accepted
+
+    const walletAfter = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+    expect(Number(walletAfter.balance)).toBe(Number(walletBefore.balance)); // no credit fired
 
     // Cleanup: reject it so it doesn't leave a dangling reservation.
     await api.patch(`${PREFIX}/admin/payouts/${id}/reject`).set('Authorization', admin.auth).send({});
+  });
+
+  describe('Fix #3 — silent invalid-state-transition no-op', () => {
+    async function freshRequested(amount = 20000) {
+      const res = await api.post(`${PREFIX}/payouts`).set('Authorization', seller.auth).send({ amount, ...validBank() });
+      return res.body.data.id;
+    }
+
+    async function freshApproved(amount = 20000) {
+      const id = await freshRequested(amount);
+      await api.patch(`${PREFIX}/admin/payouts/${id}/approve`).set('Authorization', admin.auth);
+      return id;
+    }
+
+    async function freshRejected(amount = 20000) {
+      const id = await freshRequested(amount);
+      await api.patch(`${PREFIX}/admin/payouts/${id}/reject`).set('Authorization', admin.auth).send({});
+      return id;
+    }
+
+    async function freshProcessed(amount = 20000) {
+      const id = await freshApproved(amount);
+      await api.patch(`${PREFIX}/admin/payouts/${id}/mark-processed`).set('Authorization', admin.auth);
+      return id;
+    }
+
+    async function freshFailed(amount = 20000) {
+      const id = await freshApproved(amount);
+      await api.patch(`${PREFIX}/admin/payouts/${id}/mark-failed`).set('Authorization', admin.auth).send({});
+      return id;
+    }
+
+    async function expectUnchanged(id, expectedStatus, walletBefore) {
+      const row = await prisma.payoutRequest.findUnique({ where: { id } });
+      expect(row.status).toBe(expectedStatus);
+      const walletAfter = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      expect(Number(walletAfter.balance)).toBe(Number(walletBefore.balance));
+      const txCount = await prisma.walletTransaction.count({ where: { refId: id } });
+      return txCount;
+    }
+
+    // ---- Approve ----
+    test('approve: REQUESTED -> APPROVED succeeds', async () => {
+      const id = await freshRequested();
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/approve`).set('Authorization', admin.auth);
+      expect(res.status).toBe(200);
+      expect(res.body.data.status).toBe('APPROVED');
+    });
+
+    test('approve: retry on APPROVED is idempotent, no side effect', async () => {
+      const id = await freshApproved();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const before = await prisma.payoutRequest.findUnique({ where: { id } });
+
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/approve`).set('Authorization', admin.auth);
+      expect(res.status).toBe(200);
+      expect(res.body.data.status).toBe('APPROVED');
+
+      const after = await prisma.payoutRequest.findUnique({ where: { id } });
+      expect(after.approvedAt.getTime()).toBe(before.approvedAt.getTime()); // stamp not re-fired
+      const walletAfter = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      expect(Number(walletAfter.balance)).toBe(Number(walletBefore.balance));
+    });
+
+    test('approve: on REJECTED -> invalid transition (409), nothing changes', async () => {
+      const id = await freshRejected();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/approve`).set('Authorization', admin.auth);
+      expect(res.status).toBe(409);
+      await expectUnchanged(id, 'REJECTED', walletBefore);
+    });
+
+    test('approve: on PROCESSED -> invalid transition (409), nothing changes', async () => {
+      const id = await freshProcessed();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/approve`).set('Authorization', admin.auth);
+      expect(res.status).toBe(409);
+      await expectUnchanged(id, 'PROCESSED', walletBefore);
+    });
+
+    test('approve: on FAILED -> invalid transition (409), nothing changes', async () => {
+      const id = await freshFailed();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/approve`).set('Authorization', admin.auth);
+      expect(res.status).toBe(409);
+      await expectUnchanged(id, 'FAILED', walletBefore);
+    });
+
+    // ---- Reject ----
+    test('reject: retry on REJECTED is idempotent, no second credit', async () => {
+      const id = await freshRejected();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/reject`).set('Authorization', admin.auth).send({});
+      expect(res.status).toBe(200);
+      const txCount = await expectUnchanged(id, 'REJECTED', walletBefore);
+      expect(txCount).toBe(1); // only the original release credit — no second one
+    });
+
+    test('reject: on APPROVED -> invalid transition (409), nothing changes', async () => {
+      const id = await freshApproved();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/reject`).set('Authorization', admin.auth).send({});
+      expect(res.status).toBe(409);
+      await expectUnchanged(id, 'APPROVED', walletBefore);
+    });
+
+    test('reject: on PROCESSED -> invalid transition (409), nothing changes', async () => {
+      const id = await freshProcessed();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/reject`).set('Authorization', admin.auth).send({});
+      expect(res.status).toBe(409);
+      await expectUnchanged(id, 'PROCESSED', walletBefore);
+    });
+
+    test('reject: on FAILED -> invalid transition (409), nothing changes', async () => {
+      const id = await freshFailed();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/reject`).set('Authorization', admin.auth).send({});
+      expect(res.status).toBe(409);
+      await expectUnchanged(id, 'FAILED', walletBefore);
+    });
+
+    // ---- Mark Processed ----
+    test('mark-processed: retry on PROCESSED is idempotent, no side effect', async () => {
+      const id = await freshProcessed();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const before = await prisma.payoutRequest.findUnique({ where: { id } });
+
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/mark-processed`).set('Authorization', admin.auth);
+      expect(res.status).toBe(200);
+
+      const after = await prisma.payoutRequest.findUnique({ where: { id } });
+      expect(after.processedAt.getTime()).toBe(before.processedAt.getTime());
+      const walletAfter = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      expect(Number(walletAfter.balance)).toBe(Number(walletBefore.balance));
+    });
+
+    test('mark-processed: on REQUESTED -> invalid transition (409), nothing changes', async () => {
+      const id = await freshRequested();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/mark-processed`).set('Authorization', admin.auth);
+      expect(res.status).toBe(409);
+      await expectUnchanged(id, 'REQUESTED', walletBefore);
+    });
+
+    test('mark-processed: on REJECTED -> invalid transition (409), nothing changes', async () => {
+      const id = await freshRejected();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/mark-processed`).set('Authorization', admin.auth);
+      expect(res.status).toBe(409);
+      await expectUnchanged(id, 'REJECTED', walletBefore);
+    });
+
+    test('mark-processed: on FAILED -> invalid transition (409), nothing changes', async () => {
+      const id = await freshFailed();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/mark-processed`).set('Authorization', admin.auth);
+      expect(res.status).toBe(409);
+      await expectUnchanged(id, 'FAILED', walletBefore);
+    });
+
+    // ---- Mark Failed ----
+    test('mark-failed: retry on FAILED is idempotent, no second credit', async () => {
+      const id = await freshFailed();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/mark-failed`).set('Authorization', admin.auth).send({});
+      expect(res.status).toBe(200);
+      const txCount = await expectUnchanged(id, 'FAILED', walletBefore);
+      expect(txCount).toBe(1); // only the original release credit — no second one
+    });
+
+    test('mark-failed: on REJECTED -> invalid transition (409), nothing changes', async () => {
+      const id = await freshRejected();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/mark-failed`).set('Authorization', admin.auth).send({});
+      expect(res.status).toBe(409);
+      await expectUnchanged(id, 'REJECTED', walletBefore);
+    });
+
+    test('mark-failed: on PROCESSED -> invalid transition (409), nothing changes', async () => {
+      const id = await freshProcessed();
+      const walletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+      const res = await api.patch(`${PREFIX}/admin/payouts/${id}/mark-failed`).set('Authorization', admin.auth).send({});
+      expect(res.status).toBe(409);
+      await expectUnchanged(id, 'PROCESSED', walletBefore);
+    });
   });
 
   test('a seller cannot reach any /admin/payouts endpoint', async () => {

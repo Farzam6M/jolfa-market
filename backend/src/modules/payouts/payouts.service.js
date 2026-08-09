@@ -4,6 +4,41 @@ const ApiError = require('../../utils/ApiError');
 const { pushNotification } = require('../notifications/notifications.service');
 const { logAdminActivity } = require('../admin/admin.service');
 
+// Persian labels for PayoutStatus, mirroring orders.service.js's
+// STATUS_LABELS convention — used only to render the invalid-transition
+// error message below.
+const PAYOUT_STATUS_LABELS = {
+  REQUESTED: 'در انتظار بررسی',
+  APPROVED: 'تأیید شده',
+  PROCESSED: 'واریز شده',
+  REJECTED: 'رد شده',
+  FAILED: 'ناموفق',
+};
+
+/**
+ * Called after an atomic `updateMany(where: {id, status: fromState})` claim
+ * misses (claimed.count === 0), i.e. the payout was NOT in `fromState` at
+ * claim time. Distinguishes the two reasons that can happen, per Phase 5
+ * Fix #3:
+ *
+ *  - `payoutRequest.status === toState` already: this is a duplicate/
+ *    retried call for a transition that already succeeded (possibly by a
+ *    concurrent caller that won the race). Safe, idempotent no-op — return
+ *    normally, no error, no second side effect.
+ *  - any other status: caller is asking for a transition the state machine
+ *    does not allow from where the payout actually is. Must NOT be a
+ *    silent 200 no-op (that was the Fix #3 bug) — raise an explicit error,
+ *    same convention as orders.service.js#updateStatus's
+ *    ORDER_TRANSITIONS check (ApiError.conflict / 409, `«from» -> «to»`
+ *    message shape).
+ */
+function assertIdempotentOrThrowInvalidTransition(payoutRequest, toState) {
+  if (payoutRequest.status === toState) return; // idempotent replay — caller proceeds, no side effects.
+  throw ApiError.conflict(
+    `تغییر وضعیت از «${PAYOUT_STATUS_LABELS[payoutRequest.status]}» به «${PAYOUT_STATUS_LABELS[toState]}» مجاز نیست`,
+  );
+}
+
 /**
  * Creates a PayoutRequest and, in the SAME transaction, atomically reserves
  * (debits) `amount` out of the seller's wallet — this is the "REQUESTED"
@@ -178,11 +213,14 @@ async function releaseReservation(tx, payoutRequest, reason) {
  * reserved (debited) at REQUESTED time and stays reserved until either
  * PROCESSED (money genuinely leaves) or FAILED (returned).
  *
- * Atomic claim (updateMany REQUESTED -> APPROVED), same idempotent-no-op
- * convention as payments.service.js#markGatewayRefundProcessed: a second
- * concurrent/retried call for the same id sees claim.count === 0 and just
- * returns the row as-is rather than erroring, so a double-click can't
- * double-fire the approvedAt/approvedById stamp or any side effects.
+ * Atomic claim (updateMany REQUESTED -> APPROVED): a second concurrent/
+ * retried call for the same id sees claim.count === 0. Phase 5 Fix #3:
+ * that miss is then resolved by
+ * assertIdempotentOrThrowInvalidTransition — a duplicate retry on an
+ * already-APPROVED row is a safe idempotent no-op (no double-fire of
+ * approvedAt/approvedById), but any other current status (REJECTED/
+ * PROCESSED/FAILED) is an invalid transition and raises an explicit error
+ * instead of the old silent 200 no-op.
  */
 async function approvePayout(id, actor) {
   const claimed = await prisma.payoutRequest.updateMany({
@@ -192,7 +230,10 @@ async function approvePayout(id, actor) {
 
   const payoutRequest = await prisma.payoutRequest.findUnique({ where: { id } });
   if (!payoutRequest) throw ApiError.notFound('درخواست برداشت یافت نشد');
-  if (claimed.count === 0) return payoutRequest; // Already past REQUESTED — no-op.
+  if (claimed.count === 0) {
+    assertIdempotentOrThrowInvalidTransition(payoutRequest, 'APPROVED');
+    return payoutRequest; // Idempotent replay — already APPROVED, no second side effect.
+  }
 
   await logAdminActivity(actor.id, `تأیید درخواست برداشت ${payoutRequest.id}`);
   await pushNotification({
@@ -206,10 +247,14 @@ async function approvePayout(id, actor) {
  * wallet in the SAME transaction as the status claim, so a crash between
  * the two is impossible (either both happen or neither does).
  *
- * Same atomic-claim-then-no-op-on-miss convention as approvePayout — see
- * there. The credit-back only ever runs on the call that actually wins the
- * REQUESTED -> REJECTED claim, so a retried/duplicate reject can never
- * double-credit the wallet.
+ * Same atomic-claim convention as approvePayout — see there. Phase 5
+ * Fix #3: a claim miss is resolved via
+ * assertIdempotentOrThrowInvalidTransition, so the credit-back only ever
+ * runs on the call that actually wins the REQUESTED -> REJECTED claim
+ * (retried/duplicate reject on an already-REJECTED row is an idempotent
+ * no-op, never a second credit) and any other current status (APPROVED/
+ * PROCESSED/FAILED) raises an explicit invalid-transition error instead of
+ * a silent 200.
  */
 async function rejectPayout(id, reason, actor) {
   const result = await prisma.$transaction(async (tx) => {
@@ -222,7 +267,10 @@ async function rejectPayout(id, reason, actor) {
 
     const payoutRequest = await tx.payoutRequest.findUnique({ where: { id } });
     if (!payoutRequest) throw ApiError.notFound('درخواست برداشت یافت نشد');
-    if (claimed.count === 0) return payoutRequest; // Already past REQUESTED — no-op, no second credit.
+    if (claimed.count === 0) {
+      assertIdempotentOrThrowInvalidTransition(payoutRequest, 'REJECTED');
+      return payoutRequest; // Idempotent replay — already REJECTED, no second credit.
+    }
 
     await releaseReservation(tx, payoutRequest, `بازگشت وجه درخواست برداشت رد شده ${payoutRequest.id}`);
     return payoutRequest;
@@ -239,7 +287,8 @@ async function rejectPayout(id, reason, actor) {
  * APPROVED -> PROCESSED. No wallet movement — this is the terminal
  * success state confirming the off-platform bank transfer actually
  * happened; the money already left the seller's wallet at REQUESTED time.
- * Same atomic-claim-then-no-op-on-miss convention as approvePayout.
+ * Same atomic-claim convention as approvePayout; a claim miss is resolved
+ * via assertIdempotentOrThrowInvalidTransition (Phase 5 Fix #3).
  */
 async function markProcessed(id, actor) {
   const claimed = await prisma.payoutRequest.updateMany({
@@ -249,7 +298,10 @@ async function markProcessed(id, actor) {
 
   const payoutRequest = await prisma.payoutRequest.findUnique({ where: { id } });
   if (!payoutRequest) throw ApiError.notFound('درخواست برداشت یافت نشد');
-  if (claimed.count === 0) return payoutRequest; // Already past APPROVED — no-op.
+  if (claimed.count === 0) {
+    assertIdempotentOrThrowInvalidTransition(payoutRequest, 'PROCESSED');
+    return payoutRequest; // Idempotent replay — already PROCESSED, no second side effect.
+  }
 
   await logAdminActivity(actor.id, `ثبت واریز درخواست برداشت ${payoutRequest.id}`);
   await pushNotification({
@@ -265,7 +317,11 @@ async function markProcessed(id, actor) {
  * off-platform but did not go through (bad bank details, bank-side
  * rejection, ...), rather than an admin declining the request up front.
  * Returns the reserved amount to the wallet, same as rejectPayout — see
- * there for the atomicity/idempotency rationale.
+ * there for the atomicity/idempotency rationale. A claim miss is resolved
+ * via assertIdempotentOrThrowInvalidTransition (Phase 5 Fix #3): duplicate
+ * retry on an already-FAILED row is idempotent (no second credit); any
+ * other current status is an invalid transition and raises an explicit
+ * error.
  */
 async function markFailed(id, failureReason, actor) {
   const result = await prisma.$transaction(async (tx) => {
@@ -278,7 +334,10 @@ async function markFailed(id, failureReason, actor) {
 
     const payoutRequest = await tx.payoutRequest.findUnique({ where: { id } });
     if (!payoutRequest) throw ApiError.notFound('درخواست برداشت یافت نشد');
-    if (claimed.count === 0) return payoutRequest; // Already past APPROVED — no-op, no second credit.
+    if (claimed.count === 0) {
+      assertIdempotentOrThrowInvalidTransition(payoutRequest, 'FAILED');
+      return payoutRequest; // Idempotent replay — already FAILED, no second credit.
+    }
 
     await releaseReservation(tx, payoutRequest, `بازگشت وجه برداشت ناموفق ${payoutRequest.id}`);
     return payoutRequest;
