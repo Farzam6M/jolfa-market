@@ -430,6 +430,9 @@ describe('Phase 6 — Admin liability visibility', () => {
     seller = await makeUser('SELLER', '54120000' + Math.floor(Math.random() * 9));
     admin = await makeUser('ADMIN', '54130000' + Math.floor(Math.random() * 9));
     store = await makeApprovedStore(seller.user.id, 'فروشگاه نمایش بدهی');
+    await prisma.wallet.upsert({
+      where: { userId: seller.user.id }, update: { balance: 0 }, create: { userId: seller.user.id, balance: 0 },
+    });
   });
 
   test('GET /admin/payout-liabilities lists liabilities with status/seller filters and pagination', async () => {
