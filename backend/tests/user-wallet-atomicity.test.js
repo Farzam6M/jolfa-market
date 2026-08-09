@@ -82,7 +82,7 @@ afterAll(async () => {
 
 describe('User + Wallet creation atomicity', () => {
   test('POST /auth/register creates a Wallet (and Cart) for the new user', async () => {
-    const mobile = `0955${Math.floor(10000000 + Math.random() * 89999999)}`;
+    const mobile = `0955${Math.floor(1000000 + Math.random() * 8999999)}`;
     const otpCode = await issueRegisterOtp(mobile);
 
     const res = await api.post(`${PREFIX}/auth/register`).send({
@@ -105,7 +105,7 @@ describe('User + Wallet creation atomicity', () => {
 
   test('POST /admin/admins creates a Wallet for the new staff user', async () => {
     const superAdmin = await makeUser('SUPER_ADMIN', '56000000' + Math.floor(Math.random() * 9));
-    const mobile = `0956${Math.floor(10000000 + Math.random() * 89999999)}`;
+    const mobile = `0956${Math.floor(1000000 + Math.random() * 8999999)}`;
 
     const res = await api.post(`${PREFIX}/admin/admins`).set('Authorization', superAdmin.auth).send({
       name: 'ادمین تست اتمیک', mobile, password: 'Passw0rd!23',
@@ -121,7 +121,7 @@ describe('User + Wallet creation atomicity', () => {
 
   test('POST /stores (new-user branch) creates a Wallet for the new seller user', async () => {
     const admin = await makeUser('ADMIN', '57000000' + Math.floor(Math.random() * 9));
-    const mobile = `0957${Math.floor(10000000 + Math.random() * 89999999)}`;
+    const mobile = `0957${Math.floor(1000000 + Math.random() * 8999999)}`;
 
     const res = await api.post(`${PREFIX}/stores`).set('Authorization', admin.auth).send({
       name: 'فروشگاه تست اتمیک', mobile,
