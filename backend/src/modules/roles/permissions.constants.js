@@ -61,6 +61,7 @@ const PERMISSIONS = {
   WALLET_READ_SELF: 'wallet:read:self',
   WALLET_WITHDRAW_SELF: 'wallet:withdraw:self', // seller: POST/GET /payouts (own payout requests)
   PAYOUTS_MANAGE: 'payouts:manage', // admin/super_admin: GET/PATCH /admin/payouts/*
+  PAYOUT_LIABILITIES_READ: 'payout_liabilities:read', // admin/super_admin: GET /admin/payout-liabilities (Phase 6, read-only)
 
   // Support chat / Store chat
   SUPPORT_CHAT_USE: 'support_chat:use',
@@ -122,6 +123,7 @@ const ROLE_PERMISSIONS = {
     PERMISSIONS.HERO_READ, PERMISSIONS.HERO_MANAGE,
     PERMISSIONS.COMMISSION_MANAGE,
     PERMISSIONS.PAYOUTS_MANAGE,
+    PERMISSIONS.PAYOUT_LIABILITIES_READ,
   ],
   SUPER_ADMIN: ['*'], // wildcard: implicitly has every permission, incl. ADMINS_MANAGE / ROLES_MANAGE
 };

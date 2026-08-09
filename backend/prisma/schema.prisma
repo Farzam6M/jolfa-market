@@ -893,14 +893,16 @@ model PayoutRequest {
 // here instead of blocking the customer's refund on it.
 //
 // One row per (order, store) shortfall — created only when a clawback
-// couldn't be fully collected. Append-only, same as every other financial
-// ledger table here (OrderItemSettlement, OrderItemSettlementReversal,
-// PaymentRefund): never updated in place except the OUTSTANDING ->
-// RECOVERED status flip once reconciled (e.g. deducted from a future
-// settlement credit or payout) — recovery flow itself is intentionally
-// NOT implemented yet (out of scope: no settlement/commission changes),
-// this table only makes the debt visible and auditable so it CAN be
-// reconciled later.
+// couldn't be fully collected. Append-only in the sense that no row is
+// ever deleted or re-pointed at a different order/store; `amount` is the
+// REMAINING outstanding balance of the liability and is additively
+// decremented in place as it is recovered (Phase 6:
+// payout-liabilities.service.js#recoverSellerLiabilities), the same
+// "field holds the current remaining amount" convention as Wallet.balance
+// itself. `status` flips OUTSTANDING -> RECOVERED (never backwards) only
+// once `amount` reaches zero, with `recoveredAt` stamped at that moment.
+// Recovery is automatic-only, driven from future settleDeliveredOrder
+// earnings — see recoverSellerLiabilities for the FIFO algorithm.
 enum SellerLiabilityStatus {
   OUTSTANDING
   RECOVERED
@@ -927,6 +929,10 @@ model SellerPayoutLiability {
   @@index([sellerId])
   @@index([orderId])
   @@index([status])
+  // Additive Phase 6 index: recoverSellerLiabilities' FIFO scan
+  // (WHERE sellerId = ? AND status = 'OUTSTANDING' ORDER BY createdAt ASC)
+  // and the admin listing's sellerId+status filter both hit this shape.
+  @@index([sellerId, status, createdAt])
   @@map("seller_payout_liabilities")
 }
 

@@ -9,6 +9,7 @@ const { pushNotification } = require('../notifications/notifications.service');
 const { PERMISSIONS } = require('../roles/permissions.constants');
 const { resolveCommissionRate } = require('../commission-rules/commission-rules.service');
 const { refundWallet, refundGateway } = require('../payments/payments.service');
+const { recoverSellerLiabilities } = require('../payout-liabilities/payout-liabilities.service');
 
 const STATUS_LABELS = {
   PENDING: 'در انتظار', CONFIRMED: 'تایید شده', PREPARING: 'در حال آماده‌سازی', SENT: 'ارسال شده', DELIVERED: 'تحویل داده شده', CANCELLED: 'لغو شده',
@@ -337,6 +338,18 @@ async function listSettlementsForStore(userId, { page = 1, pageSize = 20 } = {})
  * conditional updateMany (mirrors the debit pattern in
  * payments.service.js#payWithWallet) rather than a read-then-write, so it
  * can't race with any other balance-mutating operation on the same wallet.
+ *
+ * Phase 6 — liability recovery: BEFORE the wallet credit, `sellerEarning`
+ * is run through payout-liabilities.service.js#recoverSellerLiabilities
+ * (in this same `tx`), which FIFO-recovers as much as possible against
+ * the seller's OUTSTANDING SellerPayoutLiability rows and returns
+ * whatever remains. Only that remainder is credited to the wallet — the
+ * gross `sellerEarning` itself, and everything computed from it
+ * (OrderItemSettlement's snapshot, commission), is completely unchanged;
+ * only how much of it reaches the wallet differs. For a seller with no
+ * outstanding liability this is a no-op (remainder === sellerEarning),
+ * so this function's behavior for such sellers is unchanged from before
+ * Phase 6.
  */
 async function settleDeliveredOrder(tx, order) {
   // eslint-disable-next-line no-restricted-syntax
@@ -372,34 +385,52 @@ async function settleDeliveredOrder(tx, order) {
     // eslint-disable-next-line no-await-in-loop
     const store = await tx.store.findUnique({ where: { id: item.storeId }, select: { sellerId: true } });
 
+    // Phase 6: recover as much of this earning as possible against the
+    // seller's OUTSTANDING liabilities (FIFO) BEFORE crediting anything —
+    // see recoverSellerLiabilities' own comment for why this happens
+    // first rather than crediting the gross amount and debiting after
+    // (avoids a temporary wallet inflation that was never really
+    // available to the seller). No-op (remainingSellerEarning ===
+    // sellerEarning) when the seller has no outstanding liability.
+    // eslint-disable-next-line no-await-in-loop
+    const { remainingSellerEarning } = await recoverSellerLiabilities(tx, store.sellerId, sellerEarning);
+
     // Atomic credit — same compare-and-swap-free-but-conditional pattern as
     // the debit in payments.service.js#payWithWallet, just in the other
     // direction. A missing wallet (should be impossible — every user gets
     // one at registration, see auth.service.js/users.service.js/
     // stores.service.js) surfaces as count !== 1 and throws, rolling back
     // this whole settlement rather than silently dropping the seller's
-    // earning.
+    // earning. Still run even when remainingSellerEarning is 0 (increment
+    // by 0) so the "wallet exists" invariant check below stays identical
+    // to pre-Phase-6 behavior for every seller, liability or not.
     // eslint-disable-next-line no-await-in-loop
     const credited = await tx.wallet.updateMany({
       where: { userId: store.sellerId },
-      data: { balance: { increment: sellerEarning } },
+      data: { balance: { increment: remainingSellerEarning } },
     });
     if (credited.count !== 1) {
       throw ApiError.internal('کیف پول فروشنده برای تسویه یافت نشد');
     }
 
-    // eslint-disable-next-line no-await-in-loop
-    const wallet = await tx.wallet.findUnique({ where: { userId: store.sellerId } });
-    // eslint-disable-next-line no-await-in-loop
-    await tx.walletTransaction.create({
-      data: {
-        walletId: wallet.id,
-        type: 'CREDIT',
-        amount: sellerEarning,
-        reason: `تسویه سفارش ${order.orderNumber}`,
-        refId: item.id,
-      },
-    });
+    // Only record a CREDIT WalletTransaction when money actually reached
+    // the wallet — a fully-recovered earning (remainder 0) already has
+    // its own audit trail via recoverSellerLiabilities' DEBIT row(s), so
+    // a zero-amount CREDIT here would be pure noise, not a real event.
+    if (remainingSellerEarning > 0) {
+      // eslint-disable-next-line no-await-in-loop
+      const wallet = await tx.wallet.findUnique({ where: { userId: store.sellerId } });
+      // eslint-disable-next-line no-await-in-loop
+      await tx.walletTransaction.create({
+        data: {
+          walletId: wallet.id,
+          type: 'CREDIT',
+          amount: remainingSellerEarning,
+          reason: `تسویه سفارش ${order.orderNumber}`,
+          refId: item.id,
+        },
+      });
+    }
   }
 }
 

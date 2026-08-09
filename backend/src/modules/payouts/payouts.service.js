@@ -3,6 +3,7 @@ const { prisma } = require('../../config/database');
 const ApiError = require('../../utils/ApiError');
 const { pushNotification } = require('../notifications/notifications.service');
 const { logAdminActivity } = require('../admin/admin.service');
+const { getOutstandingLiabilityTotal } = require('../payout-liabilities/payout-liabilities.service');
 
 // Persian labels for PayoutStatus, mirroring orders.service.js's
 // STATUS_LABELS convention — used only to render the invalid-transition
@@ -77,6 +78,27 @@ function assertIdempotentOrThrowInvalidTransition(payoutRequest, toState) {
  * like "insufficient balance" does: count !== 1, same error message,
  * matching payWithWallet's own documented convention of not distinguishing
  * the two cases.
+ *
+ * Phase 6 — liability-aware cap: withdrawableAmount = max(0, balance -
+ * outstandingLiabilityTotal), so a payout can never reserve money still
+ * needed to cover an OUTSTANDING SellerPayoutLiability (see
+ * payout-liabilities.service.js#getOutstandingLiabilityTotal). This is
+ * folded into the SAME gte check as the reservation itself
+ * (`balance >= amount + outstandingLiabilityTotal`, algebraically
+ * identical to `balance - outstandingLiabilityTotal >= amount`), so the
+ * liability check and the reservation are one atomic condition — never a
+ * separate "SELECT liability; SELECT wallet; THEN create payout" that
+ * could race. getOutstandingLiabilityTotal itself is a plain SUM
+ * aggregate rather than a single-row compare-and-swap, so — exactly like
+ * orders.service.js#refundDeliveredOrder's identical "aggregate read,
+ * then act on it" shape — this whole transaction runs at Serializable
+ * isolation: a concurrent write that would change the aggregate (a new
+ * liability created by a refund, a liability partially recovered by a
+ * concurrent settlement, or another concurrent payout against the same
+ * wallet) aborts this transaction with Postgres's serialization-failure
+ * detection (Prisma P2034) instead of silently reserving against a stale
+ * liability total. Caught below and turned into the same 409 convention
+ * refundDeliveredOrder already uses for this exact class of race.
  */
 async function createPayout(sellerId, payload, actor) {
   const idempotencyKey = payload.idempotencyKey || crypto.randomUUID();
@@ -102,13 +124,26 @@ async function createPayout(sellerId, payload, actor) {
         },
       });
 
+      // Phase 6: read INSIDE this Serializable transaction — see
+      // function-level comment above for why this can't be a plain
+      // pre-transaction read.
+      const outstandingLiabilityTotal = await getOutstandingLiabilityTotal(tx, sellerId);
+
       // Atomic reserve: debit only succeeds if the wallet exists AND has
-      // enough balance — see function-level comment above.
+      // enough balance to cover both this withdrawal AND every
+      // outstanding liability (balance >= amount + outstandingLiabilityTotal
+      // <=> withdrawableAmount = balance - outstandingLiabilityTotal >=
+      // amount) — see function-level comment above. When
+      // outstandingLiabilityTotal is 0 this is exactly the pre-Phase-6
+      // check, unchanged.
       const debited = await tx.wallet.updateMany({
-        where: { userId: sellerId, balance: { gte: payload.amount } },
+        where: { userId: sellerId, balance: { gte: Number(payload.amount) + outstandingLiabilityTotal } },
         data: { balance: { decrement: payload.amount } },
       });
       if (debited.count !== 1) {
+        // Same existing error/convention for both "not enough balance at
+        // all" and "enough balance but some of it is reserved for an
+        // outstanding liability" — no new error system, per Phase 6 spec.
         throw ApiError.badRequest('موجودی کیف پول برای برداشت کافی نیست');
       }
 
@@ -124,7 +159,7 @@ async function createPayout(sellerId, payload, actor) {
       });
 
       return payoutRequest;
-    });
+    }, { isolationLevel: 'Serializable' });
   } catch (err) {
     // Lost the create race to a concurrent request with the SAME
     // idempotencyKey (see function-level comment). This transaction never
@@ -137,6 +172,12 @@ async function createPayout(sellerId, payload, actor) {
         return winner;
       }
     }
+    // Serializable conflict (Prisma P2034) — this request lost a race with
+    // another concurrent operation touching the same seller's wallet
+    // and/or liabilities (another payout, a refund creating a new
+    // liability, a settlement recovering one). Same 409 convention as
+    // refundDeliveredOrder's identical P2034 handling; safe to retry.
+    if (err.code === 'P2034') throw ApiError.conflict('درخواست دیگری هم‌زمان روی کیف پول یا بدهی این فروشنده در حال انجام است؛ لطفاً دوباره تلاش کنید');
     throw err;
   }
 }

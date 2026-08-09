@@ -1,0 +1,21 @@
+-- Phase 6 — Seller Payout Liability Recovery & Visibility.
+--
+-- Purely additive: ONE new composite index, nothing else. No table,
+-- column, enum, or existing index is touched or dropped.
+--
+-- seller_payout_liabilities(sellerId, status, createdAt):
+--   Backs two Phase 6 access patterns that the existing single-column
+--   indexes (sellerId / orderId / status) can't serve efficiently
+--   together:
+--     1. recoverSellerLiabilities' FIFO scan —
+--        WHERE sellerId = ? AND status = 'OUTSTANDING'
+--        ORDER BY createdAt ASC (then id ASC as the deterministic
+--        tie-breaker, already covered by the primary key).
+--     2. The admin GET /admin/payout-liabilities listing's
+--        sellerId + status filter, also ordered by createdAt.
+--
+-- No backfill, no data migration: existing OUTSTANDING rows participate
+-- in the new recovery mechanism immediately, as-is.
+
+-- CreateIndex
+CREATE INDEX "seller_payout_liabilities_sellerId_status_createdAt_idx" ON "seller_payout_liabilities"("sellerId", "status", "createdAt");

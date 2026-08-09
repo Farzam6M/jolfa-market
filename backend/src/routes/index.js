@@ -31,5 +31,9 @@ router.use('/admin/payment-refunds', require('../modules/payment-refunds/payment
 // Same rationale as commission-rules/commission-report/payment-refunds
 // above: its own module/router rather than folded into admin.routes.js.
 router.use('/admin/payouts', require('../modules/payouts/payouts.admin.routes'));
+// Same rationale as commission-rules/commission-report/payment-refunds/
+// payouts.admin above: its own module/router rather than folded into
+// admin.routes.js or payouts.admin.routes.js. Phase 6, read-only.
+router.use('/admin/payout-liabilities', require('../modules/payout-liabilities/payout-liabilities.routes'));
 
 module.exports = router;
