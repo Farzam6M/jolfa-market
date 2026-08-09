@@ -11,6 +11,7 @@ router.use('/wishlist', require('../modules/wishlist/wishlist.routes'));
 router.use('/reviews', require('../modules/reviews/reviews.routes'));
 router.use('/orders', require('../modules/orders/orders.routes'));
 router.use('/payments', require('../modules/payments/payments.routes'));
+router.use('/payouts', require('../modules/payouts/payouts.routes'));
 router.use('/chat', require('../modules/support-chat/support-chat.routes'));
 router.use('/notifications', require('../modules/notifications/notifications.routes'));
 router.use('/hero', require('../modules/hero/hero.routes'));
@@ -27,5 +28,8 @@ router.use('/admin/commission-report', require('../modules/commission-report/com
 // Same rationale as commission-rules/commission-report above: its own
 // module/router rather than folded into admin.routes.js.
 router.use('/admin/payment-refunds', require('../modules/payment-refunds/payment-refunds.routes'));
+// Same rationale as commission-rules/commission-report/payment-refunds
+// above: its own module/router rather than folded into admin.routes.js.
+router.use('/admin/payouts', require('../modules/payouts/payouts.admin.routes'));
 
 module.exports = router;

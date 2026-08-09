@@ -116,6 +116,10 @@ model User {
   adminActivityLogs    AdminActivityLog[]
   commissionRulesCreated CommissionRule[]
   paymentRefundsRequested PaymentRefund[]
+  payoutRequests          PayoutRequest[] @relation("PayoutRequestsAsSeller")
+  payoutRequestsRequested PayoutRequest[] @relation("PayoutRequestsRequested")
+  payoutRequestsApproved  PayoutRequest[] @relation("PayoutRequestsApproved")
+  payoutRequestsProcessed PayoutRequest[] @relation("PayoutRequestsProcessed")
 
   @@index([roleId])
   @@map("users")
@@ -797,6 +801,82 @@ model OrderItemSettlementReversal {
   @@index([settlementId])
   @@index([refundId])
   @@map("order_item_settlement_reversals")
+}
+
+// ──────────────────────── Seller Payout / Withdrawal (Phase 5) ────────────────────────
+//
+// Purely additive on top of Phase 1-4: nothing here mutates Wallet's shape,
+// OrderItemSettlement, or PaymentRefund. A payout only ever moves money
+// that has already been credited into a seller's Wallet.balance by
+// settleDeliveredOrder (Phase 2/3) — this module never talks to Order/
+// OrderItem/Payment directly.
+//
+// State machine (enforced in payouts.service.js, not here):
+//   REQUESTED -> APPROVED  -> PROCESSED   (terminal success)
+//   REQUESTED -> REJECTED               (terminal, funds returned)
+//   APPROVED  -> FAILED                 (terminal, funds returned)
+//
+// Money lifecycle: the requested `amount` is atomically reserved (debited)
+// out of the seller's Wallet.balance the moment the row is created
+// (REQUESTED) — the same atomic conditional-updateMany compare-and-swap
+// pattern used everywhere else in this codebase for wallet mutations (see
+// payments.service.js#payWithWallet, orders.service.js#settleDeliveredOrder
+// / #refundDeliveredOrder). REJECTED and FAILED both credit that reserved
+// amount back to the seller's wallet; PROCESSED does not (the money has
+// genuinely left the platform by then). Every debit/credit against a
+// payout has its own WalletTransaction row (append-only ledger, mirrors
+// every other wallet-affecting flow).
+enum PayoutStatus {
+  REQUESTED  // Amount reserved (debited) from the seller's wallet; awaiting admin review.
+  APPROVED   // Admin approved; awaiting off-platform bank transfer.
+  PROCESSED  // Bank transfer confirmed complete — terminal, no wallet movement (money already left the wallet at REQUESTED).
+  REJECTED   // Admin rejected before approval — terminal, reserved amount returned to wallet.
+  FAILED     // Approved but the off-platform transfer failed — terminal, reserved amount returned to wallet.
+}
+
+model PayoutRequest {
+  id       String       @id @default(uuid())
+  sellerId String
+  // Same convention as Store.sellerId / Wallet.userId — the seller IS a
+  // User row (one Store per seller, @unique), not a separate Seller model.
+  seller   User         @relation("PayoutRequestsAsSeller", fields: [sellerId], references: [id], onDelete: Restrict)
+  amount   Decimal      @db.Decimal(12, 0)
+  status   PayoutStatus @default(REQUESTED)
+
+  // DB-level idempotency guard (same pattern as PaymentRefund.idempotencyKey
+  // — see payments.service.js#refundWallet). A client may supply its own
+  // key so a retried/double-submitted withdrawal request is a safe no-op
+  // instead of reserving the amount twice; the service generates one
+  // server-side when the client doesn't provide it.
+  idempotencyKey String @unique
+
+  // Bank destination, stored as a point-in-time SNAPSHOT on the request
+  // itself (per Phase 5 spec — no separate BankAccount model yet). Changing
+  // a seller's bank details later never alters an already-submitted
+  // PayoutRequest's destination.
+  bankAccountHolder String
+  bankIban          String
+  bankCardNumber    String?
+  bankName          String?
+
+  requestedById String
+  requestedBy   User      @relation("PayoutRequestsRequested", fields: [requestedById], references: [id], onDelete: Restrict)
+  approvedById  String?
+  approvedBy    User?     @relation("PayoutRequestsApproved", fields: [approvedById], references: [id], onDelete: Restrict)
+  approvedAt    DateTime?
+  processedById String?
+  processedBy   User?     @relation("PayoutRequestsProcessed", fields: [processedById], references: [id], onDelete: Restrict)
+  processedAt   DateTime?
+  // Set on REJECTED (optional admin note) and FAILED (why the off-platform
+  // transfer didn't go through). Left null for REQUESTED/APPROVED/PROCESSED.
+  failureReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sellerId])
+  @@index([status])
+  @@map("payout_requests")
 }
 
 // ──────────────────────────── Support Chat / Store Chat ────────────────────────────
