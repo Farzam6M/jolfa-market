@@ -24,5 +24,8 @@ router.use('/admin/commission-rules', require('../modules/commission-rules/commi
 // OrderItemSettlement, kept out of admin.routes.js which is reserved for
 // dashboard/activity-log/admin-account-management concerns.
 router.use('/admin/commission-report', require('../modules/commission-report/commission-report.routes'));
+// Same rationale as commission-rules/commission-report above: its own
+// module/router rather than folded into admin.routes.js.
+router.use('/admin/payment-refunds', require('../modules/payment-refunds/payment-refunds.routes'));
 
 module.exports = router;
