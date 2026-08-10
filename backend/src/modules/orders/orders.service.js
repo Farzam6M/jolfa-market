@@ -106,6 +106,30 @@ async function checkout(userId, { addressId }) {
   }
 
   return prisma.$transaction(async (tx) => {
+    // Cart-level checkout claim (F1): `Cart.userId` is unique, so this user
+    // has exactly one cart row — it already IS the stable identity a
+    // checkout operation is "for". Locking that single row here (a real
+    // Postgres row lock, not an in-process mutex) means a second checkout
+    // request for the SAME cart — whether truly concurrent or a client
+    // retry that overlaps a still-in-flight first request — blocks on this
+    // statement until the first request's transaction commits or rolls
+    // back, instead of racing it past the checks below. Because the lock is
+    // scoped to this one cart row, two different users (different cart
+    // rows) are never serialized against each other by this, even if they
+    // happen to be buying the same product.
+    await tx.$queryRaw`SELECT id FROM "carts" WHERE id = ${cart.id} FOR UPDATE`;
+
+    // Re-check under the lock whether this cart still has items to check
+    // out. If it doesn't — even though it did in the guard above, moments
+    // ago — a concurrent checkout for this exact cart just finished (and
+    // emptied it) while we were waiting for the lock: that's the duplicate
+    // checkout attempt this claim exists to stop, so surface it as a clean
+    // conflict rather than silently creating a second Order.
+    const stillPending = await tx.cartItem.count({ where: { cartId: cart.id } });
+    if (stillPending === 0) {
+      throw ApiError.conflict('این سبد خرید توسط یک درخواست هم‌زمان دیگر هم‌اکنون تسویه شد');
+    }
+
     const pricedItems = [];
     for (const item of cart.items) {
       const storeProduct = await tx.storeProduct.findUnique({

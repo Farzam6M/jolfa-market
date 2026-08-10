@@ -567,6 +567,99 @@ describe('Checkout, order status machine, and visibility', () => {
     const finalStock = await prisma.storeProduct.findUnique({ where: { id: offer.id } });
     expect(finalStock.stock).toBe(0); // never went negative, never stayed at 1 (the winning purchase did decrement it)
   });
+
+  // F1 — cart-level checkout idempotency. Stock is deliberately NOT the
+  // limiting factor in these tests (unlike the race test above): the point
+  // is that even when stock could satisfy two separate Orders, the SAME
+  // user's SAME cart must still only ever produce one.
+  describe('F1: cart-level checkout idempotency', () => {
+    test('two simultaneous checkout requests for the same user/cart: exactly one Order is created, the loser gets a 409, stock is decremented only once', async () => {
+      const sellerF1 = await makeUser('SELLER', '51300000' + Math.floor(Math.random() * 9));
+      await makeApprovedStore(sellerF1.user.id, 'فروشگاه یکتایی تسویه');
+      const offer = await makeApprovedProduct(sellerF1.auth, admin.auth, category.id, {
+        name: 'محصول تست یکتایی تسویه همزمان', price: 12000, stock: 20,
+      });
+
+      const buyer = await makeUser('CUSTOMER', '51310000' + Math.floor(Math.random() * 9));
+      await api.post(`${PREFIX}/cart/items`).set('Authorization', buyer.auth).send({ productId: offer.id, qty: 2 });
+
+      const [res1, res2] = await Promise.all([
+        api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyer.auth).send({}),
+        api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyer.auth).send({}),
+      ]);
+      const statuses = [res1.status, res2.status].sort();
+      expect(statuses).toEqual([201, 409]); // one winner, one clean conflict — never two winners
+
+      const winner = res1.status === 201 ? res1 : res2;
+
+      const ordersForBuyer = await prisma.order.findMany({ where: { userId: buyer.user.id } });
+      expect(ordersForBuyer.length).toBe(1); // exactly one Order, not two
+      expect(ordersForBuyer[0].id).toBe(winner.body.data.id);
+
+      const orderItems = await prisma.orderItem.findMany({ where: { orderId: winner.body.data.id } });
+      expect(orderItems.length).toBe(1); // no duplicate OrderItems
+      expect(orderItems[0].qty).toBe(2);
+
+      const stock = await prisma.storeProduct.findUnique({ where: { id: offer.id } });
+      expect(stock.stock).toBe(18); // 20 - 2, decremented exactly once (not 16, which would mean it ran twice)
+
+      const cartRow = await prisma.cart.findUnique({ where: { userId: buyer.user.id } });
+      const remainingItems = await prisma.cartItem.findMany({ where: { cartId: cartRow.id } });
+      expect(remainingItems.length).toBe(0); // cart correctly emptied by the winning checkout
+    });
+
+    test('a retried checkout after the first one already succeeded does not create a second Order', async () => {
+      const sellerF1 = await makeUser('SELLER', '51320000' + Math.floor(Math.random() * 9));
+      await makeApprovedStore(sellerF1.user.id, 'فروشگاه تست تلاش مجدد تسویه');
+      const offer = await makeApprovedProduct(sellerF1.auth, admin.auth, category.id, {
+        name: 'محصول تست تلاش مجدد تسویه', price: 9000, stock: 10,
+      });
+
+      const buyer = await makeUser('CUSTOMER', '51330000' + Math.floor(Math.random() * 9));
+      await api.post(`${PREFIX}/cart/items`).set('Authorization', buyer.auth).send({ productId: offer.id, qty: 1 });
+
+      const first = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyer.auth).send({});
+      expect(first.status).toBe(201);
+
+      // Simulates the client not receiving the first response and retrying
+      // with the exact same (now-empty) cart.
+      const retry = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyer.auth).send({});
+      expect(retry.status).toBe(400); // cart is now empty — the existing empty-cart response, not a new Order
+
+      const ordersForBuyer = await prisma.order.findMany({ where: { userId: buyer.user.id } });
+      expect(ordersForBuyer.length).toBe(1); // still just the one Order from the first request
+      expect(ordersForBuyer[0].id).toBe(first.body.data.id);
+
+      const stock = await prisma.storeProduct.findUnique({ where: { id: offer.id } });
+      expect(stock.stock).toBe(9); // decremented only by the first, successful checkout
+    });
+
+    test('two different users checking out concurrently are not serialized against each other', async () => {
+      const sellerF1 = await makeUser('SELLER', '51340000' + Math.floor(Math.random() * 9));
+      await makeApprovedStore(sellerF1.user.id, 'فروشگاه تست کاربران مستقل');
+      const offer = await makeApprovedProduct(sellerF1.auth, admin.auth, category.id, {
+        name: 'محصول تست کاربران مستقل', price: 7000, stock: 20,
+      });
+
+      const buyerX = await makeUser('CUSTOMER', '51350000' + Math.floor(Math.random() * 9));
+      const buyerY = await makeUser('CUSTOMER', '51360000' + Math.floor(Math.random() * 9));
+      await api.post(`${PREFIX}/cart/items`).set('Authorization', buyerX.auth).send({ productId: offer.id, qty: 1 });
+      await api.post(`${PREFIX}/cart/items`).set('Authorization', buyerY.auth).send({ productId: offer.id, qty: 1 });
+
+      const [resX, resY] = await Promise.all([
+        api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyerX.auth).send({}),
+        api.post(`${PREFIX}/orders/checkout`).set('Authorization', buyerY.auth).send({}),
+      ]);
+      // Different users, different cart rows — the per-cart lock must not
+      // turn into a global checkout lock: both succeed.
+      expect(resX.status).toBe(201);
+      expect(resY.status).toBe(201);
+      expect(resX.body.data.id).not.toBe(resY.body.data.id);
+
+      const stock = await prisma.storeProduct.findUnique({ where: { id: offer.id } });
+      expect(stock.stock).toBe(18); // 20 - 1 - 1
+    });
+  });
 });
 
 describe('Payments', () => {
