@@ -13,7 +13,9 @@
  * Phase 2 report — the design document schema.prisma cites for the exact
  * per-event debit/credit legs does not exist anywhere in this repository).
  * These tests exercise the two generic primitives the phase does
- * implement: getOrCreateAccount and postJournal (balance + idempotency).
+ * implement: getOrCreateAccount and postJournal (leg balance validation,
+ * idempotency, and — per schema.prisma's Account.balance doc — the cached
+ * per-account balance this posting service now maintains).
  *
  * Uses random UUIDs for every ownerId/eventId so repeated runs never
  * collide, and cleans up exactly the rows it created in `afterAll` —
@@ -219,5 +221,91 @@ describe('postJournal', () => {
       .reduce((sum, e) => sum.plus(e.amount), new Prisma.Decimal(0));
     expect(creditTotal.equals(new Prisma.Decimal('999999999999'))).toBe(true);
     expect(creditTotal.equals(debitTotal)).toBe(true);
+  });
+
+  test('posting a journal updates each leg account\'s cached balance (CREDIT +, DEBIT -)', async () => {
+    const eventId = crypto.randomUUID();
+    createdEventIds.push(['PAYMENT_CONFIRMED', eventId]);
+
+    const { accA, accB } = await withTx(async (tx) => {
+      const a = await makeAccount(tx, 'CUSTOMER_WALLET', crypto.randomUUID());
+      const b = await makeAccount(tx, 'PLATFORM_CASH', crypto.randomUUID());
+      await postJournal(tx, {
+        eventType: 'PAYMENT_CONFIRMED',
+        eventId,
+        currency: 'TMN',
+        legs: [
+          { accountId: a.id, direction: 'DEBIT', amount: '400' },
+          { accountId: b.id, direction: 'CREDIT', amount: '400' },
+        ],
+      });
+      return { accA: a, accB: b };
+    });
+
+    const refreshedA = await prisma.account.findUnique({ where: { id: accA.id } });
+    const refreshedB = await prisma.account.findUnique({ where: { id: accB.id } });
+    expect(new Prisma.Decimal(refreshedA.balance).equals(new Prisma.Decimal('-400'))).toBe(true);
+    expect(new Prisma.Decimal(refreshedB.balance).equals(new Prisma.Decimal('400'))).toBe(true);
+  });
+
+  test('idempotent replay does not re-apply the balance update a second time', async () => {
+    const eventId = crypto.randomUUID();
+    createdEventIds.push(['SETTLEMENT', eventId]);
+
+    const { accA, accB } = await withTx(async (tx) => {
+      const a = await makeAccount(tx, 'CUSTOMER_WALLET', crypto.randomUUID());
+      const b = await makeAccount(tx, 'PLATFORM_CASH', crypto.randomUUID());
+      await postJournal(tx, {
+        eventType: 'SETTLEMENT',
+        eventId,
+        currency: 'TMN',
+        legs: [
+          { accountId: a.id, direction: 'DEBIT', amount: '250' },
+          { accountId: b.id, direction: 'CREDIT', amount: '250' },
+        ],
+      });
+      return { accA: a, accB: b };
+    });
+
+    // Replay with the same (eventType, eventId) — postJournal short-circuits
+    // to the idempotent-replay path before touching any Account row.
+    const replay = await withTx((tx) => postJournal(tx, {
+      eventType: 'SETTLEMENT',
+      eventId,
+      currency: 'TMN',
+      legs: [
+        { accountId: accA.id, direction: 'DEBIT', amount: '250' },
+        { accountId: accB.id, direction: 'CREDIT', amount: '250' },
+      ],
+    }));
+    expect(replay.idempotentReplay).toBe(true);
+
+    const refreshedA = await prisma.account.findUnique({ where: { id: accA.id } });
+    const refreshedB = await prisma.account.findUnique({ where: { id: accB.id } });
+    expect(new Prisma.Decimal(refreshedA.balance).equals(new Prisma.Decimal('-250'))).toBe(true);
+    expect(new Prisma.Decimal(refreshedB.balance).equals(new Prisma.Decimal('250'))).toBe(true);
+  });
+
+  test('an unbalanced journal leaves every account balance untouched', async () => {
+    const { accA, accB } = await withTx(async (tx) => {
+      const a = await makeAccount(tx, 'CUSTOMER_WALLET', crypto.randomUUID());
+      const b = await makeAccount(tx, 'PLATFORM_CASH', crypto.randomUUID());
+      return { accA: a, accB: b };
+    });
+
+    await expect(withTx((tx) => postJournal(tx, {
+      eventType: 'PAYMENT_CONFIRMED',
+      eventId: crypto.randomUUID(),
+      currency: 'TMN',
+      legs: [
+        { accountId: accA.id, direction: 'DEBIT', amount: '100' },
+        { accountId: accB.id, direction: 'CREDIT', amount: '90' },
+      ],
+    }))).rejects.toMatchObject({ statusCode: 400 });
+
+    const refreshedA = await prisma.account.findUnique({ where: { id: accA.id } });
+    const refreshedB = await prisma.account.findUnique({ where: { id: accB.id } });
+    expect(new Prisma.Decimal(refreshedA.balance).equals(new Prisma.Decimal('0'))).toBe(true);
+    expect(new Prisma.Decimal(refreshedB.balance).equals(new Prisma.Decimal('0'))).toBe(true);
   });
 });

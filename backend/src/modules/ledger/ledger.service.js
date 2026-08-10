@@ -13,7 +13,11 @@
  * Phase 2 spec calls for:
  *   - getOrCreateAccount: idempotent (ownerType, ownerId, currency) lookup.
  *   - postJournal: balanced, idempotent double-entry posting keyed on
- *     (eventType, eventId).
+ *     (eventType, eventId), which also maintains each touched Account's
+ *     cached `balance` column (see postJournal's own comment below —
+ *     schema.prisma's Account.balance doc calls this out explicitly as
+ *     this phase's responsibility, independent of the still-undocumented
+ *     per-event leg mapping).
  *
  * Event wrapper functions (postPaymentConfirmed, postSettlement, ...) are
  * NOT implemented in this phase — see the accompanying phase report for
@@ -102,16 +106,31 @@ function sumByDirection(legs, direction) {
  * Idempotency (design: journals_eventType_eventId_key is the real guard,
  * matching payouts.service.js#createPayout's established pattern):
  *   1. Pre-check for an existing Journal by (eventType, eventId); if
- *      found, return it as an idempotent replay — no new rows.
+ *      found, return it as an idempotent replay — no new rows, and no
+ *      balance re-application (see below).
  *   2. Otherwise attempt to create the Journal + its LedgerEntry rows.
  *   3. If a concurrent caller wins the race, this Journal.create throws
  *      P2002 for journals_eventType_eventId_key; that specific conflict is
  *      caught, the winning Journal is re-fetched and returned, and no
- *      duplicate entries are created on this side.
+ *      duplicate entries or balance updates happen on this side.
  *
  * Balance requirement: SUM(DEBIT legs) must equal SUM(CREDIT legs),
  * computed with Prisma.Decimal (never Number/parseFloat). An unbalanced
  * journal throws before anything is written and nothing is committed.
+ *
+ * Cached balance maintenance: schema.prisma's Account.balance doc states
+ * this column is "SUM(CREDIT) - SUM(DEBIT) of this account's LedgerEntry
+ * rows" and explicitly defers writing it to "a later phase's posting
+ * service..., the same atomic-cache-update discipline Wallet.balance
+ * already uses" — i.e. this function. So each leg's Account.balance is
+ * updated with a Prisma `increment`/`decrement` (CREDIT increments,
+ * DEBIT decrements) in the same transaction as its LedgerEntry insert,
+ * matching the exact convention payments.service.js#payWithWallet and
+ * payouts.service.js already use for Wallet.balance. This is purely
+ * mechanical bookkeeping for the generic engine — it does not depend on,
+ * and does not resolve, the still-undocumented per-event leg mapping
+ * (which accounts a given eventType touches, and in which direction, is
+ * entirely up to the caller-supplied `legs`).
  *
  * @param {import('@prisma/client').Prisma.TransactionClient} tx
  * @param {object} params
@@ -186,6 +205,18 @@ async function postJournal(tx, {
         },
       });
       entries.push(entry);
+      // Keep Account.balance (SUM(CREDIT) - SUM(DEBIT)) in sync with this
+      // leg, atomically, in the same transaction — see the function-level
+      // comment above. CREDIT increments, DEBIT decrements.
+      // eslint-disable-next-line no-await-in-loop
+      await tx.account.update({
+        where: { id: leg.accountId },
+        data: {
+          balance: leg.direction === 'CREDIT'
+            ? { increment: leg.amount }
+            : { decrement: leg.amount },
+        },
+      });
     }
     return { journal, entries, idempotentReplay: false };
   } catch (err) {
