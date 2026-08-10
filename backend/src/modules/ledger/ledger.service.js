@@ -19,15 +19,21 @@
  *     this phase's responsibility, independent of the still-undocumented
  *     per-event leg mapping).
  *
- * Event wrapper functions (postPaymentConfirmed, postSettlement, ...) are
- * NOT implemented in this phase — see the accompanying phase report for
- * why (the design document schema.prisma repeatedly cites for the exact
- * per-event debit/credit legs does not exist anywhere in this repository).
+ * One event wrapper is implemented so far: postPaymentConfirmed, using the
+ * PAYMENT_GATEWAY_CLEARING -> PLATFORM_CASH mapping supplied directly by
+ * the product owner for this step (see ledger.constants.js's
+ * EVENT_ACCOUNT_MAP comment — this specific mapping did NOT come from
+ * anything found in the repository). The remaining six wrappers
+ * (postSettlement, postRefund, postPayoutReserve, postPayoutRelease,
+ * postPayoutProcessed, postLiabilityRecovery) are NOT implemented — see
+ * the accompanying phase report for why (the design document
+ * schema.prisma repeatedly cites for their exact per-event debit/credit
+ * legs does not exist anywhere in this repository).
  */
 
 const { Prisma } = require('@prisma/client');
 const ApiError = require('../../utils/ApiError');
-const { LEDGER_CURRENCY } = require('./ledger.constants');
+const { LEDGER_CURRENCY, PLATFORM_LEDGER_OWNER_ID, EVENT_ACCOUNT_MAP } = require('./ledger.constants');
 
 // Prisma's generated unique-constraint name for Journal's compound unique
 // index, per the 20260811000000_ledger_foundation migration:
@@ -239,7 +245,54 @@ async function postJournal(tx, {
   }
 }
 
+/**
+ * Thin semantic wrapper over postJournal for the PAYMENT_CONFIRMED event.
+ * Posts DEBIT PAYMENT_GATEWAY_CLEARING / CREDIT PLATFORM_CASH for `amount`
+ * — the mapping in ledger.constants.js's EVENT_ACCOUNT_MAP, supplied
+ * directly by the product owner for this step (not repository-derived —
+ * see that file's comment).
+ *
+ * Both accounts here are platform-owned (ownerId = PLATFORM_LEDGER_OWNER_ID
+ * per schema.prisma's LedgerAccountOwnerType doc for PAYMENT_GATEWAY_CLEARING
+ * and PLATFORM_CASH), so unlike a CUSTOMER_WALLET/SELLER_WALLET leg this
+ * wrapper needs no caller-supplied ownerId for either side.
+ *
+ * Same "operates inside the caller's transaction, opens none of its own"
+ * contract as getOrCreateAccount/postJournal. All idempotency (including
+ * not double-applying the Account.balance update on replay) is handled by
+ * postJournal itself via (eventType, eventId) — this wrapper adds no
+ * idempotency logic of its own.
+ *
+ * @param {import('@prisma/client').Prisma.TransactionClient} tx
+ * @param {object} params
+ * @param {string} params.eventId - the domain id this event represents (e.g. Payment.id)
+ * @param {string|null} [params.actorId]
+ * @param {string} [params.currency]
+ * @param {string|number|Prisma.Decimal} params.amount
+ * @returns {Promise<{journal: object, entries: object[], idempotentReplay: boolean}>}
+ */
+async function postPaymentConfirmed(tx, {
+  eventId, actorId = null, currency = LEDGER_CURRENCY, amount,
+}) {
+  const mapping = EVENT_ACCOUNT_MAP.PAYMENT_CONFIRMED;
+
+  const debitAccount = await getOrCreateAccount(tx, mapping.debitOwnerType, PLATFORM_LEDGER_OWNER_ID, currency);
+  const creditAccount = await getOrCreateAccount(tx, mapping.creditOwnerType, PLATFORM_LEDGER_OWNER_ID, currency);
+
+  return postJournal(tx, {
+    eventType: 'PAYMENT_CONFIRMED',
+    eventId,
+    actorId,
+    currency,
+    legs: [
+      { accountId: debitAccount.id, direction: 'DEBIT', amount },
+      { accountId: creditAccount.id, direction: 'CREDIT', amount },
+    ],
+  });
+}
+
 module.exports = {
   getOrCreateAccount,
   postJournal,
+  postPaymentConfirmed,
 };

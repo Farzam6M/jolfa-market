@@ -32,17 +32,29 @@ const LEDGER_CURRENCY = 'TMN';
 // file), not under backend/ or the repo root. Only README.md files exist,
 // and neither mentions the ledger design.
 //
-// Per this phase's own instructions ("Do NOT invent business semantics if
-// they are not established... STOP and report the ambiguity instead of
-// guessing"), the concrete per-event debit/credit leg mapping
-// (PAYMENT_CONFIRMED, SETTLEMENT, REFUND, PAYOUT_RESERVE, PAYOUT_RELEASE,
-// PAYOUT_PROCESSED, LIABILITY_RECOVERY — including the explicitly-flagged
-// open question of whether LIABILITY_RECOVERY draws from PLATFORM_CASH
-// alone or also PLATFORM_REVENUE) is intentionally NOT defined here. See
-// the final report for what is required to unblock this.
+// PAYMENT_CONFIRMED is the one exception: its mapping below was supplied
+// directly by the product owner for this step (DEBIT
+// PAYMENT_GATEWAY_CLEARING / CREDIT PLATFORM_CASH), NOT derived from
+// anything found in this repository — the only repo-native comment about
+// PAYMENT_GATEWAY_CLEARING (schema.prisma) calls it "speculative ... no
+// real gateway wired in yet" and does not itself tie it to
+// PAYMENT_CONFIRMED. Recorded as given, not independently verified here.
+//
+// The other six event types (SETTLEMENT, REFUND, PAYOUT_RESERVE,
+// PAYOUT_RELEASE, PAYOUT_PROCESSED, LIABILITY_RECOVERY — including the
+// explicitly-flagged open question of whether LIABILITY_RECOVERY draws
+// from PLATFORM_CASH alone or also PLATFORM_REVENUE) remain intentionally
+// undefined pending their own decisions.
 // ─────────────────────────────────────────────────────────────────────────
+const EVENT_ACCOUNT_MAP = {
+  PAYMENT_CONFIRMED: {
+    debitOwnerType: 'PAYMENT_GATEWAY_CLEARING',
+    creditOwnerType: 'PLATFORM_CASH',
+  },
+};
 
 module.exports = {
   PLATFORM_LEDGER_OWNER_ID,
   LEDGER_CURRENCY,
+  EVENT_ACCOUNT_MAP,
 };

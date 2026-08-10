@@ -8,14 +8,14 @@
  * directly inside a real `prisma.$transaction`, with no HTTP layer, no
  * auth, and no seeded roles/users required.
  *
- * Only postPaymentConfirmed-style event wrapper coverage is out of scope
- * here: those wrappers are not implemented in this phase (see the P2.4
- * Phase 2 report — the design document schema.prisma cites for the exact
- * per-event debit/credit legs does not exist anywhere in this repository).
- * These tests exercise the two generic primitives the phase does
- * implement: getOrCreateAccount and postJournal (leg balance validation,
- * idempotency, and — per schema.prisma's Account.balance doc — the cached
- * per-account balance this posting service now maintains).
+ * These tests exercise the two generic primitives (getOrCreateAccount and
+ * postJournal: leg balance validation, idempotency, and — per
+ * schema.prisma's Account.balance doc — the cached per-account balance
+ * this posting service maintains) plus the one event wrapper implemented
+ * so far, postPaymentConfirmed. The other six wrappers (postSettlement,
+ * postRefund, postPayoutReserve, postPayoutRelease, postPayoutProcessed,
+ * postLiabilityRecovery) are not implemented yet — see the P2.4 Phase 2
+ * report — so there is no coverage for them here.
  *
  * Uses random UUIDs for every ownerId/eventId so repeated runs never
  * collide, and cleans up exactly the rows it created in `afterAll` —
@@ -31,7 +31,8 @@
 const crypto = require('crypto');
 const { Prisma } = require('@prisma/client');
 const { prisma } = require('../../src/config/database');
-const { getOrCreateAccount, postJournal } = require('../../src/modules/ledger/ledger.service');
+const { getOrCreateAccount, postJournal, postPaymentConfirmed } = require('../../src/modules/ledger/ledger.service');
+const { PLATFORM_LEDGER_OWNER_ID } = require('../../src/modules/ledger/ledger.constants');
 
 const createdAccountIds = [];
 const createdEventIds = []; // [eventType, eventId]
@@ -307,5 +308,133 @@ describe('postJournal', () => {
     const refreshedB = await prisma.account.findUnique({ where: { id: accB.id } });
     expect(new Prisma.Decimal(refreshedA.balance).equals(new Prisma.Decimal('0'))).toBe(true);
     expect(new Prisma.Decimal(refreshedB.balance).equals(new Prisma.Decimal('0'))).toBe(true);
+  });
+});
+
+describe('postPaymentConfirmed', () => {
+  // PAYMENT_GATEWAY_CLEARING and PLATFORM_CASH are both platform-owned
+  // (ownerId = PLATFORM_LEDGER_OWNER_ID) — track them for cleanup the same
+  // way makeAccount does for the generic-engine tests above, since
+  // postPaymentConfirmed creates/reuses them internally rather than via
+  // the makeAccount test helper.
+  async function trackPlatformAccounts(currency = 'TMN') {
+    const clearing = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'PAYMENT_GATEWAY_CLEARING', ownerId: PLATFORM_LEDGER_OWNER_ID, currency } },
+    });
+    const cash = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'PLATFORM_CASH', ownerId: PLATFORM_LEDGER_OWNER_ID, currency } },
+    });
+    if (clearing) createdAccountIds.push(clearing.id);
+    if (cash) createdAccountIds.push(cash.id);
+    return { clearing, cash };
+  }
+
+  test('successful posting: one Journal, two correctly-directed LedgerEntry rows, correct eventType/accounts/amount', async () => {
+    const eventId = crypto.randomUUID();
+    createdEventIds.push(['PAYMENT_CONFIRMED', eventId]);
+
+    const result = await withTx((tx) => postPaymentConfirmed(tx, {
+      eventId, actorId: null, currency: 'TMN', amount: '1500',
+    }));
+    await trackPlatformAccounts();
+
+    expect(result.idempotentReplay).toBe(false);
+    expect(result.entries).toHaveLength(1 * 2);
+
+    const journalRow = await prisma.journal.findUnique({ where: { id: result.journal.id } });
+    expect(journalRow.eventType).toBe('PAYMENT_CONFIRMED');
+    expect(journalRow.eventId).toBe(eventId);
+
+    const entryRows = await prisma.ledgerEntry.findMany({
+      where: { journalId: result.journal.id },
+      include: { account: true },
+    });
+    expect(entryRows).toHaveLength(2);
+
+    const debitEntry = entryRows.find((e) => e.direction === 'DEBIT');
+    const creditEntry = entryRows.find((e) => e.direction === 'CREDIT');
+    expect(debitEntry.account.ownerType).toBe('PAYMENT_GATEWAY_CLEARING');
+    expect(debitEntry.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(creditEntry.account.ownerType).toBe('PLATFORM_CASH');
+    expect(creditEntry.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(new Prisma.Decimal(debitEntry.amount).equals(new Prisma.Decimal('1500'))).toBe(true);
+    expect(new Prisma.Decimal(creditEntry.amount).equals(new Prisma.Decimal('1500'))).toBe(true);
+  });
+
+  test('creates PAYMENT_GATEWAY_CLEARING and PLATFORM_CASH accounts on first use, reuses them on second use', async () => {
+    const firstEventId = crypto.randomUUID();
+    const secondEventId = crypto.randomUUID();
+    createdEventIds.push(['PAYMENT_CONFIRMED', firstEventId], ['PAYMENT_CONFIRMED', secondEventId]);
+
+    await withTx((tx) => postPaymentConfirmed(tx, {
+      eventId: firstEventId, currency: 'TMN', amount: '200',
+    }));
+    const { clearing: clearingFirst, cash: cashFirst } = await trackPlatformAccounts();
+
+    await withTx((tx) => postPaymentConfirmed(tx, {
+      eventId: secondEventId, currency: 'TMN', amount: '300',
+    }));
+    const { clearing: clearingSecond, cash: cashSecond } = await trackPlatformAccounts();
+
+    expect(clearingSecond.id).toBe(clearingFirst.id);
+    expect(cashSecond.id).toBe(cashFirst.id);
+
+    const clearingRows = await prisma.account.findMany({
+      where: { ownerType: 'PAYMENT_GATEWAY_CLEARING', ownerId: PLATFORM_LEDGER_OWNER_ID, currency: 'TMN' },
+    });
+    const cashRows = await prisma.account.findMany({
+      where: { ownerType: 'PLATFORM_CASH', ownerId: PLATFORM_LEDGER_OWNER_ID, currency: 'TMN' },
+    });
+    expect(clearingRows).toHaveLength(1);
+    expect(cashRows).toHaveLength(1);
+  });
+
+  test('idempotent: same eventId does not create a second Journal, duplicate entries, or double-apply balance', async () => {
+    const eventId = crypto.randomUUID();
+    createdEventIds.push(['PAYMENT_CONFIRMED', eventId]);
+
+    const first = await withTx((tx) => postPaymentConfirmed(tx, {
+      eventId, currency: 'TMN', amount: '750',
+    }));
+    const { clearing, cash } = await trackPlatformAccounts();
+    expect(first.idempotentReplay).toBe(false);
+
+    const balanceAfterFirst = {
+      clearing: (await prisma.account.findUnique({ where: { id: clearing.id } })).balance,
+      cash: (await prisma.account.findUnique({ where: { id: cash.id } })).balance,
+    };
+
+    const second = await withTx((tx) => postPaymentConfirmed(tx, {
+      eventId, currency: 'TMN', amount: '750',
+    }));
+    expect(second.idempotentReplay).toBe(true);
+    expect(second.journal.id).toBe(first.journal.id);
+
+    const journalRows = await prisma.journal.findMany({ where: { eventType: 'PAYMENT_CONFIRMED', eventId } });
+    expect(journalRows).toHaveLength(1);
+    const entryRows = await prisma.ledgerEntry.findMany({ where: { journalId: first.journal.id } });
+    expect(entryRows).toHaveLength(2); // not 4
+
+    const balanceAfterSecond = {
+      clearing: (await prisma.account.findUnique({ where: { id: clearing.id } })).balance,
+      cash: (await prisma.account.findUnique({ where: { id: cash.id } })).balance,
+    };
+    expect(new Prisma.Decimal(balanceAfterSecond.clearing).equals(new Prisma.Decimal(balanceAfterFirst.clearing))).toBe(true);
+    expect(new Prisma.Decimal(balanceAfterSecond.cash).equals(new Prisma.Decimal(balanceAfterFirst.cash))).toBe(true);
+  });
+
+  test('preserves exact Decimal precision for the supplied amount', async () => {
+    const eventId = crypto.randomUUID();
+    createdEventIds.push(['PAYMENT_CONFIRMED', eventId]);
+
+    const result = await withTx((tx) => postPaymentConfirmed(tx, {
+      eventId, currency: 'TMN', amount: '999999999999',
+    }));
+    await trackPlatformAccounts();
+
+    const entryRows = await prisma.ledgerEntry.findMany({ where: { journalId: result.journal.id } });
+    entryRows.forEach((entry) => {
+      expect(new Prisma.Decimal(entry.amount).equals(new Prisma.Decimal('999999999999'))).toBe(true);
+    });
   });
 });
