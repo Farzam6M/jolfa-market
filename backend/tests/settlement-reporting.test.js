@@ -112,6 +112,15 @@ describe('Phase 3 — Seller settlement visibility + Admin commission report', (
     sellerA = await makeUser('SELLER', `5301000${rand()}`);
     sellerB = await makeUser('SELLER', `5302000${rand()}`);
     admin = await makeUser('ADMIN', `5303000${rand()}`);
+    // makeUser() creates the user row directly via Prisma, bypassing the
+    // real registration flow (auth.service.js/users.service.js/stores.service.js)
+    // that normally provisions a Wallet for every new user. Both sellers
+    // below have orders driven all the way to DELIVERED via
+    // checkoutToDelivered(), which triggers settleDeliveredOrder()'s seller
+    // wallet credit — so the fixture must provide the Wallet that
+    // production registration would have created.
+    await prisma.wallet.create({ data: { userId: sellerA.user.id } });
+    await prisma.wallet.create({ data: { userId: sellerB.user.id } });
 
     storeA = await makeApprovedStore(sellerA.user.id, 'فروشگاه گزارش A');
     storeB = await makeApprovedStore(sellerB.user.id, 'فروشگاه گزارش B');

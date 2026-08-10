@@ -114,6 +114,13 @@ describe('Order settlement on DELIVERED', () => {
     customer = await makeUser('CUSTOMER', '52000000' + Math.floor(Math.random() * 9));
     seller = await makeUser('SELLER', '52010000' + Math.floor(Math.random() * 9));
     admin = await makeUser('ADMIN', '52020000' + Math.floor(Math.random() * 9));
+    // makeUser() creates the user row directly via Prisma, bypassing the
+    // real registration flow (auth.service.js/users.service.js/stores.service.js)
+    // that normally provisions a Wallet for every new user. Every test below
+    // drives orders all the way to DELIVERED, which triggers
+    // settleDeliveredOrder()'s seller wallet credit — so the fixture must
+    // provide the Wallet that production registration would have created.
+    await prisma.wallet.create({ data: { userId: seller.user.id } });
     await makeApprovedStore(seller.user.id, 'فروشگاه تسویه');
     const cat = await api.post(`${PREFIX}/categories`).set('Authorization', admin.auth)
       .send({ name: 'دسته تسویه', slug: `settlement-cat-${Date.now()}` });
@@ -174,7 +181,15 @@ describe('Order settlement on DELIVERED', () => {
     await api.post(`${PREFIX}/admin/commission-rules`).set('Authorization', admin.auth)
       .send({ scope: 'CATEGORY', categoryId: specialCat.body.data.id, rate: 20 });
 
-    const specialProduct = await makeApprovedProduct(seller.auth, admin.auth, specialCat.body.data.id, { price: 10000, stock: 10 });
+    // Explicit unique name — findOrCreateProduct() dedupes the shared global
+    // Product by identityKey (name|brand|model|capacity|color), NOT by
+    // categoryId. Reusing the default 'محصول تسویه تست' name here would
+    // collide with the beforeAll product and silently keep the OLD
+    // categoryId (categoryId is only set on first creation of a given
+    // identity), making this test assert against the wrong rule entirely.
+    const specialProduct = await makeApprovedProduct(seller.auth, admin.auth, specialCat.body.data.id, {
+      name: 'محصول ویژه تسویه با دسته اختصاصی', price: 10000, stock: 10,
+    });
     const order = await checkoutToSent(customer.auth, admin.auth, specialProduct, 1);
     await api.patch(`${PREFIX}/orders/${order.id}/status`).set('Authorization', admin.auth).send({ status: 'DELIVERED' });
 
