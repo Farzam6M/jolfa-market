@@ -162,6 +162,13 @@ describe('Commission Engine resolution — categoryId is null', () => {
     const { rate, rule } = await resolveCommissionRate(store.id, null);
     expect(Number(rate)).toBe(45);
     expect(rule.id).toBe(unscopedCampaign.id);
+
+    // This CAMPAIGN rule is fully unscoped (no sellerId, no categoryId), so
+    // as the highest-precedence tier it would match ANY seller/category
+    // lookup made by later tests for the remainder of its 1h window. Only
+    // this specific rule (by id) is deactivated — no other rule, from this
+    // test or any other suite, is touched.
+    await prisma.commissionRule.update({ where: { id: unscopedCampaign.id }, data: { isActive: false } });
   });
 
   test('end-to-end: a product with no category settles correctly against GLOBAL through checkout -> DELIVERED', async () => {
