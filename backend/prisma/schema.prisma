@@ -936,6 +936,180 @@ model SellerPayoutLiability {
   @@map("seller_payout_liabilities")
 }
 
+// ──────────────────────── Ledger — Double-Entry Foundation (P2.4 Phase 1) ────────────────────────
+//
+// Foundation-only models per the P2.2/P2.3 design decision document
+// ("Ledger + Wallet Owner Architecture + Platform Account"). This block adds
+// the Account/Journal/LedgerEntry tables and their enums ONLY — nothing here
+// is wired into payments.service.js / orders.service.js / payouts.service.js /
+// payout-liabilities.service.js / commission-rules yet. Wallet.balance and
+// WalletTransaction remain the live, unchanged source of truth until a later
+// phase actually posts to these tables. No existing model, column, enum
+// value, or row is touched by this block.
+//
+// Ownership model (design doc §3): an Account is keyed by
+// (ownerType, ownerId, currency), NOT by a User foreign key. This is
+// deliberate:
+//   - CUSTOMER_WALLET / SELLER_WALLET: ownerId = User.id, but stored as a
+//     plain string, not a relation — so a single User can hold two
+//     completely independent Account rows (one per role) even though
+//     today's Wallet.userId is @unique and only allows one row per User
+//     (see design doc §2.2/§3.1 on the Wallet.userId / Store.sellerId
+//     overlap this is meant to fix).
+//   - PLATFORM_REVENUE / PLATFORM_CASH / PAYMENT_GATEWAY_CLEARING /
+//     PAYOUT_CLEARING: ownerId is a fixed platform constant (see
+//     PLATFORM_LEDGER_OWNER_ID below), never a synthetic/fabricated User
+//     row — the schema intentionally has no FK here so platform accounts
+//     never need a fake User to satisfy a foreign key (design doc §3.3).
+
+// The fixed, well-known ownerId used for every PLATFORM_* Account.
+// Not a User.id — there is no "platform user" anywhere in this schema, and
+// none should ever be fabricated to satisfy this field. Application code in
+// a later phase is expected to reference this exact literal when
+// creating/looking up platform accounts.
+//   PLATFORM_LEDGER_OWNER_ID = "PLATFORM"
+
+enum LedgerAccountOwnerType {
+  CUSTOMER_WALLET          // ownerId = User.id (the customer). Funded by PaymentRefund credits.
+  SELLER_WALLET            // ownerId = User.id (== Store.sellerId). Funded by settlement earnings.
+  PLATFORM_REVENUE         // ownerId = PLATFORM_LEDGER_OWNER_ID. Commission accrual.
+  PLATFORM_CASH            // ownerId = PLATFORM_LEDGER_OWNER_ID. Platform-controlled collected cash.
+  PAYMENT_GATEWAY_CLEARING // ownerId = PLATFORM_LEDGER_OWNER_ID. In-flight gateway funds (speculative — see design doc §4/§12.5, no real gateway wired in yet).
+  PAYOUT_CLEARING          // ownerId = PLATFORM_LEDGER_OWNER_ID. Reserved-but-not-yet-transferred seller payouts.
+}
+
+enum LedgerAccountStatus {
+  ACTIVE
+  CLOSED // Reserved for future use — not produced by anything in this phase.
+}
+
+enum LedgerDirection {
+  DEBIT
+  CREDIT
+}
+
+// One row per distinct financial event type this system can post, matching
+// design doc §6/§7 exactly. PAYOUT_RESERVE / PAYOUT_RELEASE / PAYOUT_PROCESSED
+// are deliberately three separate values sharing what will be the same
+// eventId (a PayoutRequest.id) in a later phase — never one generic
+// "PayoutRequest event" identity for every stage (design doc §7, Decision 5).
+enum LedgerEventType {
+  PAYMENT_CONFIRMED
+  SETTLEMENT
+  REFUND
+  PAYOUT_RESERVE
+  PAYOUT_RELEASE
+  PAYOUT_PROCESSED
+  LIABILITY_RECOVERY
+}
+
+// A financial account in the double-entry sense — NOT the existing Wallet
+// model, and not wired to it in this phase. See design doc §5.
+model Account {
+  id        String                 @id @default(uuid())
+  ownerType LedgerAccountOwnerType
+  // User.id for CUSTOMER_WALLET/SELLER_WALLET; PLATFORM_LEDGER_OWNER_ID
+  // ("PLATFORM") for every PLATFORM_* ownerType. Deliberately a plain
+  // string, not a relation — see the block comment above.
+  ownerId   String
+  // Explicit per design doc Decision 7 / §8 — always "TMN" (whole-unit
+  // Iranian Toman, matching Decimal(12,0)'s scale) for every row produced
+  // by this codebase today. No fractional-Toman subunit is introduced.
+  currency  String                 @default("TMN")
+  status    LedgerAccountStatus    @default(ACTIVE)
+  // Cached/materialized balance (design doc §5, §11.5): SUM(CREDIT) -
+  // SUM(DEBIT) of this account's LedgerEntry rows. NOT written by anything
+  // in this phase — no posting logic exists yet, so every row's balance
+  // stays at its default 0 until a later phase's posting service starts
+  // maintaining it transactionally alongside each LedgerEntry insert (the
+  // same atomic-cache-update discipline Wallet.balance already uses).
+  balance   Decimal                @default(0) @db.Decimal(12, 0)
+  createdAt DateTime               @default(now())
+  updatedAt DateTime               @updatedAt
+
+  entries LedgerEntry[]
+
+  // Exactly one account per (owner, currency) — design doc §5's stated
+  // uniqueness rule. A User with both a CUSTOMER_WALLET and a SELLER_WALLET
+  // row is two separate rows here (different ownerType), not a constraint
+  // violation.
+  @@unique([ownerType, ownerId, currency])
+  // Speeds up "does this platform account already exist" / per-owner
+  // listing lookups; the unique index above already covers ownerType+ownerId
+  // equality lookups as a prefix, this covers ownerId-only lookups across
+  // ownerTypes (e.g. "every account this User owns, either role").
+  @@index([ownerId])
+  @@map("ledger_accounts")
+}
+
+// One Journal per financial event. Every Journal's LedgerEntry rows must
+// balance (SUM(DEBIT) == SUM(CREDIT)) — enforced by the posting service in a
+// later phase, not by anything in this schema (Postgres has no native
+// per-group balance CHECK). See design doc §5, §7, §10.
+model Journal {
+  id        String          @id @default(uuid())
+  eventType LedgerEventType
+  // The domain id this Journal represents — Payment.id / OrderItemSettlement.id
+  // / PaymentRefund.id (or a per-store composite) / PayoutRequest.id / a
+  // deterministic recovery-event id — see design doc §7's per-event-type table.
+  // Deliberately a plain string, not a polymorphic relation: the referenced
+  // model differs per eventType, and this table must not gain a FK to every
+  // financial model it could ever describe.
+  eventId   String
+  // The User who triggered this event (customer paying, admin approving a
+  // payout, ...). Null for system-driven postings with no single human
+  // actor. Deliberately NOT a relation to User in this phase — kept a plain
+  // nullable string so this foundation migration never has to reason about
+  // ON DELETE behavior against User for a table nothing writes to yet;
+  // revisit if/when a later phase's posting service needs relational
+  // integrity here.
+  actorId   String?
+  // Must match every LedgerEntry row's currency within this Journal (design
+  // doc §5) — enforced by the posting service, not a DB constraint.
+  currency  String          @default("TMN")
+  createdAt DateTime        @default(now())
+
+  entries LedgerEntry[]
+
+  // Idempotency guard (design doc §7, Decision 5): the real protection
+  // against duplicate postings, independent of whatever upstream
+  // idempotency (PaymentRefund.idempotencyKey, PayoutRequest.idempotencyKey,
+  // OrderItemSettlement.orderItemId, etc.) already exists on the source row.
+  @@unique([eventType, eventId])
+  @@index([eventType])
+  @@index([actorId])
+  @@index([createdAt])
+  @@map("journals")
+}
+
+// One row per debit/credit leg. amount is always positive; `direction`
+// determines the accounting effect. See design doc §5, §6, §10.
+model LedgerEntry {
+  id        String          @id @default(uuid())
+  journalId String
+  journal   Journal         @relation(fields: [journalId], references: [id], onDelete: Restrict)
+  accountId String
+  account   Account         @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  direction LedgerDirection
+  // Always positive — sign/effect comes from `direction`, matching design
+  // doc §5's explicit "Amount is always positive" rule. Same Decimal(12,0)
+  // convention as every other money column in this schema (whole Toman).
+  amount    Decimal         @db.Decimal(12, 0)
+  // Must match both journal.currency and account.currency for this row —
+  // enforced by the posting service, not a DB constraint, in this phase.
+  currency  String          @default("TMN")
+  createdAt DateTime        @default(now())
+
+  // Statement / reconciliation queries (design doc §5, §10): "every entry
+  // for this account, in order" is the dominant read pattern once postings
+  // exist.
+  @@index([accountId, createdAt])
+  // "Every leg of this journal" — used to verify the debit=credit invariant
+  // and to render a full journal.
+  @@index([journalId])
+  @@map("ledger_entries")
+}
+
 // ──────────────────────────── Support Chat / Store Chat ────────────────────────────
 
 enum ConversationStatus {
