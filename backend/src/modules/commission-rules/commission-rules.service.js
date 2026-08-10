@@ -3,6 +3,61 @@ const ApiError = require('../../utils/ApiError');
 const { logAdminActivity } = require('../admin/admin.service');
 
 /**
+ * ─── P1 — Admin Commission Governance: audit metadata ──────────────────
+ *
+ * `AdminActivityLog.action` is a free-text Persian sentence rendered
+ * as-is by the existing "آخرین فعالیت‌ها" admin feed (see
+ * admin.service.js#getActivityLog) — every other module in this codebase
+ * populates it that way, and changing it to an English machine code would
+ * break that existing display. To satisfy P1's requirement for a stable,
+ * machine-readable action identifier without touching that convention,
+ * each commission-rule mutation now ALSO writes `meta.actionCode` (one of
+ * the COMMISSION_RULE_* constants below) alongside a full before/after
+ * snapshot — `action` stays human-readable, `meta` carries everything a
+ * script/report would need.
+ */
+const COMMISSION_RULE_ACTION_CODES = Object.freeze({
+  CREATED: 'COMMISSION_RULE_CREATED',
+  UPDATED: 'COMMISSION_RULE_UPDATED',
+  ACTIVATED: 'COMMISSION_RULE_ACTIVATED',
+  DEACTIVATED: 'COMMISSION_RULE_DEACTIVATED',
+  DELETED: 'COMMISSION_RULE_DELETED',
+});
+
+/**
+ * Reduces a CommissionRule row to the plain-JSON-safe subset of fields P1
+ * requires to be reconstructable (rate, scope, sellerId, categoryId,
+ * campaignStartAt, campaignEndAt, priority, isActive), for storage in
+ * `AdminActivityLog.meta` (a Json column — Prisma Decimal/Date instances
+ * are not directly JSON-serializable, so they're normalized to
+ * string/ISO-string here). Returns null as-is (used for CREATE's "before"
+ * and DELETE's "after", which don't exist).
+ */
+function serializeRuleForAudit(rule) {
+  if (!rule) return null;
+  return {
+    rate: rule.rate !== null && rule.rate !== undefined ? rule.rate.toString() : null,
+    scope: rule.scope,
+    sellerId: rule.sellerId ?? null,
+    categoryId: rule.categoryId ?? null,
+    campaignStartAt: rule.campaignStartAt ? new Date(rule.campaignStartAt).toISOString() : null,
+    campaignEndAt: rule.campaignEndAt ? new Date(rule.campaignEndAt).toISOString() : null,
+    priority: rule.priority,
+    isActive: rule.isActive,
+  };
+}
+
+/** Builds the structured `meta` payload written to AdminActivityLog for every commission-rule mutation. */
+function buildAuditMeta(ruleId, before, after) {
+  return {
+    resource: 'CommissionRule',
+    resourceId: ruleId,
+    before: serializeRuleForAudit(before),
+    after: serializeRuleForAudit(after),
+  };
+}
+
+/**
  * ════════════════════════════════════════════════════════════════════
  * SCOPE / PRIORITY ORDERING — the single source of truth for how a
  * commission rate is picked for a given (sellerId, categoryId, now).
@@ -219,7 +274,14 @@ async function create(data, actor) {
       createdById: actor.id, // never taken from the request body
     },
   });
-  await logAdminActivity(actor.id, `ایجاد قانون کمیسیون (${rule.scope}) با نرخ ${rule.rate}%`);
+  await logAdminActivity(
+    actor.id,
+    `ایجاد قانون کمیسیون (${rule.scope}) با نرخ ${rule.rate}%`,
+    {
+      actionCode: COMMISSION_RULE_ACTION_CODES.CREATED,
+      ...buildAuditMeta(rule.id, null, rule),
+    },
+  );
   return rule;
 }
 
@@ -254,9 +316,10 @@ async function update(id, data, actor) {
   // Postgres's serialization-failure detection aborts one of two
   // concurrently-conflicting transactions (Prisma P2034) rather than
   // letting both pass the check.
+  let before;
   let updated;
   try {
-    updated = await prisma.$transaction(async (tx) => {
+    ({ before, updated } = await prisma.$transaction(async (tx) => {
       const current = await tx.commissionRule.findUnique({ where: { id } });
       if (!current) throw ApiError.notFound('قانون کمیسیون یافت نشد');
 
@@ -269,7 +332,7 @@ async function update(id, data, actor) {
         await assertNotRemovingLastActiveGlobal(id, tx);
       }
 
-      return tx.commissionRule.update({
+      const updatedRow = await tx.commissionRule.update({
         where: { id },
         data: {
           ...(data.scope !== undefined ? { scope: data.scope } : {}),
@@ -282,7 +345,12 @@ async function update(id, data, actor) {
           ...(data.isActive !== undefined ? { isActive: data.isActive } : {}),
         },
       });
-    }, { isolationLevel: 'Serializable' });
+      // `current` is captured pre-mutation, inside the same transaction that
+      // performs the update, so it reflects the exact row state the update
+      // was applied against (not a possibly-stale read from before the
+      // transaction started) — this is what P1's audit "before" snapshot uses.
+      return { before: current, updated: updatedRow };
+    }, { isolationLevel: 'Serializable' }));
   } catch (err) {
     // Lost a Serializable race against another concurrent update/remove
     // that also touched the active-GLOBAL count — same 409 convention as
@@ -292,7 +360,30 @@ async function update(id, data, actor) {
     throw err;
   }
 
-  await logAdminActivity(actor.id, `ویرایش قانون کمیسیون (${updated.scope}) با نرخ ${updated.rate}%`);
+  // P1 governance: a PATCH that flips isActive is classified as a distinct
+  // ACTIVATE/DEACTIVATE audit event rather than a generic UPDATE, even if
+  // the same request also changed other fields — one semantically precise
+  // event per mutation, per the P1 decision, with the full before/after
+  // diff (including the other changed fields) still carried in `meta` so
+  // no information is lost by not also emitting a second UPDATED event.
+  const isActiveChanged = data.isActive !== undefined && data.isActive !== before.isActive;
+  let actionCode;
+  let actionText;
+  if (isActiveChanged && data.isActive === true) {
+    actionCode = COMMISSION_RULE_ACTION_CODES.ACTIVATED;
+    actionText = `فعال‌سازی قانون کمیسیون (${updated.scope}) با نرخ ${updated.rate}%`;
+  } else if (isActiveChanged && data.isActive === false) {
+    actionCode = COMMISSION_RULE_ACTION_CODES.DEACTIVATED;
+    actionText = `غیرفعال‌سازی قانون کمیسیون (${updated.scope}) با نرخ ${updated.rate}%`;
+  } else {
+    actionCode = COMMISSION_RULE_ACTION_CODES.UPDATED;
+    actionText = `ویرایش قانون کمیسیون (${updated.scope}) با نرخ ${updated.rate}%`;
+  }
+
+  await logAdminActivity(actor.id, actionText, {
+    actionCode,
+    ...buildAuditMeta(updated.id, before, updated),
+  });
   return updated;
 }
 
@@ -323,9 +414,17 @@ async function remove(id, actor) {
     throw err;
   }
 
-  await logAdminActivity(actor.id, `حذف قانون کمیسیون (${existing.scope}) با نرخ ${existing.rate}%`);
+  await logAdminActivity(
+    actor.id,
+    `حذف قانون کمیسیون (${existing.scope}) با نرخ ${existing.rate}%`,
+    {
+      actionCode: COMMISSION_RULE_ACTION_CODES.DELETED,
+      ...buildAuditMeta(existing.id, existing, null),
+    },
+  );
 }
 
 module.exports = {
   list, create, update, remove, resolveCommissionRate, assertValidCombo, assertNotRemovingLastActiveGlobal,
+  COMMISSION_RULE_ACTION_CODES,
 };
