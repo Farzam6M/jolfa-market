@@ -27,7 +27,7 @@ async function main() {
   // here but then be rejected by request validation on every future /auth/login attempt,
   // permanently locking the seeded account out.
   const superAdminMobile = process.env.SEED_SUPERADMIN_MOBILE || '09999999999';
-  await prisma.user.upsert({
+  const superAdmin = await prisma.user.upsert({
     where: { mobile: superAdminMobile },
     update: {},
     create: {
@@ -80,6 +80,30 @@ async function main() {
   for (const s of heroSlides) {
     const existing = await prisma.heroSlide.findFirst({ where: { title: s.title } });
     if (!existing) await prisma.heroSlide.create({ data: s });
+  }
+
+  console.log('Seeding default GLOBAL commission rule...');
+  // CommissionRule has no unique constraint we can upsert against for this
+  // (scope alone isn't unique — multiple GLOBAL rows are allowed, e.g. an
+  // inactive historical one). Guard idempotency manually instead: only
+  // create the default when no active GLOBAL rule exists yet. This never
+  // fights assertNotRemovingLastActiveGlobal() — that guard blocks removing
+  // the *last* active GLOBAL rule, it never prevents adding one.
+  const existingActiveGlobal = await prisma.commissionRule.findFirst({
+    where: { scope: 'GLOBAL', isActive: true },
+  });
+  if (!existingActiveGlobal) {
+    // 10% matches the GLOBAL commission rate used consistently as the
+    // project's convention across the test suite (order-settlement.test.js,
+    // order-refund.test.js, settlement-reporting.test.js, payout-liabilities.test.js).
+    await prisma.commissionRule.create({
+      data: {
+        scope: 'GLOBAL',
+        rate: 10,
+        isActive: true,
+        createdById: superAdmin.id,
+      },
+    });
   }
 
   console.log('Seed complete.');

@@ -250,11 +250,25 @@ describe('Order settlement on DELIVERED', () => {
   test('if settlement cannot resolve a commission rate, the whole transaction rolls back: order stays SENT and can be retried', async () => {
     const order = await checkoutToSent(customer.auth, admin.auth, product, 1);
 
-    // Remove the only active GLOBAL rule so resolveCommissionRate() has
-    // nothing to resolve against — this is exactly the failure path
-    // decision #14 requires to roll back the whole transaction.
-    const deactivated = await api.patch(`${PREFIX}/admin/commission-rules/${globalRuleId}`).set('Authorization', admin.auth).send({ isActive: false });
-    expect(deactivated.status).toBe(200);
+    // Isolate this test's precondition explicitly instead of assuming
+    // globalRuleId (this suite's own rule) is the only active GLOBAL row —
+    // seed.js guarantees a default active GLOBAL rule exists in a fresh
+    // database, so deactivating only globalRuleId would leave that seeded
+    // row active and resolveCommissionRate() would still succeed. Look up
+    // and deactivate every currently-active GLOBAL rule (going straight to
+    // Prisma, since the admin API's assertNotRemovingLastActiveGlobal()
+    // guard exists precisely to block reaching this "zero active GLOBAL"
+    // state through the API) so resolveCommissionRate() truly has nothing
+    // to resolve against — the exact failure path decision #14 requires to
+    // roll back the whole transaction.
+    const activeGlobalRules = await prisma.commissionRule.findMany({
+      where: { scope: 'GLOBAL', isActive: true },
+    });
+    expect(activeGlobalRules.length).toBeGreaterThan(0); // sanity: something is active before we isolate the "none active" state
+    await prisma.commissionRule.updateMany({
+      where: { id: { in: activeGlobalRules.map((r) => r.id) } },
+      data: { isActive: false },
+    });
 
     const failedDelivery = await api.patch(`${PREFIX}/orders/${order.id}/status`).set('Authorization', admin.auth).send({ status: 'DELIVERED' });
     expect(failedDelivery.status).toBeGreaterThanOrEqual(500);
@@ -265,8 +279,13 @@ describe('Order settlement on DELIVERED', () => {
     const settlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: order.items[0].id } });
     expect(settlement).toBeNull(); // no partial settlement row left behind
 
-    // Reactivate and retry the exact same request — must now succeed.
-    await api.patch(`${PREFIX}/admin/commission-rules/${globalRuleId}`).set('Authorization', admin.auth).send({ isActive: true });
+    // Restore exactly the rows we deactivated (not just globalRuleId) so
+    // later tests — in this file and others — see the same active-GLOBAL
+    // state as before this test, then retry the exact same request.
+    await prisma.commissionRule.updateMany({
+      where: { id: { in: activeGlobalRules.map((r) => r.id) } },
+      data: { isActive: true },
+    });
     const retried = await api.patch(`${PREFIX}/orders/${order.id}/status`).set('Authorization', admin.auth).send({ status: 'DELIVERED' });
     expect(retried.status).toBe(200);
     expect(retried.body.data.status).toBe('DELIVERED');

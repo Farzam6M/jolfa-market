@@ -177,10 +177,13 @@ async function assertReferencesExist({ sellerId, categoryId }) {
  * deactivating (isActive: false), rescoping away from GLOBAL, or deleting
  * the last one. `excludeId` is the rule being mutated (so it doesn't count
  * against itself when checking "is there at least one OTHER active GLOBAL
- * rule").
+ * rule"). `client` is the Prisma client to query with — pass the active
+ * `tx` when called from inside update()/remove()'s Serializable
+ * transaction (see below) so this count participates in that transaction's
+ * conflict detection instead of racing against it.
  */
-async function assertNotRemovingLastActiveGlobal(excludeId) {
-  const otherActiveGlobalCount = await prisma.commissionRule.count({
+async function assertNotRemovingLastActiveGlobal(excludeId, client = prisma) {
+  const otherActiveGlobalCount = await client.commissionRule.count({
     where: { scope: 'GLOBAL', isActive: true, id: { not: excludeId } },
   });
   if (otherActiveGlobalCount === 0) {
@@ -226,6 +229,9 @@ async function update(id, data, actor) {
 
   // Merge onto the existing row so combo validation always sees the full
   // resulting record, not just whatever subset of fields this PATCH sent.
+  // This pre-check is read-only validation (bad scope/reference combos) —
+  // it doesn't touch the active-GLOBAL invariant, so it doesn't need to be
+  // inside the race-protected transaction below.
   const merged = {
     scope: data.scope !== undefined ? data.scope : existing.scope,
     sellerId: data.sellerId !== undefined ? data.sellerId : existing.sellerId,
@@ -236,41 +242,87 @@ async function update(id, data, actor) {
   assertValidCombo(merged);
   await assertReferencesExist(merged);
 
-  const willBeActive = data.isActive !== undefined ? data.isActive : existing.isActive;
-  const willBeGlobal = merged.scope === 'GLOBAL';
-  const wasActiveGlobal = existing.scope === 'GLOBAL' && existing.isActive;
-  // Only need to guard when this update would take an active GLOBAL rule
-  // out of the active-GLOBAL pool (by deactivating it or by rescoping it away).
-  if (wasActiveGlobal && (!willBeActive || !willBeGlobal)) {
-    await assertNotRemovingLastActiveGlobal(id);
+  // F2: the "would this leave zero active GLOBAL rules?" check and the
+  // mutation that could cause it must be one atomic, concurrency-safe
+  // operation — a plain count-then-update (as this used to be) lets two
+  // concurrent requests each see "2 active" and each proceed, jointly
+  // deactivating both and leaving zero. Runs at Serializable isolation, the
+  // same pattern already used in this codebase for "aggregate read, then
+  // act on it" races (orders.service.js#refundDeliveredOrder,
+  // payouts.service.js#createPayout): re-reads `existing` and performs the
+  // guard's count INSIDE the transaction (via `tx`, not `prisma`), so
+  // Postgres's serialization-failure detection aborts one of two
+  // concurrently-conflicting transactions (Prisma P2034) rather than
+  // letting both pass the check.
+  let updated;
+  try {
+    updated = await prisma.$transaction(async (tx) => {
+      const current = await tx.commissionRule.findUnique({ where: { id } });
+      if (!current) throw ApiError.notFound('قانون کمیسیون یافت نشد');
+
+      const willBeActive = data.isActive !== undefined ? data.isActive : current.isActive;
+      const willBeGlobal = (data.scope !== undefined ? data.scope : current.scope) === 'GLOBAL';
+      const wasActiveGlobal = current.scope === 'GLOBAL' && current.isActive;
+      // Only need to guard when this update would take an active GLOBAL rule
+      // out of the active-GLOBAL pool (by deactivating it or by rescoping it away).
+      if (wasActiveGlobal && (!willBeActive || !willBeGlobal)) {
+        await assertNotRemovingLastActiveGlobal(id, tx);
+      }
+
+      return tx.commissionRule.update({
+        where: { id },
+        data: {
+          ...(data.scope !== undefined ? { scope: data.scope } : {}),
+          ...(data.sellerId !== undefined ? { sellerId: data.sellerId } : {}),
+          ...(data.categoryId !== undefined ? { categoryId: data.categoryId } : {}),
+          ...(data.campaignStartAt !== undefined ? { campaignStartAt: data.campaignStartAt } : {}),
+          ...(data.campaignEndAt !== undefined ? { campaignEndAt: data.campaignEndAt } : {}),
+          ...(data.rate !== undefined ? { rate: data.rate } : {}),
+          ...(data.priority !== undefined ? { priority: data.priority } : {}),
+          ...(data.isActive !== undefined ? { isActive: data.isActive } : {}),
+        },
+      });
+    }, { isolationLevel: 'Serializable' });
+  } catch (err) {
+    // Lost a Serializable race against another concurrent update/remove
+    // that also touched the active-GLOBAL count — same 409 convention as
+    // refundDeliveredOrder/createPayout's identical P2034 handling; safe to
+    // retry once the winning request's result is visible.
+    if (err.code === 'P2034') throw ApiError.conflict('عملیات دیگری هم‌زمان روی قوانین کمیسیون سراسری در حال انجام است؛ لطفاً دوباره تلاش کنید');
+    throw err;
   }
 
-  const updated = await prisma.commissionRule.update({
-    where: { id },
-    data: {
-      ...(data.scope !== undefined ? { scope: data.scope } : {}),
-      ...(data.sellerId !== undefined ? { sellerId: data.sellerId } : {}),
-      ...(data.categoryId !== undefined ? { categoryId: data.categoryId } : {}),
-      ...(data.campaignStartAt !== undefined ? { campaignStartAt: data.campaignStartAt } : {}),
-      ...(data.campaignEndAt !== undefined ? { campaignEndAt: data.campaignEndAt } : {}),
-      ...(data.rate !== undefined ? { rate: data.rate } : {}),
-      ...(data.priority !== undefined ? { priority: data.priority } : {}),
-      ...(data.isActive !== undefined ? { isActive: data.isActive } : {}),
-    },
-  });
   await logAdminActivity(actor.id, `ویرایش قانون کمیسیون (${updated.scope}) با نرخ ${updated.rate}%`);
   return updated;
 }
 
 async function remove(id, actor) {
-  const existing = await prisma.commissionRule.findUnique({ where: { id } });
-  if (!existing) throw ApiError.notFound('قانون کمیسیون یافت نشد');
+  const existingPre = await prisma.commissionRule.findUnique({ where: { id } });
+  if (!existingPre) throw ApiError.notFound('قانون کمیسیون یافت نشد');
 
-  if (existing.scope === 'GLOBAL' && existing.isActive) {
-    await assertNotRemovingLastActiveGlobal(id);
+  // F2: same race as update() above — the "is this the last active GLOBAL
+  // rule?" check and the delete itself must be one atomic operation, or two
+  // concurrent deletes of two different active GLOBAL rules can each see
+  // "one other still active" and both proceed. Same Serializable +
+  // count-inside-tx + P2034-as-409 pattern as update() above.
+  let existing;
+  try {
+    existing = await prisma.$transaction(async (tx) => {
+      const current = await tx.commissionRule.findUnique({ where: { id } });
+      if (!current) throw ApiError.notFound('قانون کمیسیون یافت نشد');
+
+      if (current.scope === 'GLOBAL' && current.isActive) {
+        await assertNotRemovingLastActiveGlobal(id, tx);
+      }
+
+      await tx.commissionRule.delete({ where: { id } });
+      return current;
+    }, { isolationLevel: 'Serializable' });
+  } catch (err) {
+    if (err.code === 'P2034') throw ApiError.conflict('عملیات دیگری هم‌زمان روی قوانین کمیسیون سراسری در حال انجام است؛ لطفاً دوباره تلاش کنید');
+    throw err;
   }
 
-  await prisma.commissionRule.delete({ where: { id } });
   await logAdminActivity(actor.id, `حذف قانون کمیسیون (${existing.scope}) با نرخ ${existing.rate}%`);
 }
 
