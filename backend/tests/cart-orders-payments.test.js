@@ -237,6 +237,13 @@ describe('Checkout, order status machine, and visibility', () => {
     customer = await makeUser('CUSTOMER', '51000000' + Math.floor(Math.random() * 9));
     seller = await makeUser('SELLER', '51010000' + Math.floor(Math.random() * 9));
     admin = await makeUser('ADMIN', '51020000' + Math.floor(Math.random() * 9));
+    // makeUser() creates the user row directly via Prisma, bypassing the
+    // real registration flow (auth.service.js/users.service.js/stores.service.js)
+    // that normally provisions a Wallet for every new user. This describe
+    // block's tests drive orders all the way to DELIVERED, which triggers
+    // settleDeliveredOrder()'s seller wallet credit — so the fixture must
+    // provide the Wallet that production registration would have created.
+    await prisma.wallet.create({ data: { userId: seller.user.id } });
     await makeApprovedStore(seller.user.id, 'فروشگاه سفارش');
     const cat = await api.post(`${PREFIX}/categories`).set('Authorization', admin.auth)
       .send({ name: 'دسته سفارش', slug: `order-cat-${Date.now()}` });
@@ -347,9 +354,16 @@ describe('Checkout, order status machine, and visibility', () => {
     const sellerB = await makeUser('SELLER', '51077777' + Math.floor(Math.random() * 9));
     await makeApprovedStore(sellerB.user.id, 'فروشگاه ب');
     const productB = await makeApprovedProduct(sellerB.auth, admin.auth, category.id, { price: 10000, stock: 5 });
+    // A dedicated offer for this test, rather than the describe block's
+    // shared `product` — that fixture is checked out (qty 1) by several
+    // earlier tests in this block and has no restock step of its own, so by
+    // this point in the sequence its stock can already be exhausted. Every
+    // other test in this file that needs guaranteed stock creates its own
+    // isolated StoreProduct for the same reason; this follows that pattern.
+    const productA = await makeApprovedProduct(seller.auth, admin.auth, category.id, { name: 'محصول فروشنده الف چندفروشگاهی', price: 20000, stock: 5 });
 
     // A multi-seller cart: one item from `seller`'s product, one from sellerB's product.
-    await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: product.id, qty: 1 });
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: productA.id, qty: 1 });
     await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: productB.id, qty: 1 });
     const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', customer.auth).send({});
     const id = order.body.data.id;
@@ -357,7 +371,7 @@ describe('Checkout, order status machine, and visibility', () => {
     // Seller A can view the order, but only sees their own item — no payments/address, no sellerB item.
     const asSellerA = await api.get(`${PREFIX}/orders/${id}`).set('Authorization', seller.auth);
     expect(asSellerA.status).toBe(200);
-    expect(asSellerA.body.data.items.every((it) => it.productId === product.id)).toBe(true);
+    expect(asSellerA.body.data.items.every((it) => it.productId === productA.id)).toBe(true);
     expect(asSellerA.body.data.payments).toBeUndefined();
     expect(asSellerA.body.data.address).toBeUndefined();
 
@@ -383,7 +397,11 @@ describe('Checkout, order status machine, and visibility', () => {
 
   test('a customer cannot read another customer\'s order', async () => {
     const otherCustomer = await makeUser('CUSTOMER', '51099999' + Math.floor(Math.random() * 9));
-    await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: product.id, qty: 1 });
+    // Dedicated offer, not the describe block's shared `product` — see the
+    // comment in the "multi-seller order" test above for why that shared
+    // fixture can't be relied on to still have stock this late in the block.
+    const offer = await makeApprovedProduct(seller.auth, admin.auth, category.id, { name: 'محصول تست دسترسی سفارش', price: 15000, stock: 5 });
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: offer.id, qty: 1 });
     const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', customer.auth).send({});
 
     const res = await api.get(`${PREFIX}/orders/${order.body.data.id}`).set('Authorization', otherCustomer.auth);
@@ -687,7 +705,9 @@ describe('Payments', () => {
       .send({ orderId: order.body.data.id, method: 'CASH_ON_DELIVERY' });
     expect(pay.status).toBe(201);
     expect(pay.body.data.status).toBe('PENDING');
-    expect(Number(pay.body.data.amount)).toBe(15000);
+    // Payment amount is order.total (subtotal + the flat SHIPPING_FEE of
+    // 45000 from cart.service.js), not just the product's price/subtotal.
+    expect(Number(pay.body.data.amount)).toBe(15000 + 45000);
 
     const updatedOrder = await prisma.order.findUnique({ where: { id: order.body.data.id } });
     expect(updatedOrder.status).toBe('CONFIRMED');
@@ -703,7 +723,8 @@ describe('Payments', () => {
         orderId: order.body.data.id, method: 'CASH_ON_DELIVERY', amount: 1,
       }); // "amount" isn't part of the schema — must be silently stripped, not applied
     expect(pay.status).toBe(201);
-    expect(Number(pay.body.data.amount)).toBe(15000);
+    // order.total = subtotal (15000) + shipping (45000), never the forged "1".
+    expect(Number(pay.body.data.amount)).toBe(15000 + 45000);
   });
 
   test('a customer cannot pay for another customer\'s order', async () => {
@@ -829,7 +850,9 @@ describe('Payments', () => {
     expect(callback.status).toBe(200);
 
     const payment = await prisma.payment.findUnique({ where: { id: gwPay.body.data.id } });
-    expect(Number(payment.amount)).toBe(15000); // unchanged — amount was fixed at initGatewayPayment(order), never taken from the callback
+    // unchanged — amount was fixed at initGatewayPayment(order) as order.total
+    // (subtotal 15000 + shipping 45000), never taken from the callback.
+    expect(Number(payment.amount)).toBe(15000 + 45000);
   });
 
   test('cannot pay an order that is already paid/confirmed', async () => {
@@ -921,7 +944,10 @@ describe('Payments', () => {
 
   test('wallet payment with sufficient balance debits the wallet, confirms the order, and logs a transaction', async () => {
     const walletCustomer = await makeUser('CUSTOMER', '52300000' + Math.floor(Math.random() * 9));
-    await prisma.wallet.create({ data: { userId: walletCustomer.user.id, balance: 50000 } });
+    // Balance must cover order.total (subtotal 15000 + shipping 45000 = 60000),
+    // not just the product's price — WALLET payment debits order.total (see
+    // payments.service.js#payWithWallet).
+    await prisma.wallet.create({ data: { userId: walletCustomer.user.id, balance: 100000 } });
 
     const product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 15000, stock: 5 });
     await api.post(`${PREFIX}/cart/items`).set('Authorization', walletCustomer.auth).send({ productId: product.id, qty: 1 });
@@ -931,10 +957,10 @@ describe('Payments', () => {
       .send({ orderId: order.body.data.id, method: 'WALLET' });
     expect(pay.status).toBe(201);
     expect(pay.body.data.status).toBe('SUCCESS');
-    expect(Number(pay.body.data.amount)).toBe(15000);
+    expect(Number(pay.body.data.amount)).toBe(60000);
 
     const wallet = await prisma.wallet.findUnique({ where: { userId: walletCustomer.user.id } });
-    expect(Number(wallet.balance)).toBe(35000); // 50000 - 15000
+    expect(Number(wallet.balance)).toBe(40000); // 100000 - 60000
 
     const updatedOrder = await prisma.order.findUnique({ where: { id: order.body.data.id } });
     expect(updatedOrder.status).toBe('CONFIRMED');
@@ -942,7 +968,7 @@ describe('Payments', () => {
     const txLog = await prisma.walletTransaction.findFirst({ where: { walletId: wallet.id, refId: order.body.data.id } });
     expect(txLog).not.toBeNull();
     expect(txLog.type).toBe('DEBIT');
-    expect(Number(txLog.amount)).toBe(15000);
+    expect(Number(txLog.amount)).toBe(60000);
   });
 
   test('wallet payment with insufficient balance is rejected and leaves balance/order untouched', async () => {
@@ -969,8 +995,9 @@ describe('Payments', () => {
 
   test('two simultaneous wallet payments for two different orders, where balance covers only one: exactly one succeeds and the wallet balance never goes negative', async () => {
     const raceCustomer = await makeUser('CUSTOMER', '52320000' + Math.floor(Math.random() * 9));
-    // Balance covers exactly one 15000 order, not both.
-    await prisma.wallet.create({ data: { userId: raceCustomer.user.id, balance: 15000 } });
+    // Each order totals 60000 (subtotal 15000 + shipping 45000). Balance
+    // covers exactly one such order, not both.
+    await prisma.wallet.create({ data: { userId: raceCustomer.user.id, balance: 60000 } });
 
     const productA = await makeApprovedProduct(seller.auth, admin.auth, category.id, { name: 'محصول کیف پول رقابتی A', price: 15000, stock: 5 });
     const productB = await makeApprovedProduct(seller.auth, admin.auth, category.id, { name: 'محصول کیف پول رقابتی B', price: 15000, stock: 5 });
