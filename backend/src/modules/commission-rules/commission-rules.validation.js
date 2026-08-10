@@ -22,8 +22,14 @@ const baseFields = {
   campaignEndAt: z.coerce.date().optional(),
   // Percentage, 2 decimal places, matches Decimal(5,2) in the schema (max 999.99 at
   // the DB level, but a commission rate is never sane above 100%).
+  // Optional at the base-field level so PATCH can send a partial payload
+  // (e.g. just `{ isActive: false }`) without being forced to resend rate.
+  // createSchema enforces rate as required via its own superRefine below —
+  // the same conditional-requirement pattern already used there for
+  // sellerId/categoryId/campaignStartAt/campaignEndAt.
   rate: z.number().min(0, 'نرخ کمیسیون نمی‌تواند منفی باشد').max(100, 'نرخ کمیسیون نمی‌تواند بیشتر از ۱۰۰ باشد')
-    .refine((v) => Math.round(v * 100) === v * 100, 'نرخ کمیسیون حداکثر تا دو رقم اعشار مجاز است'),
+    .refine((v) => Math.round(v * 100) === v * 100, 'نرخ کمیسیون حداکثر تا دو رقم اعشار مجاز است')
+    .optional(),
   priority: z.number().int('اولویت باید عدد صحیح باشد').optional(),
   isActive: z.boolean().optional(),
 };
@@ -58,6 +64,10 @@ const createSchema = z.object({
   scope: scopeEnum,
   ...baseFields,
 }).superRefine((val, ctx) => {
+  // rate is optional at the base-field level (so updateSchema can omit it
+  // on a partial PATCH), but is always required on create, regardless of
+  // scope — enforced here rather than in baseFields itself.
+  if (val.rate === undefined) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['rate'], message: 'نرخ کمیسیون الزامی است' });
   if (val.scope === 'SELLER' && !val.sellerId) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['sellerId'], message: 'شناسه فروشگاه برای قانون SELLER الزامی است' });
   if (val.scope === 'CATEGORY' && !val.categoryId) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['categoryId'], message: 'شناسه دسته‌بندی برای قانون CATEGORY الزامی است' });
   if (val.scope === 'CAMPAIGN' && (!val.campaignStartAt || !val.campaignEndAt)) {
