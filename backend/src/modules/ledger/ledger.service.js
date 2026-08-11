@@ -19,18 +19,29 @@
  *     this phase's responsibility, independent of the still-undocumented
  *     per-event leg mapping).
  *
- * Two event wrappers are implemented so far: postPaymentConfirmed (using
+ * Four event wrappers are implemented so far: postPaymentConfirmed (using
  * the PAYMENT_GATEWAY_CLEARING -> PLATFORM_CASH mapping supplied directly
- * by the product owner, not repo-derived) and postSettlement (using the
+ * by the product owner, not repo-derived), postSettlement (using the
  * PLATFORM_CASH -> PLATFORM_REVENUE + SELLER_WALLET split, whose account
  * choice was supplied by the product owner but whose gross/commission/
  * sellerEarning formula matches orders.service.js#settleDeliveredOrder
- * exactly — see ledger.constants.js's EVENT_ACCOUNT_MAP comment for both).
- * The remaining five wrappers (postRefund, postPayoutReserve,
- * postPayoutRelease, postPayoutProcessed, postLiabilityRecovery) are NOT
- * implemented — see the accompanying phase report for why (the design
- * document schema.prisma repeatedly cites for their exact per-event
- * debit/credit legs does not exist anywhere in this repository).
+ * exactly), and — added in P2.4 Phase 2 Step 4 — postPayoutReserve /
+ * postPayoutRelease, whose SELLER_WALLET <-> PAYOUT_CLEARING mapping IS
+ * fully repo-derived: it mirrors payouts.service.js#createPayout's and
+ * #releaseReservation's real Wallet.balance debit/credit exactly (see
+ * ledger.constants.js's EVENT_ACCOUNT_MAP comment for all of the above).
+ *
+ * Three wrappers remain NOT implemented: postRefund (out of scope for
+ * Step 4), postPayoutProcessed, and postLiabilityRecovery. The latter two
+ * were audited this step and found genuinely unresolvable from repo
+ * evidence — not merely "no design doc exists" but a real structural
+ * ambiguity in each case (postPayoutProcessed: no real Wallet.balance
+ * mutation to mirror, and two internally-consistent-but-conflicting
+ * readings for whether/how PLATFORM_CASH moves; postLiabilityRecovery:
+ * literally zero repo mentions of which PLATFORM_* account, if any,
+ * receives a recovered amount). See ledger.constants.js's EVENT_ACCOUNT_MAP
+ * comment and the accompanying phase report for the full reasoning on
+ * both.
  */
 
 const { Prisma } = require('@prisma/client');
@@ -390,9 +401,128 @@ async function postSettlement(tx, {
   });
 }
 
+/**
+ * Thin semantic wrapper over postJournal for the PAYOUT_RESERVE event —
+ * the ledger-side mirror of payouts.service.js#createPayout's atomic
+ * Wallet.balance debit at the REQUESTED step.
+ *
+ * Posts DEBIT SELLER_WALLET(sellerId) / CREDIT PAYOUT_CLEARING(PLATFORM)
+ * for `amount`, per ledger.constants.js's EVENT_ACCOUNT_MAP.PAYOUT_RESERVE
+ * — see that file's comment for why this mapping (unlike
+ * PAYMENT_CONFIRMED/SETTLEMENT's account choice) is fully repo-derived
+ * rather than supplied externally: it mirrors createPayout's real
+ * `tx.wallet.updateMany({ data: { balance: { decrement: amount } } } })`
+ * exactly, and PAYOUT_CLEARING's CREDIT (increase) is schema.prisma's own
+ * "Reserved-but-not-yet-transferred seller payouts" doc comment for that
+ * owner type.
+ *
+ * `eventId` is expected to be the PayoutRequest.id (schema.prisma's
+ * Journal.eventId doc: PAYOUT_RESERVE/PAYOUT_RELEASE/PAYOUT_PROCESSED
+ * deliberately share the same eventId across a payout's lifecycle).
+ *
+ * Same "operates inside the caller's transaction, opens none of its own"
+ * contract as getOrCreateAccount/postJournal/the other wrappers. All
+ * idempotency (including not double-applying the Account.balance update
+ * on replay) is handled by postJournal itself via (eventType, eventId) —
+ * this wrapper adds no idempotency logic of its own.
+ *
+ * @param {import('@prisma/client').Prisma.TransactionClient} tx
+ * @param {object} params
+ * @param {string} params.eventId - PayoutRequest.id
+ * @param {string|null} [params.actorId]
+ * @param {string} [params.currency]
+ * @param {string} params.sellerId - the seller's User.id
+ * @param {string|number|Prisma.Decimal} params.amount
+ * @returns {Promise<{journal: object, entries: object[], idempotentReplay: boolean}>}
+ */
+async function postPayoutReserve(tx, {
+  eventId, actorId = null, currency = LEDGER_CURRENCY, sellerId, amount,
+}) {
+  if (!sellerId) throw ApiError.internal('postPayoutReserve requires sellerId');
+
+  const mapping = EVENT_ACCOUNT_MAP.PAYOUT_RESERVE;
+
+  const sellerAccount = await getOrCreateAccount(tx, mapping.debitOwnerType, sellerId, currency);
+  const clearingAccount = await getOrCreateAccount(tx, mapping.creditOwnerType, PLATFORM_LEDGER_OWNER_ID, currency);
+
+  return postJournal(tx, {
+    eventType: 'PAYOUT_RESERVE',
+    eventId,
+    actorId,
+    currency,
+    legs: [
+      { accountId: sellerAccount.id, direction: 'DEBIT', amount },
+      { accountId: clearingAccount.id, direction: 'CREDIT', amount },
+    ],
+  });
+}
+
+/**
+ * Thin semantic wrapper over postJournal for the PAYOUT_RELEASE event —
+ * the ledger-side mirror of payouts.service.js#releaseReservation's
+ * atomic Wallet.balance credit (called from both #rejectPayout's
+ * REQUESTED -> REJECTED transition and #markFailed's APPROVED -> FAILED
+ * transition — either way, a previously-reserved amount going back to the
+ * seller without ever transferring).
+ *
+ * Posts DEBIT PAYOUT_CLEARING(PLATFORM) / CREDIT SELLER_WALLET(sellerId)
+ * for `amount` — the exact reverse of postPayoutReserve's legs, per
+ * ledger.constants.js's EVENT_ACCOUNT_MAP.PAYOUT_RELEASE. The
+ * SELLER_WALLET CREDIT mirrors releaseReservation's real
+ * `tx.wallet.updateMany({ data: { balance: { increment: amount } } } })`;
+ * PAYOUT_CLEARING's DEBIT (decrease, back toward 0) is the arithmetic
+ * consequence of a balanced 2-leg journal — see ledger.constants.js's
+ * comment for the full reasoning.
+ *
+ * `eventId` is expected to be the SAME PayoutRequest.id used for that
+ * payout's postPayoutReserve call (see that wrapper's doc and
+ * schema.prisma's Journal.eventId doc) — this is a distinct eventType
+ * (PAYOUT_RELEASE vs PAYOUT_RESERVE), so postJournal's
+ * (eventType, eventId) idempotency key does not collide with the reserve
+ * posting for the same PayoutRequest.
+ *
+ * Same "operates inside the caller's transaction, opens none of its own"
+ * contract as the other wrappers. All idempotency (including not
+ * double-applying the Account.balance update on replay) is handled by
+ * postJournal itself via (eventType, eventId) — this wrapper adds no
+ * idempotency logic of its own.
+ *
+ * @param {import('@prisma/client').Prisma.TransactionClient} tx
+ * @param {object} params
+ * @param {string} params.eventId - PayoutRequest.id
+ * @param {string|null} [params.actorId]
+ * @param {string} [params.currency]
+ * @param {string} params.sellerId - the seller's User.id
+ * @param {string|number|Prisma.Decimal} params.amount
+ * @returns {Promise<{journal: object, entries: object[], idempotentReplay: boolean}>}
+ */
+async function postPayoutRelease(tx, {
+  eventId, actorId = null, currency = LEDGER_CURRENCY, sellerId, amount,
+}) {
+  if (!sellerId) throw ApiError.internal('postPayoutRelease requires sellerId');
+
+  const mapping = EVENT_ACCOUNT_MAP.PAYOUT_RELEASE;
+
+  const clearingAccount = await getOrCreateAccount(tx, mapping.debitOwnerType, PLATFORM_LEDGER_OWNER_ID, currency);
+  const sellerAccount = await getOrCreateAccount(tx, mapping.creditOwnerType, sellerId, currency);
+
+  return postJournal(tx, {
+    eventType: 'PAYOUT_RELEASE',
+    eventId,
+    actorId,
+    currency,
+    legs: [
+      { accountId: clearingAccount.id, direction: 'DEBIT', amount },
+      { accountId: sellerAccount.id, direction: 'CREDIT', amount },
+    ],
+  });
+}
+
 module.exports = {
   getOrCreateAccount,
   postJournal,
   postPaymentConfirmed,
   postSettlement,
+  postPayoutReserve,
+  postPayoutRelease,
 };

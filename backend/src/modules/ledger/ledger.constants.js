@@ -59,11 +59,60 @@ const LEDGER_CURRENCY = 'TMN';
 // consistent with, but not the same as, a stated three-leg mapping for
 // this specific event).
 //
-// The remaining five event types (REFUND, PAYOUT_RESERVE, PAYOUT_RELEASE,
-// PAYOUT_PROCESSED, LIABILITY_RECOVERY — including the explicitly-flagged
-// open question of whether LIABILITY_RECOVERY draws from PLATFORM_CASH
-// alone or also PLATFORM_REVENUE) remain intentionally undefined pending
-// their own decisions.
+// PAYOUT_RESERVE and PAYOUT_RELEASE (P2.4 Phase 2 Step 4) ARE grounded in
+// actual repo evidence, unlike PAYMENT_CONFIRMED/SETTLEMENT's account
+// *choice* above: payouts.service.js#createPayout (the REQUESTED step)
+// atomically DEBITS the seller's real Wallet.balance by the reserved
+// amount, and payouts.service.js#releaseReservation (called from both
+// #rejectPayout and #markFailed) atomically CREDITS it straight back. This
+// wrapper's SELLER_WALLET leg direction mirrors those real Wallet.balance
+// mutations exactly (DEBIT on reserve, CREDIT on release). The paired
+// PAYOUT_CLEARING leg's existence and purpose ("Reserved-but-not-yet-
+// transferred seller payouts") is schema.prisma's own
+// LedgerAccountOwnerType doc comment for that value, and its direction
+// follows arithmetically from SELLER_WALLET's (a balanced 2-leg journal
+// has exactly one DEBIT and one CREDIT of the same amount): CREDIT
+// (increase) when a reservation is opened, DEBIT (decrease, back to 0)
+// when it's released without transferring. eventId = PayoutRequest.id for
+// both, per schema.prisma's Journal.eventId doc ("PAYOUT_RESERVE /
+// PAYOUT_RELEASE / PAYOUT_PROCESSED are deliberately three separate
+// values sharing what will be the same eventId (a PayoutRequest.id)").
+//
+// PAYOUT_PROCESSED (payouts.service.js#markProcessed) is NOT included
+// below — audited and found NOT resolvable from repo evidence. Its own
+// doc comment states plainly "No wallet movement — ... the money already
+// left the seller's wallet at REQUESTED time", so unlike RESERVE/RELEASE
+// there is no real Wallet.balance mutation to mirror. The only thing
+// evidence supports is that PAYOUT_CLEARING must close back to 0 (DEBIT)
+// when a reservation is finally transferred rather than released — but a
+// balanced 2-leg journal requires an equal-amount CREDIT on some other
+// account, and PLATFORM_CASH is the only remaining plausible candidate
+// with no repo evidence either way for the resulting direction: crediting
+// (increasing) PLATFORM_CASH here conserves the running total across
+// PAYMENT_CONFIRMED -> SETTLEMENT -> PAYOUT_RESERVE -> PAYOUT_PROCESSED
+// (final PLATFORM_CASH balance settles at the total amount ever paid out,
+// PLATFORM_REVENUE at total commission — internally consistent) but reads
+// backwards against the intuitive "real cash leaves the platform when a
+// payout is processed" story, and nothing in this repo confirms which
+// reading the product owner intends, or whether PLATFORM_CASH is even the
+// intended second account at all. Guessing was avoided per this phase's
+// instructions; see the accompanying phase report.
+//
+// LIABILITY_RECOVERY (payout-liabilities.service.js#recoverSellerLiabilities,
+// called from orders.service.js#settleDeliveredOrder before that
+// settlement's own wallet credit) is also NOT included below — this is
+// the "explicitly-flagged open question" already anticipated in this
+// comment's previous revision: whether the recovered amount (which never
+// actually reaches the seller's wallet — see that function's own "no
+// gross credit-then-debit" note) should be recognized as PLATFORM_CASH,
+// PLATFORM_REVENUE, or a split of the two is not stated anywhere in this
+// repository (grepped for every relevant term across the whole backend/
+// tree — only the ledger module and schema.prisma itself mention these
+// owner types). Guessing was avoided; see the accompanying phase report.
+//
+// REFUND remains undefined for the same reason it was before this
+// revision — not in scope for this step and no mapping was added or
+// removed for it here.
 // ─────────────────────────────────────────────────────────────────────────
 const EVENT_ACCOUNT_MAP = {
   PAYMENT_CONFIRMED: {
@@ -74,6 +123,14 @@ const EVENT_ACCOUNT_MAP = {
     debitOwnerType: 'PLATFORM_CASH',
     creditRevenueOwnerType: 'PLATFORM_REVENUE',
     creditSellerOwnerType: 'SELLER_WALLET',
+  },
+  PAYOUT_RESERVE: {
+    debitOwnerType: 'SELLER_WALLET',
+    creditOwnerType: 'PAYOUT_CLEARING',
+  },
+  PAYOUT_RELEASE: {
+    debitOwnerType: 'PAYOUT_CLEARING',
+    creditOwnerType: 'SELLER_WALLET',
   },
 };
 
