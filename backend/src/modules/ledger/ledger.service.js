@@ -19,29 +19,35 @@
  *     this phase's responsibility, independent of the still-undocumented
  *     per-event leg mapping).
  *
- * Four event wrappers are implemented so far: postPaymentConfirmed (using
+ * Five event wrappers are implemented so far: postPaymentConfirmed (using
  * the PAYMENT_GATEWAY_CLEARING -> PLATFORM_CASH mapping supplied directly
  * by the product owner, not repo-derived), postSettlement (using the
  * PLATFORM_CASH -> PLATFORM_REVENUE + SELLER_WALLET split, whose account
  * choice was supplied by the product owner but whose gross/commission/
  * sellerEarning formula matches orders.service.js#settleDeliveredOrder
- * exactly), and — added in P2.4 Phase 2 Step 4 — postPayoutReserve /
- * postPayoutRelease, whose SELLER_WALLET <-> PAYOUT_CLEARING mapping IS
- * fully repo-derived: it mirrors payouts.service.js#createPayout's and
- * #releaseReservation's real Wallet.balance debit/credit exactly (see
- * ledger.constants.js's EVENT_ACCOUNT_MAP comment for all of the above).
+ * exactly), postPayoutReserve / postPayoutRelease (P2.4 Phase 2 Step 4),
+ * whose SELLER_WALLET <-> PAYOUT_CLEARING mapping IS fully repo-derived: it
+ * mirrors payouts.service.js#createPayout's and #releaseReservation's real
+ * Wallet.balance debit/credit exactly, and — added in P2.4 Phase 2 Step 5 —
+ * postRefund (no-shortfall path only), whose CUSTOMER_WALLET/SELLER_WALLET/
+ * PLATFORM_REVENUE mapping is likewise fully repo-derived: it mirrors
+ * orders.service.js#refundDeliveredOrder's real customer-credit and
+ * no-shortfall seller-wallet-decrement mutations exactly, and reverses
+ * SETTLEMENT's own CREDIT PLATFORM_REVENUE leg (see ledger.constants.js's
+ * EVENT_ACCOUNT_MAP comment for all of the above).
  *
- * Three wrappers remain NOT implemented: postRefund (out of scope for
- * Step 4), postPayoutProcessed, and postLiabilityRecovery. The latter two
- * were audited this step and found genuinely unresolvable from repo
- * evidence — not merely "no design doc exists" but a real structural
- * ambiguity in each case (postPayoutProcessed: no real Wallet.balance
- * mutation to mirror, and two internally-consistent-but-conflicting
- * readings for whether/how PLATFORM_CASH moves; postLiabilityRecovery:
- * literally zero repo mentions of which PLATFORM_* account, if any,
- * receives a recovered amount). See ledger.constants.js's EVENT_ACCOUNT_MAP
- * comment and the accompanying phase report for the full reasoning on
- * both.
+ * Two wrappers remain NOT implemented: postPayoutProcessed and
+ * postLiabilityRecovery. Both were audited in Step 4 and found genuinely
+ * unresolvable from repo evidence — not merely "no design doc exists" but
+ * a real structural ambiguity in each case (postPayoutProcessed: no real
+ * Wallet.balance mutation to mirror, and two internally-consistent-but-
+ * conflicting readings for whether/how PLATFORM_CASH moves;
+ * postLiabilityRecovery: literally zero repo mentions of which PLATFORM_*
+ * account, if any, receives a recovered amount). See ledger.constants.js's
+ * EVENT_ACCOUNT_MAP comment and the Step 4 phase report for the full
+ * reasoning on both. postRefund's own shortfall path (SellerPayoutLiability)
+ * is also deliberately out of scope for this step — see postRefund's own
+ * doc comment.
  */
 
 const { Prisma } = require('@prisma/client');
@@ -518,6 +524,121 @@ async function postPayoutRelease(tx, {
   });
 }
 
+/**
+ * Thin semantic wrapper over postJournal for the REFUND event — the
+ * NO-SHORTFALL path only.
+ *
+ * Posts:
+ *   CREDIT CUSTOMER_WALLET (customerId)   customerAmount
+ *   DEBIT  SELLER_WALLET (per sellerId)   sellerRefunds[].amount
+ *   DEBIT  PLATFORM_REVENUE (PLATFORM)    commissionAmount
+ * per ledger.constants.js's EVENT_ACCOUNT_MAP.REFUND — see that file's
+ * comment for the full repo evidence behind each leg's direction
+ * (CUSTOMER_WALLET's own "Funded by PaymentRefund credits" doc comment;
+ * SELLER_WALLET's DEBIT mirroring refundDeliveredOrder's real
+ * Wallet.balance decrement for the fast/no-shortfall path; PLATFORM_REVENUE
+ * DEBIT reversing SETTLEMENT's own CREDIT for the same commissionAmount).
+ * Balanced whenever customerAmount === sum(sellerRefunds[].amount) +
+ * commissionAmount, by construction of refundDeliveredOrder's own
+ * refundedGrossAmount = refundedCommissionAmount + refundedSellerEarning
+ * split (mirrored, per-line, into sellerRefunds/commissionAmount here) —
+ * postJournal's own DEBIT-total === CREDIT-total check is what actually
+ * rejects an inconsistent split; this wrapper adds no extra check of its
+ * own, same convention as postSettlement.
+ *
+ * SHORTFALL IS OUT OF SCOPE FOR THIS WRAPPER. refundDeliveredOrder's own
+ * Pass 2 loop has a second branch — when a seller's Wallet can't cover the
+ * full clawback, it collects whatever the wallet currently holds and
+ * records the remainder as a SellerPayoutLiability row instead of the full
+ * `amount` ever leaving SELLER_WALLET. This wrapper does NOT represent
+ * that: `sellerRefunds[].amount` is posted to SELLER_WALLET as given,
+ * unconditionally. Callers must only invoke this wrapper for the
+ * no-shortfall case (i.e. pass the amount actually collected from the
+ * seller's wallet, not the full clawback amount, if a shortfall occurred)
+ * — this wrapper has no way to detect a shortfall itself, since it never
+ * reads Wallet.balance (only Account.balance, a different, ledger-owned
+ * number). Representing a shortfall's SellerPayoutLiability side in the
+ * Ledger (whether as a liability owner type, which does not exist in the
+ * current LedgerAccountOwnerType enum, or otherwise) is explicitly
+ * deferred to a future step, not guessed here.
+ *
+ * Multiple sellers: `sellerRefunds` is an array of `{ sellerId, amount }`
+ * (refundDeliveredOrder can refund items from more than one store/seller
+ * in a single call — its `storeDebits` Map, one entry per storeId/sellerId
+ * pair), so this wrapper posts one SELLER_WALLET DEBIT leg per entry
+ * rather than assuming a single seller.
+ *
+ * Zero-amount legs: same convention as postSettlement — postJournal
+ * rejects any leg with amount <= 0 (a pre-existing, unmodified
+ * generic-engine invariant), so this wrapper omits the PLATFORM_REVENUE
+ * leg when commissionAmount is 0, and omits any individual seller's leg
+ * when that seller's refund amount is 0 (the 100%-commission edge case).
+ * The remaining legs still balance exactly, by the same construction as
+ * above.
+ *
+ * `eventId` is expected to be PaymentRefund.id (schema.prisma's
+ * Journal.eventId doc: "... PaymentRefund.id ..." — refundDeliveredOrder
+ * creates exactly one PaymentRefund row per call, covering however many
+ * items/sellers were refunded, matching this wrapper's one-Journal-per-call
+ * shape).
+ *
+ * Same "operates inside the caller's transaction, opens none of its own"
+ * contract as getOrCreateAccount/postJournal/the other wrappers. All
+ * idempotency (including not double-applying the Account.balance update
+ * on replay) is handled by postJournal itself via (eventType, eventId) —
+ * this wrapper adds no idempotency logic of its own.
+ *
+ * @param {import('@prisma/client').Prisma.TransactionClient} tx
+ * @param {object} params
+ * @param {string} params.eventId - PaymentRefund.id
+ * @param {string|null} [params.actorId]
+ * @param {string} [params.currency]
+ * @param {string} params.customerId - the customer's User.id
+ * @param {string|number|Prisma.Decimal} params.customerAmount
+ * @param {Array<{sellerId: string, amount: string|number|Prisma.Decimal}>} params.sellerRefunds
+ * @param {string|number|Prisma.Decimal} params.commissionAmount
+ * @returns {Promise<{journal: object, entries: object[], idempotentReplay: boolean}>}
+ */
+async function postRefund(tx, {
+  eventId, actorId = null, currency = LEDGER_CURRENCY, customerId, customerAmount, sellerRefunds, commissionAmount,
+}) {
+  if (!customerId) throw ApiError.internal('postRefund requires customerId');
+  if (!Array.isArray(sellerRefunds) || sellerRefunds.length === 0) {
+    throw ApiError.internal('postRefund requires a non-empty sellerRefunds array');
+  }
+
+  const mapping = EVENT_ACCOUNT_MAP.REFUND;
+
+  const customerAccount = await getOrCreateAccount(tx, mapping.creditCustomerOwnerType, customerId, currency);
+
+  const legs = [
+    { accountId: customerAccount.id, direction: 'CREDIT', amount: customerAmount },
+  ];
+
+  // eslint-disable-next-line no-restricted-syntax
+  for (const { sellerId, amount } of sellerRefunds) {
+    if (!sellerId) throw ApiError.internal('postRefund requires sellerId for every sellerRefunds entry');
+    if (new Prisma.Decimal(amount).greaterThan(0)) {
+      // eslint-disable-next-line no-await-in-loop
+      const sellerAccount = await getOrCreateAccount(tx, mapping.debitSellerOwnerType, sellerId, currency);
+      legs.push({ accountId: sellerAccount.id, direction: 'DEBIT', amount });
+    }
+  }
+
+  if (new Prisma.Decimal(commissionAmount).greaterThan(0)) {
+    const revenueAccount = await getOrCreateAccount(tx, mapping.debitRevenueOwnerType, PLATFORM_LEDGER_OWNER_ID, currency);
+    legs.push({ accountId: revenueAccount.id, direction: 'DEBIT', amount: commissionAmount });
+  }
+
+  return postJournal(tx, {
+    eventType: 'REFUND',
+    eventId,
+    actorId,
+    currency,
+    legs,
+  });
+}
+
 module.exports = {
   getOrCreateAccount,
   postJournal,
@@ -525,4 +646,5 @@ module.exports = {
   postSettlement,
   postPayoutReserve,
   postPayoutRelease,
+  postRefund,
 };

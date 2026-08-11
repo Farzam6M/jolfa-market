@@ -110,9 +110,46 @@ const LEDGER_CURRENCY = 'TMN';
 // tree — only the ledger module and schema.prisma itself mention these
 // owner types). Guessing was avoided; see the accompanying phase report.
 //
-// REFUND remains undefined for the same reason it was before this
-// revision — not in scope for this step and no mapping was added or
-// removed for it here.
+// REFUND (P2.4 Phase 2 Step 5) IS grounded in actual repo evidence, same
+// tier as PAYOUT_RESERVE/PAYOUT_RELEASE above — not merely "the product
+// owner picked these three account types" but each leg's direction
+// mirroring a real mutation or a real doc comment elsewhere in this repo:
+//   - CUSTOMER_WALLET's own LedgerAccountOwnerType doc comment (schema.
+//     prisma) says verbatim "Funded by PaymentRefund credits" — i.e. a
+//     CREDIT (increase), which is exactly what orders.service.js#
+//     refundDeliveredOrder's customer-side leg does (refundWallet/
+//     refundGateway posting `totalCustomerRefund` back to the customer).
+//   - SELLER_WALLET's DEBIT mirrors refundDeliveredOrder's own real
+//     Wallet.balance mutation for the *no-shortfall* path exactly: its
+//     Pass 2 loop does `tx.wallet.updateMany({ data: { balance:
+//     { decrement: amount } } } })` per seller for the full clawback
+//     amount whenever the wallet can cover it (the `debited.count === 1`
+//     fast path) — a decrement, i.e. this wrapper's DEBIT direction
+//     (DEBIT decrements Account.balance, same convention as every other
+//     wrapper here). The shortfall/SellerPayoutLiability branch of that
+//     same loop is explicitly NOT mirrored by this wrapper — see
+//     postRefund's own doc comment.
+//   - PLATFORM_REVENUE's DEBIT is the arithmetic reversal of SETTLEMENT's
+//     CREDIT PLATFORM_REVENUE above for the same commissionAmount: this
+//     repo's own OrderItemSettlementReversal model (schema.prisma) stores
+//     `refundedCommissionAmount` as a reversal of the original
+//     OrderItemSettlement.commissionAmount, and refundDeliveredOrder's own
+//     formula derives refundedCommissionAmount as the same proportional
+//     split of refundedGrossAmount that settleDeliveredOrder used forward
+//     — so reversing SETTLEMENT's CREDIT direction with a DEBIT here is
+//     the direct double-entry undo of that original posting, not a fresh
+//     account-choice decision.
+// PLATFORM_CASH deliberately does NOT appear in this mapping: unlike
+// SETTLEMENT (which moves gross cash from PLATFORM_CASH out to
+// PLATFORM_REVENUE/SELLER_WALLET), refundDeliveredOrder never touches any
+// PLATFORM_CASH-equivalent balance — the customer-side leg is a Wallet
+// credit (refundWallet) or a gateway-pending PaymentRefund row
+// (refundGateway) with no PAYMENT_GATEWAY_CLEARING-mirroring code path in
+// this phase, and this wrapper only implements the no-shortfall case (see
+// postRefund's own doc comment for why the shortfall/SellerPayoutLiability
+// path — which also touches no PLATFORM_CASH-equivalent balance — is out
+// of scope here too). Introducing a PLATFORM_CASH leg would require
+// inventing a mutation this repo's real refund code never performs.
 // ─────────────────────────────────────────────────────────────────────────
 const EVENT_ACCOUNT_MAP = {
   PAYMENT_CONFIRMED: {
@@ -131,6 +168,11 @@ const EVENT_ACCOUNT_MAP = {
   PAYOUT_RELEASE: {
     debitOwnerType: 'PAYOUT_CLEARING',
     creditOwnerType: 'SELLER_WALLET',
+  },
+  REFUND: {
+    creditCustomerOwnerType: 'CUSTOMER_WALLET',
+    debitSellerOwnerType: 'SELLER_WALLET',
+    debitRevenueOwnerType: 'PLATFORM_REVENUE',
   },
 };
 
