@@ -32,24 +32,48 @@ const LEDGER_CURRENCY = 'TMN';
 // file), not under backend/ or the repo root. Only README.md files exist,
 // and neither mentions the ledger design.
 //
-// PAYMENT_CONFIRMED is the one exception: its mapping below was supplied
-// directly by the product owner for this step (DEBIT
-// PAYMENT_GATEWAY_CLEARING / CREDIT PLATFORM_CASH), NOT derived from
-// anything found in this repository — the only repo-native comment about
-// PAYMENT_GATEWAY_CLEARING (schema.prisma) calls it "speculative ... no
-// real gateway wired in yet" and does not itself tie it to
-// PAYMENT_CONFIRMED. Recorded as given, not independently verified here.
+// PAYMENT_CONFIRMED is one exception: its mapping below was supplied
+// directly by the product owner (DEBIT PAYMENT_GATEWAY_CLEARING / CREDIT
+// PLATFORM_CASH), NOT derived from anything found in this repository — the
+// only repo-native comment about PAYMENT_GATEWAY_CLEARING (schema.prisma)
+// calls it "speculative ... no real gateway wired in yet" and does not
+// itself tie it to PAYMENT_CONFIRMED. Recorded as given, not independently
+// verified here.
 //
-// The other six event types (SETTLEMENT, REFUND, PAYOUT_RESERVE,
-// PAYOUT_RELEASE, PAYOUT_PROCESSED, LIABILITY_RECOVERY — including the
-// explicitly-flagged open question of whether LIABILITY_RECOVERY draws
-// from PLATFORM_CASH alone or also PLATFORM_REVENUE) remain intentionally
-// undefined pending their own decisions.
+// SETTLEMENT is the second exception, and unlike PAYMENT_CONFIRMED this one
+// IS grounded in actual repo evidence: orders.service.js#settleDeliveredOrder
+// (its own doc comment) computes, per OrderItem:
+//   gross          = priceSnapshot * qty
+//   commission     = round(gross * commissionRate / 100)
+//   sellerEarning  = gross - commission
+// and persists exactly those three numbers verbatim on OrderItemSettlement
+// (schema.prisma's grossAmount/commissionAmount/sellerEarning columns —
+// same names reused by postSettlement's parameters below, deliberately).
+// The three-way DEBIT PLATFORM_CASH / CREDIT PLATFORM_REVENUE / CREDIT
+// SELLER_WALLET split itself, and which owner types represent "commission"
+// vs. "cash", was supplied by the product owner for this step — this
+// repository does not itself name PLATFORM_CASH/PLATFORM_REVENUE/
+// SELLER_WALLET as SETTLEMENT's specific legs anywhere (only their
+// standalone LedgerAccountOwnerType doc comments: PLATFORM_REVENUE =
+// "Commission accrual", SELLER_WALLET = "Funded by settlement earnings" —
+// consistent with, but not the same as, a stated three-leg mapping for
+// this specific event).
+//
+// The remaining five event types (REFUND, PAYOUT_RESERVE, PAYOUT_RELEASE,
+// PAYOUT_PROCESSED, LIABILITY_RECOVERY — including the explicitly-flagged
+// open question of whether LIABILITY_RECOVERY draws from PLATFORM_CASH
+// alone or also PLATFORM_REVENUE) remain intentionally undefined pending
+// their own decisions.
 // ─────────────────────────────────────────────────────────────────────────
 const EVENT_ACCOUNT_MAP = {
   PAYMENT_CONFIRMED: {
     debitOwnerType: 'PAYMENT_GATEWAY_CLEARING',
     creditOwnerType: 'PLATFORM_CASH',
+  },
+  SETTLEMENT: {
+    debitOwnerType: 'PLATFORM_CASH',
+    creditRevenueOwnerType: 'PLATFORM_REVENUE',
+    creditSellerOwnerType: 'SELLER_WALLET',
   },
 };
 

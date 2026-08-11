@@ -19,16 +19,18 @@
  *     this phase's responsibility, independent of the still-undocumented
  *     per-event leg mapping).
  *
- * One event wrapper is implemented so far: postPaymentConfirmed, using the
- * PAYMENT_GATEWAY_CLEARING -> PLATFORM_CASH mapping supplied directly by
- * the product owner for this step (see ledger.constants.js's
- * EVENT_ACCOUNT_MAP comment — this specific mapping did NOT come from
- * anything found in the repository). The remaining six wrappers
- * (postSettlement, postRefund, postPayoutReserve, postPayoutRelease,
- * postPayoutProcessed, postLiabilityRecovery) are NOT implemented — see
- * the accompanying phase report for why (the design document
- * schema.prisma repeatedly cites for their exact per-event debit/credit
- * legs does not exist anywhere in this repository).
+ * Two event wrappers are implemented so far: postPaymentConfirmed (using
+ * the PAYMENT_GATEWAY_CLEARING -> PLATFORM_CASH mapping supplied directly
+ * by the product owner, not repo-derived) and postSettlement (using the
+ * PLATFORM_CASH -> PLATFORM_REVENUE + SELLER_WALLET split, whose account
+ * choice was supplied by the product owner but whose gross/commission/
+ * sellerEarning formula matches orders.service.js#settleDeliveredOrder
+ * exactly — see ledger.constants.js's EVENT_ACCOUNT_MAP comment for both).
+ * The remaining five wrappers (postRefund, postPayoutReserve,
+ * postPayoutRelease, postPayoutProcessed, postLiabilityRecovery) are NOT
+ * implemented — see the accompanying phase report for why (the design
+ * document schema.prisma repeatedly cites for their exact per-event
+ * debit/credit legs does not exist anywhere in this repository).
  */
 
 const { Prisma } = require('@prisma/client');
@@ -291,8 +293,106 @@ async function postPaymentConfirmed(tx, {
   });
 }
 
+/**
+ * Thin semantic wrapper over postJournal for the SETTLEMENT event.
+ *
+ * Mirrors orders.service.js#settleDeliveredOrder's own formula exactly
+ * (that function's doc comment: gross = priceSnapshot * qty; commission =
+ * round(gross * commissionRate / 100); sellerEarning = gross - commission
+ * — the same three numbers it persists verbatim onto OrderItemSettlement's
+ * grossAmount/commissionAmount/sellerEarning columns). This wrapper does
+ * NOT recompute that formula; it takes the three already-computed amounts
+ * as input and posts:
+ *   DEBIT  PLATFORM_CASH             grossAmount
+ *   CREDIT PLATFORM_REVENUE          commissionAmount
+ *   CREDIT SELLER_WALLET (sellerId)  sellerEarning
+ * per ledger.constants.js's EVENT_ACCOUNT_MAP.SETTLEMENT — see that
+ * file's comment for what in this mapping is repo-derived (the formula)
+ * vs. supplied directly by the product owner (which owner types
+ * represent which leg).
+ *
+ * Zero-amount legs: postJournal rejects any leg with amount <= 0 (a
+ * pre-existing, unmodified generic-engine invariant), but a real
+ * commissionRate of 0% (a legitimate, explicitly allowed value — see
+ * commission-rules.validation.js's `rate.min(0)`) makes commissionAmount
+ * genuinely 0, and a 100% rate makes sellerEarning 0. Rather than pass a
+ * zero-amount leg through to postJournal (which would throw) or weaken
+ * postJournal's own validation (out of scope for this step), this
+ * wrapper omits whichever of the PLATFORM_REVENUE / SELLER_WALLET legs
+ * would be zero — the remaining legs still balance exactly, since
+ * grossAmount === commissionAmount + sellerEarning by construction.
+ *
+ * Invalid split: if the caller passes amounts where grossAmount !==
+ * commissionAmount + sellerEarning (a caller bug, not a 0%/100%-rate
+ * edge case), this wrapper adds no extra check of its own — postJournal's
+ * existing DEBIT-total === CREDIT-total validation already rejects it,
+ * so no imbalanced Journal can ever commit.
+ *
+ * Both PLATFORM_CASH and PLATFORM_REVENUE are platform-owned (ownerId =
+ * PLATFORM_LEDGER_OWNER_ID); SELLER_WALLET is owned by the seller's own
+ * User.id (schema.prisma's LedgerAccountOwnerType doc: "SELLER_WALLET —
+ * ownerId = User.id (== Store.sellerId)"), so the caller must supply
+ * `sellerId` (settleDeliveredOrder resolves this via
+ * `tx.store.findUnique({ where: { id: item.storeId } }).sellerId`).
+ *
+ * Same "operates inside the caller's transaction, opens none of its own"
+ * contract as getOrCreateAccount/postJournal/postPaymentConfirmed. All
+ * idempotency (including not double-applying the Account.balance update
+ * on replay) is handled by postJournal itself via (eventType, eventId) —
+ * this wrapper adds no idempotency logic of its own. `eventId` is
+ * expected to be the per-item OrderItemSettlement.id (or equivalently
+ * the OrderItem.id it's unique on) — settlement in this codebase is
+ * per-OrderItem, not per-Order (see settleDeliveredOrder's per-item
+ * loop) — matching the migration's own eventId doc ("Payment.id /
+ * OrderItemSettlement.id / PaymentRefund.id / ... — see design doc §7's
+ * per-event-type table").
+ *
+ * @param {import('@prisma/client').Prisma.TransactionClient} tx
+ * @param {object} params
+ * @param {string} params.eventId - OrderItemSettlement.id (or equivalent per-item id)
+ * @param {string|null} [params.actorId]
+ * @param {string} [params.currency]
+ * @param {string} params.sellerId - the seller's User.id (== Store.sellerId)
+ * @param {string|number|Prisma.Decimal} params.grossAmount
+ * @param {string|number|Prisma.Decimal} params.commissionAmount
+ * @param {string|number|Prisma.Decimal} params.sellerEarning
+ * @returns {Promise<{journal: object, entries: object[], idempotentReplay: boolean}>}
+ */
+async function postSettlement(tx, {
+  eventId, actorId = null, currency = LEDGER_CURRENCY, sellerId, grossAmount, commissionAmount, sellerEarning,
+}) {
+  if (!sellerId) throw ApiError.internal('postSettlement requires sellerId');
+
+  const mapping = EVENT_ACCOUNT_MAP.SETTLEMENT;
+
+  const cashAccount = await getOrCreateAccount(tx, mapping.debitOwnerType, PLATFORM_LEDGER_OWNER_ID, currency);
+
+  const legs = [
+    { accountId: cashAccount.id, direction: 'DEBIT', amount: grossAmount },
+  ];
+
+  if (new Prisma.Decimal(commissionAmount).greaterThan(0)) {
+    const revenueAccount = await getOrCreateAccount(tx, mapping.creditRevenueOwnerType, PLATFORM_LEDGER_OWNER_ID, currency);
+    legs.push({ accountId: revenueAccount.id, direction: 'CREDIT', amount: commissionAmount });
+  }
+
+  if (new Prisma.Decimal(sellerEarning).greaterThan(0)) {
+    const sellerAccount = await getOrCreateAccount(tx, mapping.creditSellerOwnerType, sellerId, currency);
+    legs.push({ accountId: sellerAccount.id, direction: 'CREDIT', amount: sellerEarning });
+  }
+
+  return postJournal(tx, {
+    eventType: 'SETTLEMENT',
+    eventId,
+    actorId,
+    currency,
+    legs,
+  });
+}
+
 module.exports = {
   getOrCreateAccount,
   postJournal,
   postPaymentConfirmed,
+  postSettlement,
 };

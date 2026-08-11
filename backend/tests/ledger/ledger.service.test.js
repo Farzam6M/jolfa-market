@@ -11,11 +11,11 @@
  * These tests exercise the two generic primitives (getOrCreateAccount and
  * postJournal: leg balance validation, idempotency, and — per
  * schema.prisma's Account.balance doc — the cached per-account balance
- * this posting service maintains) plus the one event wrapper implemented
- * so far, postPaymentConfirmed. The other six wrappers (postSettlement,
- * postRefund, postPayoutReserve, postPayoutRelease, postPayoutProcessed,
- * postLiabilityRecovery) are not implemented yet — see the P2.4 Phase 2
- * report — so there is no coverage for them here.
+ * this posting service maintains) plus the two event wrappers implemented
+ * so far, postPaymentConfirmed and postSettlement. The remaining five
+ * wrappers (postRefund, postPayoutReserve, postPayoutRelease,
+ * postPayoutProcessed, postLiabilityRecovery) are not implemented yet —
+ * see the P2.4 Phase 2 report — so there is no coverage for them here.
  *
  * Uses random UUIDs for every ownerId/eventId so repeated runs never
  * collide, and cleans up exactly the rows it created in `afterAll` —
@@ -31,7 +31,7 @@
 const crypto = require('crypto');
 const { Prisma } = require('@prisma/client');
 const { prisma } = require('../../src/config/database');
-const { getOrCreateAccount, postJournal, postPaymentConfirmed } = require('../../src/modules/ledger/ledger.service');
+const { getOrCreateAccount, postJournal, postPaymentConfirmed, postSettlement } = require('../../src/modules/ledger/ledger.service');
 const { PLATFORM_LEDGER_OWNER_ID } = require('../../src/modules/ledger/ledger.constants');
 
 const createdAccountIds = [];
@@ -436,5 +436,194 @@ describe('postPaymentConfirmed', () => {
     entryRows.forEach((entry) => {
       expect(new Prisma.Decimal(entry.amount).equals(new Prisma.Decimal('999999999999'))).toBe(true);
     });
+  });
+});
+
+describe('postSettlement', () => {
+  // PLATFORM_CASH and PLATFORM_REVENUE are platform-owned (shared with the
+  // generic-engine / postPaymentConfirmed tests above), so track them for
+  // cleanup the same way trackPlatformAccounts() does there. SELLER_WALLET
+  // is per-seller — tracked per test via its own sellerId.
+  async function trackAccounts(sellerId, currency = 'TMN') {
+    const cash = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'PLATFORM_CASH', ownerId: PLATFORM_LEDGER_OWNER_ID, currency } },
+    });
+    const revenue = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'PLATFORM_REVENUE', ownerId: PLATFORM_LEDGER_OWNER_ID, currency } },
+    });
+    const seller = sellerId ? await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'SELLER_WALLET', ownerId: sellerId, currency } },
+    }) : null;
+    if (cash) createdAccountIds.push(cash.id);
+    if (revenue) createdAccountIds.push(revenue.id);
+    if (seller) createdAccountIds.push(seller.id);
+    return { cash, revenue, seller };
+  }
+
+  test('successful settlement: one Journal, 3 entries, correct eventType/eventId/accounts/directions/amounts', async () => {
+    const eventId = crypto.randomUUID();
+    const sellerId = crypto.randomUUID();
+    createdEventIds.push(['SETTLEMENT', eventId]);
+
+    // gross = 10000, rate 10% -> commission = 1000, sellerEarning = 9000
+    // (mirrors settleDeliveredOrder's own formula exactly).
+    const result = await withTx((tx) => postSettlement(tx, {
+      eventId, actorId: null, currency: 'TMN', sellerId, grossAmount: '10000', commissionAmount: '1000', sellerEarning: '9000',
+    }));
+    await trackAccounts(sellerId);
+
+    expect(result.idempotentReplay).toBe(false);
+
+    const journalRow = await prisma.journal.findUnique({ where: { id: result.journal.id } });
+    expect(journalRow.eventType).toBe('SETTLEMENT');
+    expect(journalRow.eventId).toBe(eventId);
+
+    const entryRows = await prisma.ledgerEntry.findMany({
+      where: { journalId: result.journal.id },
+      include: { account: true },
+    });
+    expect(entryRows).toHaveLength(3);
+
+    const debitEntry = entryRows.find((e) => e.direction === 'DEBIT');
+    const creditEntries = entryRows.filter((e) => e.direction === 'CREDIT');
+    expect(debitEntry.account.ownerType).toBe('PLATFORM_CASH');
+    expect(debitEntry.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(new Prisma.Decimal(debitEntry.amount).equals(new Prisma.Decimal('10000'))).toBe(true);
+
+    const revenueEntry = creditEntries.find((e) => e.account.ownerType === 'PLATFORM_REVENUE');
+    const sellerEntry = creditEntries.find((e) => e.account.ownerType === 'SELLER_WALLET');
+    expect(revenueEntry).toBeDefined();
+    expect(revenueEntry.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(new Prisma.Decimal(revenueEntry.amount).equals(new Prisma.Decimal('1000'))).toBe(true);
+    expect(sellerEntry).toBeDefined();
+    expect(sellerEntry.account.ownerId).toBe(sellerId);
+    expect(new Prisma.Decimal(sellerEntry.amount).equals(new Prisma.Decimal('9000'))).toBe(true);
+  });
+
+  test('platform accounts are not duplicated across settlements; seller account is reused across the same seller\'s settlements', async () => {
+    const sellerId = crypto.randomUUID();
+    const firstEventId = crypto.randomUUID();
+    const secondEventId = crypto.randomUUID();
+    createdEventIds.push(['SETTLEMENT', firstEventId], ['SETTLEMENT', secondEventId]);
+
+    await withTx((tx) => postSettlement(tx, {
+      eventId: firstEventId, currency: 'TMN', sellerId, grossAmount: '2000', commissionAmount: '200', sellerEarning: '1800',
+    }));
+    const first = await trackAccounts(sellerId);
+
+    await withTx((tx) => postSettlement(tx, {
+      eventId: secondEventId, currency: 'TMN', sellerId, grossAmount: '3000', commissionAmount: '300', sellerEarning: '2700',
+    }));
+    const second = await trackAccounts(sellerId);
+
+    expect(second.cash.id).toBe(first.cash.id);
+    expect(second.revenue.id).toBe(first.revenue.id);
+    expect(second.seller.id).toBe(first.seller.id);
+
+    const sellerRows = await prisma.account.findMany({
+      where: { ownerType: 'SELLER_WALLET', ownerId: sellerId, currency: 'TMN' },
+    });
+    expect(sellerRows).toHaveLength(1);
+  });
+
+  test('idempotent: same eventId twice leaves exactly one Journal, three entries, and does not double-apply balance', async () => {
+    const eventId = crypto.randomUUID();
+    const sellerId = crypto.randomUUID();
+    createdEventIds.push(['SETTLEMENT', eventId]);
+
+    const args = {
+      eventId, currency: 'TMN', sellerId, grossAmount: '5000', commissionAmount: '500', sellerEarning: '4500',
+    };
+
+    const first = await withTx((tx) => postSettlement(tx, args));
+    const { cash, revenue, seller } = await trackAccounts(sellerId);
+    expect(first.idempotentReplay).toBe(false);
+
+    const balancesAfterFirst = {
+      cash: (await prisma.account.findUnique({ where: { id: cash.id } })).balance,
+      revenue: (await prisma.account.findUnique({ where: { id: revenue.id } })).balance,
+      seller: (await prisma.account.findUnique({ where: { id: seller.id } })).balance,
+    };
+
+    const second = await withTx((tx) => postSettlement(tx, args));
+    expect(second.idempotentReplay).toBe(true);
+    expect(second.journal.id).toBe(first.journal.id);
+
+    const journalRows = await prisma.journal.findMany({ where: { eventType: 'SETTLEMENT', eventId } });
+    expect(journalRows).toHaveLength(1);
+    const entryRows = await prisma.ledgerEntry.findMany({ where: { journalId: first.journal.id } });
+    expect(entryRows).toHaveLength(3); // not 6
+
+    const balancesAfterSecond = {
+      cash: (await prisma.account.findUnique({ where: { id: cash.id } })).balance,
+      revenue: (await prisma.account.findUnique({ where: { id: revenue.id } })).balance,
+      seller: (await prisma.account.findUnique({ where: { id: seller.id } })).balance,
+    };
+    expect(new Prisma.Decimal(balancesAfterSecond.cash).equals(new Prisma.Decimal(balancesAfterFirst.cash))).toBe(true);
+    expect(new Prisma.Decimal(balancesAfterSecond.revenue).equals(new Prisma.Decimal(balancesAfterFirst.revenue))).toBe(true);
+    expect(new Prisma.Decimal(balancesAfterSecond.seller).equals(new Prisma.Decimal(balancesAfterFirst.seller))).toBe(true);
+  });
+
+  test('preserves exact Decimal precision for large settlement amounts', async () => {
+    const eventId = crypto.randomUUID();
+    const sellerId = crypto.randomUUID();
+    createdEventIds.push(['SETTLEMENT', eventId]);
+
+    // gross = 999999999999, commission (10%) = 99999999999, seller = 900000000000
+    const result = await withTx((tx) => postSettlement(tx, {
+      eventId,
+      currency: 'TMN',
+      sellerId,
+      grossAmount: '999999999999',
+      commissionAmount: '99999999999',
+      sellerEarning: '900000000000',
+    }));
+    await trackAccounts(sellerId);
+
+    const entryRows = await prisma.ledgerEntry.findMany({
+      where: { journalId: result.journal.id },
+      include: { account: true },
+    });
+    const debit = entryRows.find((e) => e.direction === 'DEBIT');
+    const revenue = entryRows.find((e) => e.account.ownerType === 'PLATFORM_REVENUE');
+    const seller = entryRows.find((e) => e.account.ownerType === 'SELLER_WALLET');
+    expect(new Prisma.Decimal(debit.amount).equals(new Prisma.Decimal('999999999999'))).toBe(true);
+    expect(new Prisma.Decimal(revenue.amount).equals(new Prisma.Decimal('99999999999'))).toBe(true);
+    expect(new Prisma.Decimal(seller.amount).equals(new Prisma.Decimal('900000000000'))).toBe(true);
+  });
+
+  test('an inconsistent split (gross !== commission + sellerEarning) is rejected, not silently posted unbalanced', async () => {
+    const eventId = crypto.randomUUID();
+    const sellerId = crypto.randomUUID();
+
+    // gross 10000 but commission(1000) + sellerEarning(8000) = 9000 != 10000
+    await expect(withTx((tx) => postSettlement(tx, {
+      eventId, currency: 'TMN', sellerId, grossAmount: '10000', commissionAmount: '1000', sellerEarning: '8000',
+    }))).rejects.toMatchObject({ statusCode: 400 });
+
+    const journalRow = await prisma.journal.findUnique({
+      where: { eventType_eventId: { eventType: 'SETTLEMENT', eventId } },
+    });
+    expect(journalRow).toBeNull();
+    await trackAccounts(sellerId); // still track for cleanup — accounts may have been created before the rejection
+  });
+
+  test('0% commission omits the PLATFORM_REVENUE leg but still posts a balanced 2-leg journal', async () => {
+    const eventId = crypto.randomUUID();
+    const sellerId = crypto.randomUUID();
+    createdEventIds.push(['SETTLEMENT', eventId]);
+
+    const result = await withTx((tx) => postSettlement(tx, {
+      eventId, currency: 'TMN', sellerId, grossAmount: '4000', commissionAmount: '0', sellerEarning: '4000',
+    }));
+    await trackAccounts(sellerId);
+
+    const entryRows = await prisma.ledgerEntry.findMany({
+      where: { journalId: result.journal.id },
+      include: { account: true },
+    });
+    expect(entryRows).toHaveLength(2);
+    expect(entryRows.some((e) => e.account.ownerType === 'PLATFORM_REVENUE')).toBe(false);
+    expect(entryRows.some((e) => e.account.ownerType === 'SELLER_WALLET')).toBe(true);
   });
 });
