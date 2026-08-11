@@ -78,25 +78,22 @@ const LEDGER_CURRENCY = 'TMN';
 // PAYOUT_RELEASE / PAYOUT_PROCESSED are deliberately three separate
 // values sharing what will be the same eventId (a PayoutRequest.id)").
 //
-// PAYOUT_PROCESSED (payouts.service.js#markProcessed) is NOT included
-// below — audited and found NOT resolvable from repo evidence. Its own
-// doc comment states plainly "No wallet movement — ... the money already
-// left the seller's wallet at REQUESTED time", so unlike RESERVE/RELEASE
-// there is no real Wallet.balance mutation to mirror. The only thing
-// evidence supports is that PAYOUT_CLEARING must close back to 0 (DEBIT)
-// when a reservation is finally transferred rather than released — but a
-// balanced 2-leg journal requires an equal-amount CREDIT on some other
-// account, and PLATFORM_CASH is the only remaining plausible candidate
-// with no repo evidence either way for the resulting direction: crediting
-// (increasing) PLATFORM_CASH here conserves the running total across
-// PAYMENT_CONFIRMED -> SETTLEMENT -> PAYOUT_RESERVE -> PAYOUT_PROCESSED
-// (final PLATFORM_CASH balance settles at the total amount ever paid out,
-// PLATFORM_REVENUE at total commission — internally consistent) but reads
-// backwards against the intuitive "real cash leaves the platform when a
-// payout is processed" story, and nothing in this repo confirms which
-// reading the product owner intends, or whether PLATFORM_CASH is even the
-// intended second account at all. Guessing was avoided per this phase's
-// instructions; see the accompanying phase report.
+// PAYOUT_PROCESSED (payouts.service.js#markProcessed, P2.4 Phase 2 Step 7)
+// IS now included below. Step 4's audit found this genuinely unresolvable
+// from repo evidence alone (see the phase report referenced from prior
+// revisions of this comment) — markProcessed's own doc comment states
+// plainly "No wallet movement — ... the money already left the seller's
+// wallet at REQUESTED time", so unlike RESERVE/RELEASE there is no real
+// Wallet.balance mutation to mirror, and the running-total-vs-"cash leaves
+// the platform" ambiguity flagged then had no repo-internal way to
+// resolve. The mapping below (DEBIT PAYOUT_CLEARING / CREDIT PLATFORM_CASH)
+// was therefore supplied directly by the product owner for this step — same
+// "explicitly approved, not repo-derived" tier as PAYMENT_CONFIRMED/
+// SETTLEMENT's account choice above, not the fully repo-derived tier of
+// PAYOUT_RESERVE/PAYOUT_RELEASE/REFUND. It does satisfy the one thing repo
+// evidence did support: PAYOUT_CLEARING closing back toward 0 (DEBIT) when
+// a reservation is finally transferred rather than released, continuing on
+// from PAYOUT_RESERVE's CREDIT for the same amount.
 //
 // LIABILITY_RECOVERY (payout-liabilities.service.js#recoverSellerLiabilities,
 // called from orders.service.js#settleDeliveredOrder before that
@@ -168,6 +165,10 @@ const EVENT_ACCOUNT_MAP = {
   PAYOUT_RELEASE: {
     debitOwnerType: 'PAYOUT_CLEARING',
     creditOwnerType: 'SELLER_WALLET',
+  },
+  PAYOUT_PROCESSED: {
+    debitOwnerType: 'PAYOUT_CLEARING',
+    creditOwnerType: 'PLATFORM_CASH',
   },
   REFUND: {
     creditCustomerOwnerType: 'CUSTOMER_WALLET',

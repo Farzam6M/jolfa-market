@@ -11,14 +11,14 @@
  * These tests exercise the two generic primitives (getOrCreateAccount and
  * postJournal: leg balance validation, idempotency, and — per
  * schema.prisma's Account.balance doc — the cached per-account balance
- * this posting service maintains) plus the five event wrappers implemented
+ * this posting service maintains) plus the six event wrappers implemented
  * so far: postPaymentConfirmed, postSettlement, postPayoutReserve /
- * postPayoutRelease (P2.4 Phase 2 Step 4), and — added in P2.4 Phase 2
- * Step 5 — postRefund (no-shortfall path only). Two wrappers remain NOT
- * implemented (postPayoutProcessed, postLiabilityRecovery — see the P2.4
- * Phase 2 Step 4 report for why they were audited and found genuinely
- * unresolvable from repo evidence), so there is no coverage for either
- * here.
+ * postPayoutRelease (P2.4 Phase 2 Step 4), postRefund (P2.4 Phase 2 Step 5,
+ * no-shortfall path only), and — added in P2.4 Phase 2 Step 7 —
+ * postPayoutProcessed. One wrapper remains NOT implemented
+ * (postLiabilityRecovery — see the P2.4 Phase 2 Step 4 report for why it
+ * was audited and found genuinely unresolvable from repo evidence), so
+ * there is no coverage for it here.
  *
  * Uses random UUIDs for every ownerId/eventId so repeated runs never
  * collide, and cleans up exactly the rows it created in `afterAll` —
@@ -35,7 +35,7 @@ const crypto = require('crypto');
 const { Prisma } = require('@prisma/client');
 const { prisma } = require('../../src/config/database');
 const {
-  getOrCreateAccount, postJournal, postPaymentConfirmed, postSettlement, postPayoutReserve, postPayoutRelease, postRefund,
+  getOrCreateAccount, postJournal, postPaymentConfirmed, postSettlement, postPayoutReserve, postPayoutRelease, postPayoutProcessed, postRefund,
 } = require('../../src/modules/ledger/ledger.service');
 const { PLATFORM_LEDGER_OWNER_ID } = require('../../src/modules/ledger/ledger.constants');
 
@@ -931,6 +931,186 @@ describe('postPayoutRelease', () => {
     const refreshedSeller = await prisma.account.findUnique({ where: { id: seller.id } });
     expect(new Prisma.Decimal(refreshedClearing.balance).equals(new Prisma.Decimal('0'))).toBe(true);
     expect(new Prisma.Decimal(refreshedSeller.balance).equals(new Prisma.Decimal('0'))).toBe(true);
+  });
+});
+
+describe('postPayoutProcessed', () => {
+  // Both legs are platform-owned (PAYOUT_CLEARING and PLATFORM_CASH), so —
+  // unlike postPayoutReserve/postPayoutRelease's trackAccounts — there is
+  // no per-seller account to track here; sellerId is only used as a
+  // wrapper input, never to resolve an account.
+  async function trackAccounts(currency = 'TMN') {
+    const clearing = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'PAYOUT_CLEARING', ownerId: PLATFORM_LEDGER_OWNER_ID, currency } },
+    });
+    const cash = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'PLATFORM_CASH', ownerId: PLATFORM_LEDGER_OWNER_ID, currency } },
+    });
+    if (clearing) createdAccountIds.push(clearing.id);
+    if (cash) createdAccountIds.push(cash.id);
+    return { clearing, cash };
+  }
+
+  test('successful posting: one Journal, 2 entries, correct eventType/eventId/accounts/directions/amount', async () => {
+    const eventId = crypto.randomUUID();
+    const sellerId = crypto.randomUUID();
+    createdEventIds.push(['PAYOUT_PROCESSED', eventId]);
+
+    const result = await withTx((tx) => postPayoutProcessed(tx, {
+      eventId, actorId: null, currency: 'TMN', sellerId, amount: '7000',
+    }));
+    await trackAccounts();
+
+    expect(result.idempotentReplay).toBe(false);
+
+    const journalRow = await prisma.journal.findUnique({ where: { id: result.journal.id } });
+    expect(journalRow.eventType).toBe('PAYOUT_PROCESSED');
+    expect(journalRow.eventId).toBe(eventId);
+
+    const entryRows = await prisma.ledgerEntry.findMany({
+      where: { journalId: result.journal.id },
+      include: { account: true },
+    });
+    expect(entryRows).toHaveLength(2);
+
+    const debitEntry = entryRows.find((e) => e.direction === 'DEBIT');
+    const creditEntry = entryRows.find((e) => e.direction === 'CREDIT');
+    expect(debitEntry.account.ownerType).toBe('PAYOUT_CLEARING');
+    expect(debitEntry.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(creditEntry.account.ownerType).toBe('PLATFORM_CASH');
+    expect(creditEntry.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(new Prisma.Decimal(debitEntry.amount).equals(new Prisma.Decimal('7000'))).toBe(true);
+    expect(new Prisma.Decimal(creditEntry.amount).equals(new Prisma.Decimal('7000'))).toBe(true);
+  });
+
+  test('PAYOUT_CLEARING and PLATFORM_CASH are not duplicated across multiple processed payouts', async () => {
+    const firstEventId = crypto.randomUUID();
+    const secondEventId = crypto.randomUUID();
+    createdEventIds.push(['PAYOUT_PROCESSED', firstEventId], ['PAYOUT_PROCESSED', secondEventId]);
+
+    await withTx((tx) => postPayoutProcessed(tx, {
+      eventId: firstEventId, currency: 'TMN', sellerId: crypto.randomUUID(), amount: '1500',
+    }));
+    const first = await trackAccounts();
+
+    await withTx((tx) => postPayoutProcessed(tx, {
+      eventId: secondEventId, currency: 'TMN', sellerId: crypto.randomUUID(), amount: '2500',
+    }));
+    const second = await trackAccounts();
+
+    expect(second.clearing.id).toBe(first.clearing.id);
+    expect(second.cash.id).toBe(first.cash.id);
+
+    const clearingRows = await prisma.account.findMany({
+      where: { ownerType: 'PAYOUT_CLEARING', ownerId: PLATFORM_LEDGER_OWNER_ID, currency: 'TMN' },
+    });
+    expect(clearingRows).toHaveLength(1);
+    const cashRows = await prisma.account.findMany({
+      where: { ownerType: 'PLATFORM_CASH', ownerId: PLATFORM_LEDGER_OWNER_ID, currency: 'TMN' },
+    });
+    expect(cashRows).toHaveLength(1);
+  });
+
+  test('idempotent: same eventId twice leaves exactly one Journal, two entries, and does not double-apply balance', async () => {
+    const eventId = crypto.randomUUID();
+    const sellerId = crypto.randomUUID();
+    createdEventIds.push(['PAYOUT_PROCESSED', eventId]);
+
+    const args = {
+      eventId, currency: 'TMN', sellerId, amount: '4200',
+    };
+
+    const first = await withTx((tx) => postPayoutProcessed(tx, args));
+    const { clearing, cash } = await trackAccounts();
+    expect(first.idempotentReplay).toBe(false);
+
+    const balancesAfterFirst = {
+      clearing: (await prisma.account.findUnique({ where: { id: clearing.id } })).balance,
+      cash: (await prisma.account.findUnique({ where: { id: cash.id } })).balance,
+    };
+
+    const second = await withTx((tx) => postPayoutProcessed(tx, args));
+    expect(second.idempotentReplay).toBe(true);
+    expect(second.journal.id).toBe(first.journal.id);
+
+    const journalRows = await prisma.journal.findMany({ where: { eventType: 'PAYOUT_PROCESSED', eventId } });
+    expect(journalRows).toHaveLength(1);
+    const entryRows = await prisma.ledgerEntry.findMany({ where: { journalId: first.journal.id } });
+    expect(entryRows).toHaveLength(2); // not 4
+
+    const balancesAfterSecond = {
+      clearing: (await prisma.account.findUnique({ where: { id: clearing.id } })).balance,
+      cash: (await prisma.account.findUnique({ where: { id: cash.id } })).balance,
+    };
+    expect(new Prisma.Decimal(balancesAfterSecond.clearing).equals(new Prisma.Decimal(balancesAfterFirst.clearing))).toBe(true);
+    expect(new Prisma.Decimal(balancesAfterSecond.cash).equals(new Prisma.Decimal(balancesAfterFirst.cash))).toBe(true);
+  });
+
+  test('preserves exact Decimal precision for large processed amounts', async () => {
+    const eventId = crypto.randomUUID();
+    const sellerId = crypto.randomUUID();
+    createdEventIds.push(['PAYOUT_PROCESSED', eventId]);
+
+    const result = await withTx((tx) => postPayoutProcessed(tx, {
+      eventId, currency: 'TMN', sellerId, amount: '999999999999',
+    }));
+    await trackAccounts();
+
+    const entryRows = await prisma.ledgerEntry.findMany({ where: { journalId: result.journal.id } });
+    entryRows.forEach((entry) => {
+      expect(new Prisma.Decimal(entry.amount).equals(new Prisma.Decimal('999999999999'))).toBe(true);
+    });
+  });
+
+  test('processing moves the cached balance: PAYOUT_CLEARING decreases, PLATFORM_CASH increases by the same amount', async () => {
+    const eventId = crypto.randomUUID();
+    const sellerId = crypto.randomUUID();
+    createdEventIds.push(['PAYOUT_PROCESSED', eventId]);
+
+    // PAYOUT_CLEARING/PLATFORM_CASH are platform-wide singletons shared
+    // with the postPayoutReserve/postPayoutRelease suites above, so this
+    // asserts a relative delta (before -> after) rather than an absolute
+    // balance, same reasoning as the reserve-then-processed flow test below.
+    const { clearing: clearingBeforeAccount, cash: cashBeforeAccount } = await trackAccounts();
+    const clearingBefore = clearingBeforeAccount
+      ? new Prisma.Decimal((await prisma.account.findUnique({ where: { id: clearingBeforeAccount.id } })).balance)
+      : new Prisma.Decimal(0);
+    const cashBefore = cashBeforeAccount
+      ? new Prisma.Decimal((await prisma.account.findUnique({ where: { id: cashBeforeAccount.id } })).balance)
+      : new Prisma.Decimal(0);
+
+    await withTx((tx) => postPayoutProcessed(tx, {
+      eventId, currency: 'TMN', sellerId, amount: '900',
+    }));
+    const { clearing, cash } = await trackAccounts();
+
+    const refreshedClearing = await prisma.account.findUnique({ where: { id: clearing.id } });
+    const refreshedCash = await prisma.account.findUnique({ where: { id: cash.id } });
+    expect(new Prisma.Decimal(refreshedClearing.balance).equals(clearingBefore.minus('900'))).toBe(true);
+    expect(new Prisma.Decimal(refreshedCash.balance).equals(cashBefore.plus('900'))).toBe(true);
+  });
+
+  test('a full reserve-then-processed flow returns PAYOUT_CLEARING to its balance before the reserve', async () => {
+    const sellerId = crypto.randomUUID();
+    const reserveEventId = crypto.randomUUID();
+    const processedEventId = crypto.randomUUID();
+    createdEventIds.push(['PAYOUT_RESERVE', reserveEventId], ['PAYOUT_PROCESSED', processedEventId]);
+
+    const { clearing: clearingBeforeAccount } = await trackAccounts();
+    const clearingBefore = clearingBeforeAccount
+      ? new Prisma.Decimal((await prisma.account.findUnique({ where: { id: clearingBeforeAccount.id } })).balance)
+      : new Prisma.Decimal(0);
+
+    await withTx((tx) => postPayoutReserve(tx, {
+      eventId: reserveEventId, currency: 'TMN', sellerId, amount: '5500',
+    }));
+    await withTx((tx) => postPayoutProcessed(tx, {
+      eventId: processedEventId, currency: 'TMN', sellerId, amount: '5500',
+    }));
+    const { clearing } = await trackAccounts();
+
+    const refreshedClearing = await prisma.account.findUnique({ where: { id: clearing.id } });
+    expect(new Prisma.Decimal(refreshedClearing.balance).equals(clearingBefore)).toBe(true);
   });
 });
 
