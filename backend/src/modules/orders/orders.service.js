@@ -10,6 +10,7 @@ const { PERMISSIONS } = require('../roles/permissions.constants');
 const { resolveCommissionRate } = require('../commission-rules/commission-rules.service');
 const { refundWallet, refundGateway } = require('../payments/payments.service');
 const { recoverSellerLiabilities } = require('../payout-liabilities/payout-liabilities.service');
+const { postSettlement, postRefund } = require('../ledger/ledger.service');
 
 const STATUS_LABELS = {
   PENDING: 'در انتظار', CONFIRMED: 'تایید شده', PREPARING: 'در حال آماده‌سازی', SENT: 'ارسال شده', DELIVERED: 'تحویل داده شده', CANCELLED: 'لغو شده',
@@ -393,7 +394,7 @@ async function settleDeliveredOrder(tx, order) {
     const sellerEarning = gross - commission;
 
     // eslint-disable-next-line no-await-in-loop
-    await tx.orderItemSettlement.create({
+    const settlement = await tx.orderItemSettlement.create({
       data: {
         orderItemId: item.id,
         orderId: order.id,
@@ -409,6 +410,20 @@ async function settleDeliveredOrder(tx, order) {
     // eslint-disable-next-line no-await-in-loop
     const store = await tx.store.findUnique({ where: { id: item.storeId }, select: { sellerId: true } });
 
+    // Ledger — SETTLEMENT: posted with the FULL, original sellerEarning
+    // (never remainingSellerEarning) — liability recovery below is an
+    // independent Ledger event with its own Journal, not folded into this
+    // one. eventId = OrderItemSettlement.id, same transaction.
+    // eslint-disable-next-line no-await-in-loop
+    await postSettlement(tx, {
+      eventId: settlement.id,
+      actorId: null,
+      sellerId: store.sellerId,
+      grossAmount: gross,
+      commissionAmount: commission,
+      sellerEarning,
+    });
+
     // Phase 6: recover as much of this earning as possible against the
     // seller's OUTSTANDING liabilities (FIFO) BEFORE crediting anything —
     // see recoverSellerLiabilities' own comment for why this happens
@@ -417,7 +432,7 @@ async function settleDeliveredOrder(tx, order) {
     // available to the seller). No-op (remainingSellerEarning ===
     // sellerEarning) when the seller has no outstanding liability.
     // eslint-disable-next-line no-await-in-loop
-    const { remainingSellerEarning } = await recoverSellerLiabilities(tx, store.sellerId, sellerEarning);
+    const { remainingSellerEarning } = await recoverSellerLiabilities(tx, store.sellerId, sellerEarning, settlement.id);
 
     // Atomic credit — same compare-and-swap-free-but-conditional pattern as
     // the debit in payments.service.js#payWithWallet, just in the other
@@ -656,6 +671,7 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
       const refundLines = [];
       const storeDebits = new Map(); // storeId -> { sellerId, amount }
       let totalCustomerRefund = 0;
+      let totalCommission = 0; // Ledger REFUND's PLATFORM_REVENUE debit — no-shortfall path only.
 
       // eslint-disable-next-line no-restricted-syntax
       for (const line of items) {
@@ -683,6 +699,7 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
         const refundedSellerEarning = refundedGrossAmount - refundedCommissionAmount;
 
         totalCustomerRefund += refundedGrossAmount;
+        totalCommission += refundedCommissionAmount;
 
         const { storeId } = orderItem;
         const existingDebit = storeDebits.get(storeId) || { sellerId: orderItem.store.sellerId, amount: 0 };
@@ -705,6 +722,12 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
       // as the wallet currently holds (fast-path: the full amount, exactly
       // as before) and tracks any uncollected remainder as an additive
       // liability rather than throwing and rolling back the whole refund.
+      // Tracks whether ANY affected store had a shortfall this call — the
+      // Ledger REFUND journal (no fake balancing leg possible for the
+      // shortfall path) is only posted when this stays false; see Pass 2
+      // below and the postRefund call after the PaymentRefund is created.
+      let anyShortfall = false;
+
       // eslint-disable-next-line no-restricted-syntax
       for (const [storeId, { sellerId, amount }] of storeDebits) {
         // Fast path — unchanged from before: full atomic conditional debit.
@@ -763,6 +786,7 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
         }
 
         if (shortfall > 0) {
+          anyShortfall = true;
           // eslint-disable-next-line no-await-in-loop
           await tx.sellerPayoutLiability.create({
             data: {
@@ -786,6 +810,23 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
       const refund = payment.method === 'WALLET'
         ? await refundWallet(payment.id, totalCustomerRefund, idempotencyKey, actor, tx)
         : await refundGateway(payment.id, totalCustomerRefund, idempotencyKey, actor, tx);
+
+      // Ledger — REFUND: no-shortfall path only. If ANY affected
+      // seller/store had a shortfall this call, postRefund is skipped
+      // entirely — no fake balancing leg, no new Ledger account; the
+      // refund business operation and its SellerPayoutLiability row(s)
+      // above are unaffected either way. eventId = PaymentRefund.id,
+      // same transaction.
+      if (!anyShortfall) {
+        await postRefund(tx, {
+          eventId: refund.id,
+          actorId: null,
+          customerId: order.userId,
+          customerAmount: totalCustomerRefund,
+          sellerRefunds: Array.from(storeDebits.values()).map(({ sellerId, amount }) => ({ sellerId, amount })),
+          commissionAmount: totalCommission,
+        });
+      }
 
       // eslint-disable-next-line no-restricted-syntax
       for (const line of refundLines) {

@@ -1,5 +1,6 @@
 const { prisma } = require('../../config/database');
 const ApiError = require('../../utils/ApiError');
+const { postLiabilityRecovery } = require('../ledger/ledger.service');
 
 /**
  * Phase 6 — Seller Payout Liability Recovery & Visibility.
@@ -71,7 +72,7 @@ const ApiError = require('../../utils/ApiError');
  * DEBIT row's existence is itself the durable record of "this much of
  * this earning went to liability, not to the wallet".
  */
-async function recoverSellerLiabilities(tx, sellerId, earningAmount) {
+async function recoverSellerLiabilities(tx, sellerId, earningAmount, orderItemSettlementId) {
   const earning = Number(earningAmount) || 0;
   if (earning <= 0) {
     return { totalRecovered: 0, remainingSellerEarning: earning };
@@ -123,6 +124,20 @@ async function recoverSellerLiabilities(tx, sellerId, earningAmount) {
         reason: `بازیابی خودکار بدهی فروشنده (بدهی ${liability.id}) از محل تسویه سفارش`,
         refId: liability.id,
       },
+    });
+
+    // Ledger — LIABILITY_RECOVERY: an additional accounting record, not a
+    // replacement for the WalletTransaction row above. eventId is the
+    // deterministic composite `${orderItemSettlementId}:${liability.id}`
+    // (never liability.id alone), since a single liability may be
+    // partially recovered across multiple future settlements. Posted in
+    // the SAME transaction as the recovery/decrement above.
+    // eslint-disable-next-line no-await-in-loop
+    await postLiabilityRecovery(tx, {
+      eventId: `${orderItemSettlementId}:${liability.id}`,
+      actorId: null,
+      sellerId,
+      amount: recoverable,
     });
 
     remaining -= recoverable;

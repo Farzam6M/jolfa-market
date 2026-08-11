@@ -4,6 +4,7 @@ const ApiError = require('../../utils/ApiError');
 const { pushNotification } = require('../notifications/notifications.service');
 const { logAdminActivity } = require('../admin/admin.service');
 const { getOutstandingLiabilityTotal } = require('../payout-liabilities/payout-liabilities.service');
+const { postPayoutReserve, postPayoutRelease, postPayoutProcessed } = require('../ledger/ledger.service');
 
 // Persian labels for PayoutStatus, mirroring orders.service.js's
 // STATUS_LABELS convention — used only to render the invalid-transition
@@ -147,6 +148,16 @@ async function createPayout(sellerId, payload, actor) {
         throw ApiError.badRequest('موجودی کیف پول برای برداشت کافی نیست');
       }
 
+      // Ledger — PAYOUT_RESERVE: mirrors the wallet debit above exactly,
+      // in the SAME transaction. eventId = PayoutRequest.id (see
+      // ledger.service.js#postPayoutReserve's own doc).
+      await postPayoutReserve(tx, {
+        eventId: payoutRequest.id,
+        actorId: null,
+        sellerId,
+        amount: payload.amount,
+      });
+
       const wallet = await tx.wallet.findUnique({ where: { userId: sellerId } });
       await tx.walletTransaction.create({
         data: {
@@ -236,6 +247,18 @@ async function releaseReservation(tx, payoutRequest, reason) {
     data: { balance: { increment: payoutRequest.amount } },
   });
   if (credited.count !== 1) throw ApiError.internal('کیف پول فروشنده برای بازگشت وجه یافت نشد');
+
+  // Ledger — PAYOUT_RELEASE: mirrors the wallet credit above exactly, in
+  // the SAME transaction. Shared by both rejectPayout and markFailed
+  // since they both call this one function — no duplicate Ledger call in
+  // either caller. eventId = the SAME PayoutRequest.id used at reserve
+  // time (see ledger.service.js#postPayoutRelease's own doc).
+  await postPayoutRelease(tx, {
+    eventId: payoutRequest.id,
+    actorId: null,
+    sellerId: payoutRequest.sellerId,
+    amount: payoutRequest.amount,
+  });
 
   const wallet = await tx.wallet.findUnique({ where: { userId: payoutRequest.sellerId } });
   await tx.walletTransaction.create({
@@ -332,17 +355,31 @@ async function rejectPayout(id, reason, actor) {
  * via assertIdempotentOrThrowInvalidTransition (Phase 5 Fix #3).
  */
 async function markProcessed(id, actor) {
-  const claimed = await prisma.payoutRequest.updateMany({
-    where: { id, status: 'APPROVED' },
-    data: { status: 'PROCESSED', processedById: actor.id, processedAt: new Date() },
-  });
+  const payoutRequest = await prisma.$transaction(async (tx) => {
+    const claimed = await tx.payoutRequest.updateMany({
+      where: { id, status: 'APPROVED' },
+      data: { status: 'PROCESSED', processedById: actor.id, processedAt: new Date() },
+    });
 
-  const payoutRequest = await prisma.payoutRequest.findUnique({ where: { id } });
-  if (!payoutRequest) throw ApiError.notFound('درخواست برداشت یافت نشد');
-  if (claimed.count === 0) {
-    assertIdempotentOrThrowInvalidTransition(payoutRequest, 'PROCESSED');
-    return payoutRequest; // Idempotent replay — already PROCESSED, no second side effect.
-  }
+    const row = await tx.payoutRequest.findUnique({ where: { id } });
+    if (!row) throw ApiError.notFound('درخواست برداشت یافت نشد');
+    if (claimed.count === 0) {
+      assertIdempotentOrThrowInvalidTransition(row, 'PROCESSED');
+      return row; // Idempotent replay — already PROCESSED, no second side effect, no second Journal.
+    }
+
+    // Ledger — PAYOUT_PROCESSED: only posted when this call actually won
+    // the APPROVED -> PROCESSED claim above, in the SAME transaction.
+    // eventId = the SAME PayoutRequest.id used at reserve/release time.
+    await postPayoutProcessed(tx, {
+      eventId: row.id,
+      actorId: null,
+      sellerId: row.sellerId,
+      amount: row.amount,
+    });
+
+    return row;
+  });
 
   await logAdminActivity(actor.id, `ثبت واریز درخواست برداشت ${payoutRequest.id}`);
   await pushNotification({

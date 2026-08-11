@@ -4,6 +4,7 @@ const ApiError = require('../../utils/ApiError');
 const logger = require('../../utils/logger');
 const { pushNotification } = require('../notifications/notifications.service');
 const { logAdminActivity } = require('../admin/admin.service');
+const { postPaymentConfirmed } = require('../ledger/ledger.service');
 
 async function payWithWallet(order, userId) {
   return prisma.$transaction(async (tx) => {
@@ -120,31 +121,61 @@ async function confirmGateway(transactionRef, success) {
   if (payment.status !== 'PENDING') return payment;
 
   const status = success ? 'SUCCESS' : 'FAILED';
-  // Atomic claim: only the first callback for this payment can actually flip
-  // it out of PENDING. Payment gateways commonly retry/duplicate webhook
-  // delivery — without this, two concurrent callbacks could both pass the
-  // check above and both run the order-confirm + notification side effects.
-  const claim = await prisma.payment.updateMany({
-    where: { id: payment.id, status: 'PENDING' },
-    data: { status, paidAt: success ? new Date() : null },
-  });
-  if (claim.count === 0) return prisma.payment.findUnique({ where: { id: payment.id } });
 
-  const order = await prisma.order.findUnique({ where: { id: payment.orderId } });
+  // DB success path wrapped in a transaction so the PENDING -> SUCCESS/FAILED
+  // claim, the conditional order-confirm, and the Ledger PAYMENT_CONFIRMED
+  // journal (GATEWAY-only, only on a real SUCCESS claim) all commit or roll
+  // back together. Notifications stay outside — they already ran after all
+  // DB work in the pre-Ledger version of this function.
+  const txResult = await prisma.$transaction(async (tx) => {
+    // Atomic claim: only the first callback for this payment can actually flip
+    // it out of PENDING. Payment gateways commonly retry/duplicate webhook
+    // delivery — without this, two concurrent callbacks could both pass the
+    // check above and both run the order-confirm + notification side effects.
+    const claim = await tx.payment.updateMany({
+      where: { id: payment.id, status: 'PENDING' },
+      data: { status, paidAt: success ? new Date() : null },
+    });
+    if (claim.count === 0) return { claimed: false };
+
+    const order = await tx.order.findUnique({ where: { id: payment.orderId } });
+    let orderClaimCount = null;
+
+    if (success) {
+      // Conditional, not unconditional: an order can leave PENDING for reasons
+      // that have nothing to do with this payment (most importantly, an admin
+      // cancelling an abandoned order, which restocks it — see
+      // orders.service.js updateStatus). A gateway callback can arrive late or
+      // be redelivered well after that happens. Blindly setting status:
+      // 'CONFIRMED' here would resurrect a CANCELLED order — reversing the
+      // ORDER_TRANSITIONS state machine's rule that CANCELLED is terminal —
+      // while the stock it freed stays sold. The payment itself is still
+      // marked SUCCESS above (money was genuinely captured), it just no
+      // longer auto-confirms an order that has moved on; that needs manual
+      // reconciliation/refund, not a silent state-machine violation.
+      const orderClaim = await tx.order.updateMany({ where: { id: payment.orderId, status: 'PENDING' }, data: { status: 'CONFIRMED' } });
+      orderClaimCount = orderClaim.count;
+
+      // Ledger — PAYMENT_CONFIRMED: GATEWAY-only (never WALLET/COD — those
+      // never go through this function), and only when this call actually
+      // won the PENDING -> SUCCESS claim above. Same transaction.
+      await postPaymentConfirmed(tx, {
+        eventId: payment.id,
+        actorId: null,
+        amount: payment.amount,
+      });
+    }
+
+    return {
+      claimed: true, order, orderClaimCount,
+    };
+  });
+
+  if (!txResult.claimed) return prisma.payment.findUnique({ where: { id: payment.id } });
+
+  const { order, orderClaimCount } = txResult;
   if (success) {
-    // Conditional, not unconditional: an order can leave PENDING for reasons
-    // that have nothing to do with this payment (most importantly, an admin
-    // cancelling an abandoned order, which restocks it — see
-    // orders.service.js updateStatus). A gateway callback can arrive late or
-    // be redelivered well after that happens. Blindly setting status:
-    // 'CONFIRMED' here would resurrect a CANCELLED order — reversing the
-    // ORDER_TRANSITIONS state machine's rule that CANCELLED is terminal —
-    // while the stock it freed stays sold. The payment itself is still
-    // marked SUCCESS above (money was genuinely captured), it just no
-    // longer auto-confirms an order that has moved on; that needs manual
-    // reconciliation/refund, not a silent state-machine violation.
-    const claim = await prisma.order.updateMany({ where: { id: payment.orderId, status: 'PENDING' }, data: { status: 'CONFIRMED' } });
-    if (claim.count === 0) {
+    if (orderClaimCount === 0) {
       logger.error(`Gateway payment ${payment.id} succeeded for order ${order.orderNumber} but the order is no longer PENDING (now ${order.status}) — order left as-is, needs manual reconciliation`);
     }
     await pushNotification({ icon: 'i-wallet', text: `پرداخت سفارش ${order.orderNumber} با موفقیت انجام شد`, scope: 'USER', targetUserId: order.userId });
