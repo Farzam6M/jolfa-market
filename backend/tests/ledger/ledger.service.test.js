@@ -764,6 +764,19 @@ describe('postPayoutReserve', () => {
     const sellerId = crypto.randomUUID();
     createdEventIds.push(['PAYOUT_RESERVE', eventId]);
 
+    // PAYOUT_CLEARING is a platform-wide singleton shared with every other
+    // test in this describe block (and with postPayoutRelease/
+    // postPayoutProcessed below), so — same reasoning/pattern as
+    // postPayoutProcessed's "processing moves the cached balance" test —
+    // this asserts a relative delta (before -> after) rather than an
+    // absolute balance. SELLER_WALLET is per-seller with a fresh
+    // crypto.randomUUID() each test, so it legitimately starts at 0 and an
+    // absolute assertion is fine for it.
+    const { clearing: clearingBeforeAccount } = await trackAccounts(sellerId);
+    const clearingBefore = clearingBeforeAccount
+      ? new Prisma.Decimal((await prisma.account.findUnique({ where: { id: clearingBeforeAccount.id } })).balance)
+      : new Prisma.Decimal(0);
+
     await withTx((tx) => postPayoutReserve(tx, {
       eventId, currency: 'TMN', sellerId, amount: '1200',
     }));
@@ -772,7 +785,7 @@ describe('postPayoutReserve', () => {
     const refreshedClearing = await prisma.account.findUnique({ where: { id: clearing.id } });
     const refreshedSeller = await prisma.account.findUnique({ where: { id: seller.id } });
     expect(new Prisma.Decimal(refreshedSeller.balance).equals(new Prisma.Decimal('-1200'))).toBe(true);
-    expect(new Prisma.Decimal(refreshedClearing.balance).equals(new Prisma.Decimal('1200'))).toBe(true);
+    expect(new Prisma.Decimal(refreshedClearing.balance).equals(clearingBefore.plus('1200'))).toBe(true);
   });
 });
 
@@ -904,6 +917,18 @@ describe('postPayoutRelease', () => {
     const sellerId = crypto.randomUUID();
     createdEventIds.push(['PAYOUT_RELEASE', eventId]);
 
+    // PAYOUT_CLEARING is a platform-wide singleton shared with every other
+    // test in this file that touches it (postPayoutReserve above,
+    // postPayoutProcessed below), so — same delta pattern as
+    // postPayoutProcessed's "processing moves the cached balance" test —
+    // this asserts relative to its balance immediately before this test's
+    // own posting, not an absolute value. SELLER_WALLET is per-seller with
+    // a fresh crypto.randomUUID() each test and legitimately starts at 0.
+    const { clearing: clearingBeforeAccount } = await trackAccounts(sellerId);
+    const clearingBefore = clearingBeforeAccount
+      ? new Prisma.Decimal((await prisma.account.findUnique({ where: { id: clearingBeforeAccount.id } })).balance)
+      : new Prisma.Decimal(0);
+
     await withTx((tx) => postPayoutRelease(tx, {
       eventId, currency: 'TMN', sellerId, amount: '800',
     }));
@@ -911,7 +936,7 @@ describe('postPayoutRelease', () => {
 
     const refreshedClearing = await prisma.account.findUnique({ where: { id: clearing.id } });
     const refreshedSeller = await prisma.account.findUnique({ where: { id: seller.id } });
-    expect(new Prisma.Decimal(refreshedClearing.balance).equals(new Prisma.Decimal('-800'))).toBe(true);
+    expect(new Prisma.Decimal(refreshedClearing.balance).equals(clearingBefore.minus('800'))).toBe(true);
     expect(new Prisma.Decimal(refreshedSeller.balance).equals(new Prisma.Decimal('800'))).toBe(true);
   });
 
@@ -920,6 +945,19 @@ describe('postPayoutRelease', () => {
     const reserveEventId = crypto.randomUUID();
     const releaseEventId = crypto.randomUUID();
     createdEventIds.push(['PAYOUT_RESERVE', reserveEventId], ['PAYOUT_RELEASE', releaseEventId]);
+
+    // PAYOUT_CLEARING is a platform-wide singleton shared with every other
+    // test in this file that touches it, so — same delta pattern as
+    // postPayoutProcessed's "a full reserve-then-processed flow returns
+    // PAYOUT_CLEARING to its balance before the reserve" test — a full
+    // reserve+release round trip on the SAME amount must return it to
+    // whatever it was immediately before this test, not to literal 0.
+    // SELLER_WALLET is per-seller with a fresh crypto.randomUUID() each
+    // test, so a literal 0 is correct for it (starts at 0, nets to 0).
+    const { clearing: clearingBeforeAccount } = await trackAccounts(sellerId);
+    const clearingBefore = clearingBeforeAccount
+      ? new Prisma.Decimal((await prisma.account.findUnique({ where: { id: clearingBeforeAccount.id } })).balance)
+      : new Prisma.Decimal(0);
 
     await withTx((tx) => postPayoutReserve(tx, {
       eventId: reserveEventId, currency: 'TMN', sellerId, amount: '3300',
@@ -931,7 +969,7 @@ describe('postPayoutRelease', () => {
 
     const refreshedClearing = await prisma.account.findUnique({ where: { id: clearing.id } });
     const refreshedSeller = await prisma.account.findUnique({ where: { id: seller.id } });
-    expect(new Prisma.Decimal(refreshedClearing.balance).equals(new Prisma.Decimal('0'))).toBe(true);
+    expect(new Prisma.Decimal(refreshedClearing.balance).equals(clearingBefore)).toBe(true);
     expect(new Prisma.Decimal(refreshedSeller.balance).equals(new Prisma.Decimal('0'))).toBe(true);
   });
 });
