@@ -97,15 +97,21 @@ const LEDGER_CURRENCY = 'TMN';
 //
 // LIABILITY_RECOVERY (payout-liabilities.service.js#recoverSellerLiabilities,
 // called from orders.service.js#settleDeliveredOrder before that
-// settlement's own wallet credit) is also NOT included below — this is
-// the "explicitly-flagged open question" already anticipated in this
-// comment's previous revision: whether the recovered amount (which never
-// actually reaches the seller's wallet — see that function's own "no
-// gross credit-then-debit" note) should be recognized as PLATFORM_CASH,
-// PLATFORM_REVENUE, or a split of the two is not stated anywhere in this
-// repository (grepped for every relevant term across the whole backend/
-// tree — only the ledger module and schema.prisma itself mention these
-// owner types). Guessing was avoided; see the accompanying phase report.
+// settlement's own wallet credit) — RESOLVED as of P2.4 Phase 2 Step 9/10.
+// The previously open question ("PLATFORM_CASH vs PLATFORM_REVENUE vs a
+// split of the two") is now decided: the recovered amount is recognized
+// entirely as PLATFORM_CASH, not PLATFORM_REVENUE and not split. Reasoning
+// (from the approved Step 9 design, not repo-derived — same "explicitly
+// approved, not repo-derived" tier as PAYMENT_CONFIRMED/SETTLEMENT's
+// account choice above): the seller's outstanding liability is being
+// recovered from a future seller earning, so the recovered amount reduces
+// the seller's effective wallet position and simply remains with the
+// platform as cash — it is not newly earned commission, so
+// PLATFORM_REVENUE would misstate it. This is a separate Ledger event
+// with its own Journal — it is NOT folded into postSettlement, and
+// postSettlement's own DEBIT PLATFORM_CASH / CREDIT PLATFORM_REVENUE +
+// SELLER_WALLET formula (using the full, un-netted sellerEarning) is
+// unchanged by this addition.
 //
 // REFUND (P2.4 Phase 2 Step 5) IS grounded in actual repo evidence, same
 // tier as PAYOUT_RESERVE/PAYOUT_RELEASE above — not merely "the product
@@ -174,6 +180,10 @@ const EVENT_ACCOUNT_MAP = {
     creditCustomerOwnerType: 'CUSTOMER_WALLET',
     debitSellerOwnerType: 'SELLER_WALLET',
     debitRevenueOwnerType: 'PLATFORM_REVENUE',
+  },
+  LIABILITY_RECOVERY: {
+    debitOwnerType: 'SELLER_WALLET',
+    creditOwnerType: 'PLATFORM_CASH',
   },
 };
 

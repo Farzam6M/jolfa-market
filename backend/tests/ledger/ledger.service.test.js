@@ -11,14 +11,16 @@
  * These tests exercise the two generic primitives (getOrCreateAccount and
  * postJournal: leg balance validation, idempotency, and — per
  * schema.prisma's Account.balance doc — the cached per-account balance
- * this posting service maintains) plus the six event wrappers implemented
- * so far: postPaymentConfirmed, postSettlement, postPayoutReserve /
- * postPayoutRelease (P2.4 Phase 2 Step 4), postRefund (P2.4 Phase 2 Step 5,
- * no-shortfall path only), and — added in P2.4 Phase 2 Step 7 —
- * postPayoutProcessed. One wrapper remains NOT implemented
- * (postLiabilityRecovery — see the P2.4 Phase 2 Step 4 report for why it
- * was audited and found genuinely unresolvable from repo evidence), so
- * there is no coverage for it here.
+ * this posting service maintains) plus the seven event wrappers
+ * implemented so far: postPaymentConfirmed, postSettlement,
+ * postPayoutReserve / postPayoutRelease (P2.4 Phase 2 Step 4), postRefund
+ * (P2.4 Phase 2 Step 5, no-shortfall path only), postPayoutProcessed
+ * (P2.4 Phase 2 Step 7), and — added in P2.4 Phase 2 Step 10 —
+ * postLiabilityRecovery. This step only tests the standalone Ledger
+ * wrapper itself; postLiabilityRecovery is not yet wired into
+ * payout-liabilities.service.js#recoverSellerLiabilities (deferred to a
+ * future phase), so there is no business-flow coverage for that wiring
+ * here.
  *
  * Uses random UUIDs for every ownerId/eventId so repeated runs never
  * collide, and cleans up exactly the rows it created in `afterAll` —
@@ -35,7 +37,7 @@ const crypto = require('crypto');
 const { Prisma } = require('@prisma/client');
 const { prisma } = require('../../src/config/database');
 const {
-  getOrCreateAccount, postJournal, postPaymentConfirmed, postSettlement, postPayoutReserve, postPayoutRelease, postPayoutProcessed, postRefund,
+  getOrCreateAccount, postJournal, postPaymentConfirmed, postSettlement, postPayoutReserve, postPayoutRelease, postPayoutProcessed, postRefund, postLiabilityRecovery,
 } = require('../../src/modules/ledger/ledger.service');
 const { PLATFORM_LEDGER_OWNER_ID } = require('../../src/modules/ledger/ledger.constants');
 
@@ -1373,5 +1375,194 @@ describe('postRefund', () => {
     expect(entryRows).toHaveLength(2);
     expect(entryRows.some((e) => e.account.ownerType === 'SELLER_WALLET')).toBe(false);
     expect(entryRows.some((e) => e.account.ownerType === 'PLATFORM_REVENUE')).toBe(true);
+  });
+});
+
+describe('postLiabilityRecovery', () => {
+  async function trackAccounts(sellerId, currency = 'TMN') {
+    const seller = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'SELLER_WALLET', ownerId: sellerId, currency } },
+    });
+    const cash = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'PLATFORM_CASH', ownerId: PLATFORM_LEDGER_OWNER_ID, currency } },
+    });
+    if (seller) createdAccountIds.push(seller.id);
+    if (cash) createdAccountIds.push(cash.id);
+    return { seller, cash };
+  }
+
+  test('successful posting: one Journal, 2 entries, correct eventType/eventId/accounts/directions/amount', async () => {
+    const sellerId = crypto.randomUUID();
+    const eventId = `${crypto.randomUUID()}:${crypto.randomUUID()}`; // ${orderItemSettlement.id}:${liability.id}
+    createdEventIds.push(['LIABILITY_RECOVERY', eventId]);
+
+    const result = await withTx((tx) => postLiabilityRecovery(tx, {
+      eventId, actorId: null, currency: 'TMN', sellerId, amount: '3000',
+    }));
+    await trackAccounts(sellerId);
+
+    expect(result.idempotentReplay).toBe(false);
+
+    const journalRow = await prisma.journal.findUnique({ where: { id: result.journal.id } });
+    expect(journalRow.eventType).toBe('LIABILITY_RECOVERY');
+    expect(journalRow.eventId).toBe(eventId);
+
+    const entryRows = await prisma.ledgerEntry.findMany({
+      where: { journalId: result.journal.id },
+      include: { account: true },
+    });
+    expect(entryRows).toHaveLength(2);
+
+    const debitEntry = entryRows.find((e) => e.direction === 'DEBIT');
+    const creditEntry = entryRows.find((e) => e.direction === 'CREDIT');
+    expect(debitEntry.account.ownerType).toBe('SELLER_WALLET');
+    expect(debitEntry.account.ownerId).toBe(sellerId);
+    expect(creditEntry.account.ownerType).toBe('PLATFORM_CASH');
+    expect(creditEntry.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(new Prisma.Decimal(debitEntry.amount).equals(new Prisma.Decimal('3000'))).toBe(true);
+    expect(new Prisma.Decimal(creditEntry.amount).equals(new Prisma.Decimal('3000'))).toBe(true);
+  });
+
+  test('SELLER_WALLET and PLATFORM_CASH are not duplicated across multiple recoveries with different eventIds', async () => {
+    const sellerId = crypto.randomUUID();
+    const firstEventId = `${crypto.randomUUID()}:${crypto.randomUUID()}`;
+    const secondEventId = `${crypto.randomUUID()}:${crypto.randomUUID()}`;
+    createdEventIds.push(['LIABILITY_RECOVERY', firstEventId], ['LIABILITY_RECOVERY', secondEventId]);
+
+    await withTx((tx) => postLiabilityRecovery(tx, {
+      eventId: firstEventId, currency: 'TMN', sellerId, amount: '500',
+    }));
+    const first = await trackAccounts(sellerId);
+
+    await withTx((tx) => postLiabilityRecovery(tx, {
+      eventId: secondEventId, currency: 'TMN', sellerId, amount: '750',
+    }));
+    const second = await trackAccounts(sellerId);
+
+    expect(second.seller.id).toBe(first.seller.id);
+    expect(second.cash.id).toBe(first.cash.id);
+
+    const sellerRows = await prisma.account.findMany({
+      where: { ownerType: 'SELLER_WALLET', ownerId: sellerId, currency: 'TMN' },
+    });
+    expect(sellerRows).toHaveLength(1);
+    const cashRows = await prisma.account.findMany({
+      where: { ownerType: 'PLATFORM_CASH', ownerId: PLATFORM_LEDGER_OWNER_ID, currency: 'TMN' },
+    });
+    expect(cashRows).toHaveLength(1);
+  });
+
+  test('idempotent: same eventId twice leaves exactly one Journal, two entries, and does not double-apply balance', async () => {
+    const sellerId = crypto.randomUUID();
+    const eventId = `${crypto.randomUUID()}:${crypto.randomUUID()}`;
+    createdEventIds.push(['LIABILITY_RECOVERY', eventId]);
+
+    const args = {
+      eventId, currency: 'TMN', sellerId, amount: '1200',
+    };
+
+    const first = await withTx((tx) => postLiabilityRecovery(tx, args));
+    const { seller, cash } = await trackAccounts(sellerId);
+    expect(first.idempotentReplay).toBe(false);
+
+    const balancesAfterFirst = {
+      seller: (await prisma.account.findUnique({ where: { id: seller.id } })).balance,
+      cash: (await prisma.account.findUnique({ where: { id: cash.id } })).balance,
+    };
+
+    const second = await withTx((tx) => postLiabilityRecovery(tx, args));
+    expect(second.idempotentReplay).toBe(true);
+    expect(second.journal.id).toBe(first.journal.id);
+
+    const journalRows = await prisma.journal.findMany({ where: { eventType: 'LIABILITY_RECOVERY', eventId } });
+    expect(journalRows).toHaveLength(1);
+    const entryRows = await prisma.ledgerEntry.findMany({ where: { journalId: first.journal.id } });
+    expect(entryRows).toHaveLength(2); // not 4
+
+    const balancesAfterSecond = {
+      seller: (await prisma.account.findUnique({ where: { id: seller.id } })).balance,
+      cash: (await prisma.account.findUnique({ where: { id: cash.id } })).balance,
+    };
+    expect(new Prisma.Decimal(balancesAfterSecond.seller).equals(new Prisma.Decimal(balancesAfterFirst.seller))).toBe(true);
+    expect(new Prisma.Decimal(balancesAfterSecond.cash).equals(new Prisma.Decimal(balancesAfterFirst.cash))).toBe(true);
+  });
+
+  test('preserves exact Decimal precision for a high-precision recovered amount', async () => {
+    const sellerId = crypto.randomUUID();
+    const eventId = `${crypto.randomUUID()}:${crypto.randomUUID()}`;
+    createdEventIds.push(['LIABILITY_RECOVERY', eventId]);
+
+    const result = await withTx((tx) => postLiabilityRecovery(tx, {
+      eventId, currency: 'TMN', sellerId, amount: '123456789012',
+    }));
+    await trackAccounts(sellerId);
+
+    const entryRows = await prisma.ledgerEntry.findMany({ where: { journalId: result.journal.id } });
+    entryRows.forEach((entry) => {
+      expect(new Prisma.Decimal(entry.amount).equals(new Prisma.Decimal('123456789012'))).toBe(true);
+    });
+  });
+
+  test('recovery moves the cached balance: SELLER_WALLET decreases, PLATFORM_CASH increases by the same amount', async () => {
+    const sellerId = crypto.randomUUID();
+    const eventId = `${crypto.randomUUID()}:${crypto.randomUUID()}`;
+    createdEventIds.push(['LIABILITY_RECOVERY', eventId]);
+
+    // PLATFORM_CASH is a platform-wide singleton shared with the other
+    // suites above, so this asserts a relative delta (before -> after)
+    // rather than an absolute balance, same reasoning as
+    // postPayoutProcessed's balance-movement test.
+    const { seller: sellerBeforeAccount, cash: cashBeforeAccount } = await trackAccounts(sellerId);
+    const sellerBefore = sellerBeforeAccount
+      ? new Prisma.Decimal((await prisma.account.findUnique({ where: { id: sellerBeforeAccount.id } })).balance)
+      : new Prisma.Decimal(0);
+    const cashBefore = cashBeforeAccount
+      ? new Prisma.Decimal((await prisma.account.findUnique({ where: { id: cashBeforeAccount.id } })).balance)
+      : new Prisma.Decimal(0);
+
+    await withTx((tx) => postLiabilityRecovery(tx, {
+      eventId, currency: 'TMN', sellerId, amount: '600',
+    }));
+    const { seller, cash } = await trackAccounts(sellerId);
+
+    const refreshedSeller = await prisma.account.findUnique({ where: { id: seller.id } });
+    const refreshedCash = await prisma.account.findUnique({ where: { id: cash.id } });
+    expect(new Prisma.Decimal(refreshedSeller.balance).equals(sellerBefore.minus('600'))).toBe(true);
+    expect(new Prisma.Decimal(refreshedCash.balance).equals(cashBefore.plus('600'))).toBe(true);
+  });
+
+  test('partial recovery semantics: the wrapper posts exactly the supplied recoveredAmount, not the full liability', async () => {
+    const sellerId = crypto.randomUUID();
+    // Simulates a larger outstanding SellerPayoutLiability (e.g. 10000)
+    // being partially recovered across two settlements — this wrapper
+    // never computes or looks up the liability total itself, it only
+    // posts whatever amount it is given for this one occurrence.
+    const liabilityId = crypto.randomUUID();
+    const firstSettlementId = crypto.randomUUID();
+    const secondSettlementId = crypto.randomUUID();
+    const firstEventId = `${firstSettlementId}:${liabilityId}`;
+    const secondEventId = `${secondSettlementId}:${liabilityId}`;
+    createdEventIds.push(['LIABILITY_RECOVERY', firstEventId], ['LIABILITY_RECOVERY', secondEventId]);
+
+    const firstResult = await withTx((tx) => postLiabilityRecovery(tx, {
+      eventId: firstEventId, currency: 'TMN', sellerId, amount: '4000',
+    }));
+    const secondResult = await withTx((tx) => postLiabilityRecovery(tx, {
+      eventId: secondEventId, currency: 'TMN', sellerId, amount: '6000',
+    }));
+    await trackAccounts(sellerId);
+
+    const firstEntries = await prisma.ledgerEntry.findMany({ where: { journalId: firstResult.journal.id } });
+    const secondEntries = await prisma.ledgerEntry.findMany({ where: { journalId: secondResult.journal.id } });
+
+    firstEntries.forEach((entry) => {
+      expect(new Prisma.Decimal(entry.amount).equals(new Prisma.Decimal('4000'))).toBe(true);
+    });
+    secondEntries.forEach((entry) => {
+      expect(new Prisma.Decimal(entry.amount).equals(new Prisma.Decimal('6000'))).toBe(true);
+    });
+    // Two distinct Journals — one per (settlement, liability) occurrence —
+    // sharing the same liabilityId but not the same eventId.
+    expect(firstResult.journal.id).not.toBe(secondResult.journal.id);
   });
 });

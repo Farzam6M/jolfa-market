@@ -19,7 +19,7 @@
  *     this phase's responsibility, independent of the still-undocumented
  *     per-event leg mapping).
  *
- * Six event wrappers are implemented so far: postPaymentConfirmed (using
+ * Seven event wrappers are implemented so far: postPaymentConfirmed (using
  * the PAYMENT_GATEWAY_CLEARING -> PLATFORM_CASH mapping supplied directly
  * by the product owner, not repo-derived), postSettlement (using the
  * PLATFORM_CASH -> PLATFORM_REVENUE + SELLER_WALLET split, whose account
@@ -33,20 +33,22 @@
  * PLATFORM_REVENUE mapping is likewise fully repo-derived: it mirrors
  * orders.service.js#refundDeliveredOrder's real customer-credit and
  * no-shortfall seller-wallet-decrement mutations exactly, and reverses
- * SETTLEMENT's own CREDIT PLATFORM_REVENUE leg, and — added in P2.4 Phase 2
- * Step 7 — postPayoutProcessed, using the PAYOUT_CLEARING -> PLATFORM_CASH
- * mapping supplied directly by the product owner for this step (Step 4
- * audited this event and found it genuinely unresolvable from repo evidence
- * alone; see ledger.constants.js's EVENT_ACCOUNT_MAP comment).
+ * SETTLEMENT's own CREDIT PLATFORM_REVENUE leg, postPayoutProcessed (P2.4
+ * Phase 2 Step 7), using the PAYOUT_CLEARING -> PLATFORM_CASH mapping
+ * supplied directly by the product owner for that step (Step 4 audited
+ * this event and found it genuinely unresolvable from repo evidence
+ * alone; see ledger.constants.js's EVENT_ACCOUNT_MAP comment), and — added
+ * in P2.4 Phase 2 Step 10 — postLiabilityRecovery, using the SELLER_WALLET
+ * -> PLATFORM_CASH mapping approved in the Step 9 design reconciliation
+ * (the previously open PLATFORM_CASH-vs-PLATFORM_REVENUE question is now
+ * resolved; see ledger.constants.js's EVENT_ACCOUNT_MAP comment).
  *
- * One wrapper remains NOT implemented: postLiabilityRecovery. It was
- * audited in Step 4 and found genuinely unresolvable from repo evidence —
- * literally zero repo mentions of which PLATFORM_* account, if any,
- * receives a recovered amount. See ledger.constants.js's EVENT_ACCOUNT_MAP
- * comment and the Step 4 phase report for the full reasoning.
- * postRefund's own shortfall path (SellerPayoutLiability) is also
- * deliberately out of scope for this step — see postRefund's own doc
- * comment.
+ * postLiabilityRecovery is a standalone Ledger wrapper only in this step —
+ * it is not yet called from payout-liabilities.service.js#
+ * recoverSellerLiabilities or anywhere else in the business layer. That
+ * wiring is deferred to a future phase. postRefund's own shortfall path
+ * (SellerPayoutLiability) is likewise still out of scope — see postRefund's
+ * own doc comment.
  */
 
 const { Prisma } = require('@prisma/client');
@@ -706,6 +708,80 @@ async function postRefund(tx, {
   });
 }
 
+/**
+ * Thin semantic wrapper over postJournal for the LIABILITY_RECOVERY event.
+ *
+ * A separate Ledger event with its own Journal — deliberately NOT folded
+ * into postSettlement (see this function's own contract below and
+ * postSettlement's unchanged doc comment above). Per the approved P2.4
+ * Phase 2 Step 9 design reconciliation, the existing business-level
+ * SellerPayoutLiability model and its recovery logic
+ * (payout-liabilities.service.js#recoverSellerLiabilities) are unchanged
+ * by this wrapper — this step adds no new Ledger account type such as a
+ * SELLER_PAYOUT_LIABILITY owner type, and this wrapper is not called from
+ * that business logic yet (deferred to a future wiring phase).
+ *
+ * Posts:
+ *   DEBIT  SELLER_WALLET (sellerId)   amount
+ *   CREDIT PLATFORM_CASH (PLATFORM)   amount
+ * per ledger.constants.js's EVENT_ACCOUNT_MAP.LIABILITY_RECOVERY. The
+ * seller's outstanding liability is being recovered from a future seller
+ * earning, so the recovered amount reduces the seller's effective wallet
+ * position (DEBIT SELLER_WALLET) and remains with the platform as cash
+ * (CREDIT PLATFORM_CASH) rather than newly earned commission — this is the
+ * previously open PLATFORM_CASH-vs-PLATFORM_REVENUE question, now resolved
+ * (see ledger.constants.js's EVENT_ACCOUNT_MAP comment for the full
+ * reasoning).
+ *
+ * This wrapper does not compute or look up the liability amount itself —
+ * it simply posts whatever `amount` the caller supplies (e.g. a partial
+ * recovery of a larger SellerPayoutLiability across multiple settlements).
+ * Any liability-balance bookkeeping remains entirely the business layer's
+ * responsibility (SellerPayoutLiability, untouched by this step).
+ *
+ * `eventId` is expected to be the deterministic composite
+ * `${orderItemSettlement.id}:${liability.id}` — NOT liability.id alone —
+ * since a single SellerPayoutLiability can be partially recovered across
+ * multiple settlements, and each (settlement, liability) recovery
+ * occurrence needs its own idempotency key.
+ *
+ * Same "operates inside the caller's transaction, opens none of its own"
+ * contract as getOrCreateAccount/postJournal/the other wrappers. All
+ * idempotency (including not double-applying the Account.balance update
+ * on replay) is handled by postJournal itself via (eventType, eventId) —
+ * this wrapper adds no idempotency logic of its own.
+ *
+ * @param {import('@prisma/client').Prisma.TransactionClient} tx
+ * @param {object} params
+ * @param {string} params.eventId - `${orderItemSettlement.id}:${liability.id}`
+ * @param {string|null} [params.actorId]
+ * @param {string} [params.currency]
+ * @param {string} params.sellerId - the seller's User.id (== Store.sellerId)
+ * @param {string|number|Prisma.Decimal} params.amount - the recoveredAmount for this occurrence
+ * @returns {Promise<{journal: object, entries: object[], idempotentReplay: boolean}>}
+ */
+async function postLiabilityRecovery(tx, {
+  eventId, actorId = null, currency = LEDGER_CURRENCY, sellerId, amount,
+}) {
+  if (!sellerId) throw ApiError.internal('postLiabilityRecovery requires sellerId');
+
+  const mapping = EVENT_ACCOUNT_MAP.LIABILITY_RECOVERY;
+
+  const sellerAccount = await getOrCreateAccount(tx, mapping.debitOwnerType, sellerId, currency);
+  const cashAccount = await getOrCreateAccount(tx, mapping.creditOwnerType, PLATFORM_LEDGER_OWNER_ID, currency);
+
+  return postJournal(tx, {
+    eventType: 'LIABILITY_RECOVERY',
+    eventId,
+    actorId,
+    currency,
+    legs: [
+      { accountId: sellerAccount.id, direction: 'DEBIT', amount },
+      { accountId: cashAccount.id, direction: 'CREDIT', amount },
+    ],
+  });
+}
+
 module.exports = {
   getOrCreateAccount,
   postJournal,
@@ -715,4 +791,5 @@ module.exports = {
   postPayoutRelease,
   postPayoutProcessed,
   postRefund,
+  postLiabilityRecovery,
 };
