@@ -1,0 +1,26 @@
+-- Widen ledger_accounts.balance from DECIMAL(12,0) to DECIMAL(20,0).
+--
+-- Root cause: ledger_accounts.balance is a cached running SUM(CREDIT) -
+-- SUM(DEBIT) across an account's LedgerEntry rows (see schema.prisma's
+-- Account.balance comment), maintained by incrementing/decrementing it once
+-- per posted leg (ledger.service.js#postJournal). Every individual leg
+-- amount is correctly bounded to DECIMAL(12,0) (the project's whole-Toman
+-- monetary convention, matching ledger_entries.amount and every other
+-- money column in this schema), but a column that accumulates an unbounded
+-- number of such amounts over an account's lifetime needs more headroom
+-- than any single addend — DECIMAL(12,0) caps the cached balance at the
+-- same range as one transaction, so accounts that accumulate multiple
+-- large postings (e.g. shared platform-owned accounts) legitimately
+-- overflow it ("numeric field overflow ... precision 12, scale 0").
+--
+-- Fix: only the cached balance column's precision changes, keeping
+-- scale = 0 (the project's whole-Toman, no-fractional-subunit convention
+-- documented on Account.currency). No LedgerEntry/amount column, no other
+-- model, and no Ledger business logic is touched.
+--
+-- Purely widening a NUMERIC column's precision is a safe, non-destructive
+-- ALTER — existing values already fit in DECIMAL(12,0) subset of
+-- DECIMAL(20,0), so this is a metadata-only change with no data rewrite,
+-- no truncation, and no dropped rows.
+ALTER TABLE "ledger_accounts"
+  ALTER COLUMN "balance" TYPE DECIMAL(20,0);

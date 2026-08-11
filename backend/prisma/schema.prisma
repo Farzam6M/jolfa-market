@@ -1018,12 +1018,18 @@ model Account {
   currency  String                 @default("TMN")
   status    LedgerAccountStatus    @default(ACTIVE)
   // Cached/materialized balance (design doc §5, §11.5): SUM(CREDIT) -
-  // SUM(DEBIT) of this account's LedgerEntry rows. NOT written by anything
-  // in this phase — no posting logic exists yet, so every row's balance
-  // stays at its default 0 until a later phase's posting service starts
-  // maintaining it transactionally alongside each LedgerEntry insert (the
-  // same atomic-cache-update discipline Wallet.balance already uses).
-  balance   Decimal                @default(0) @db.Decimal(12, 0)
+  // SUM(DEBIT) of this account's LedgerEntry rows, maintained
+  // transactionally alongside each LedgerEntry insert (the same
+  // atomic-cache-update discipline Wallet.balance already uses).
+  // Deliberately wider than LedgerEntry.amount/Decimal(12,0): a single
+  // leg's amount is bounded to that range, but this column accumulates
+  // an unbounded number of legs over the account's lifetime, so it needs
+  // headroom beyond any single addend, not just room for one transaction.
+  // Decimal(20,0) keeps the project's scale=0 whole-Toman convention while
+  // giving ~10^8x headroom over the largest possible single leg amount —
+  // comfortably enough for realistic lifetime accumulation without
+  // resorting to an arbitrary/oversized precision.
+  balance   Decimal                @default(0) @db.Decimal(20, 0)
   createdAt DateTime               @default(now())
   updatedAt DateTime               @updatedAt
 
