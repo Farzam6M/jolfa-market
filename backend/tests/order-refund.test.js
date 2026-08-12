@@ -601,18 +601,36 @@ describe('Delivered-order refund (settlement clawback)', () => {
   });
 
   test('in a multi-seller refund, one seller\'s shortfall never affects the OTHER seller\'s normal debit', async () => {
+    // Isolated seller/store/product fixture for the "seller1" role — `seller`
+    // is shared across every other test in this describe block and, by the
+    // time this test runs, may already carry an OUTSTANDING
+    // SellerPayoutLiability from an earlier shortfall test.
+    // recoverSellerLiabilities correctly consumes a seller's NEXT settlement
+    // against any such liability before crediting their wallet (see
+    // orders.service.js#settleDeliveredOrder) — so reusing the shared
+    // `seller` here would non-deterministically zero out the wallet this
+    // test expects to see debited normally, even though this test never
+    // touches that liability itself. A dedicated seller with no liability
+    // history keeps this test about the multi-seller shortfall isolation
+    // it's actually named for (mirrors the `withdrawSeller` isolation used
+    // a few tests down for the same reason).
+    const sellerA = await makeUser('SELLER', '54140000' + Math.floor(Math.random() * 9));
+    await prisma.wallet.create({ data: { userId: sellerA.user.id } });
+    await makeApprovedStore(sellerA.user.id, 'فروشگاه استرداد چندفروشنده');
+    const productA = await makeApprovedProduct(sellerA.auth, admin.auth, category.id, { price: 100000, stock: 100 });
+
     const order = await addToCartAndCheckout(customer.auth, [
-      { storeProduct: product, qty: 1 },
+      { storeProduct: productA, qty: 1 },
       { storeProduct: product2, qty: 1 },
     ]);
     await payWallet(customer.auth, order.id);
     await advanceToDelivered(order.id, admin.auth);
     const orderWithItems = await prisma.order.findUnique({ where: { id: order.id }, include: { items: true } });
-    const item1 = orderWithItems.items.find((i) => i.storeId === product.storeId);
+    const item1 = orderWithItems.items.find((i) => i.storeId === productA.storeId);
     const item2 = orderWithItems.items.find((i) => i.storeId === product2.storeId);
     const settlement1 = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item1.id } });
 
-    const seller1WalletBefore = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+    const seller1WalletBefore = await prisma.wallet.findUnique({ where: { userId: sellerA.user.id } });
     // seller1 can afford it; seller2 cannot.
     await prisma.wallet.update({ where: { userId: seller2.user.id }, data: { balance: 0 } });
 
@@ -620,13 +638,13 @@ describe('Delivered-order refund (settlement clawback)', () => {
       .send({ items: [{ orderItemId: item1.id, qty: 1 }, { orderItemId: item2.id, qty: 1 }] });
     expect(res.status).toBe(200); // the whole refund succeeds — seller2's shortfall no longer blocks seller1's normal debit
 
-    const seller1WalletAfter = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+    const seller1WalletAfter = await prisma.wallet.findUnique({ where: { userId: sellerA.user.id } });
     expect(Number(seller1WalletAfter.balance)).toBe(Number(seller1WalletBefore.balance) - Number(settlement1.sellerEarning)); // seller1 debited normally, in full
 
     const seller2Wallet = await prisma.wallet.findUnique({ where: { userId: seller2.user.id } });
     expect(Number(seller2Wallet.balance)).toBe(0); // seller2 drained, never negative
 
-    const liability1 = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: order.id, sellerId: seller.user.id } });
+    const liability1 = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: order.id, sellerId: sellerA.user.id } });
     expect(liability1).toBeNull(); // seller1 had no shortfall
 
     const liability2 = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: order.id, sellerId: seller2.user.id } });
