@@ -101,6 +101,12 @@ function assertIdempotentOrThrowInvalidTransition(payoutRequest, toState) {
  * liability total. Caught below and turned into the same 409 convention
  * refundDeliveredOrder already uses for this exact class of race.
  */
+// RC-B: max attempts for the WHOLE createPayout transaction when it aborts
+// with a Serializable conflict (Prisma P2034). Only P2034 triggers a
+// retry — validation errors, insufficient balance, and idempotency-key
+// duplicates are never retried (see the catch block below).
+const P2034_MAX_ATTEMPTS = 3;
+
 async function createPayout(sellerId, payload, actor) {
   const idempotencyKey = payload.idempotencyKey || crypto.randomUUID();
 
@@ -110,87 +116,114 @@ async function createPayout(sellerId, payload, actor) {
     return existing; // Idempotent replay — no second reservation, no duplicate row.
   }
 
-  try {
-    return await prisma.$transaction(async (tx) => {
-      const payoutRequest = await tx.payoutRequest.create({
-        data: {
+  // RC-B: the entire transaction is retried from scratch on P2034 — never
+  // just a part of it. Each attempt is a brand-new prisma.$transaction
+  // call, so a prior aborted attempt (which Postgres/Prisma guarantees
+  // rolled back everything: the payoutRequest row, the wallet debit, the
+  // ledger posting, the walletTransaction row) leaves nothing behind for
+  // the next attempt to collide with or duplicate. The idempotencyKey is
+  // reused across attempts, so if an earlier attempt's create() somehow
+  // did commit before the abort (it can't — abort rolls back the whole
+  // tx) there would be a P2002, which is handled the same way it already
+  // is below regardless of which attempt raised it.
+  for (let attempt = 1; attempt <= P2034_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      return await prisma.$transaction(async (tx) => {
+        const payoutRequest = await tx.payoutRequest.create({
+          data: {
+            sellerId,
+            amount: payload.amount,
+            idempotencyKey,
+            bankAccountHolder: payload.bankAccountHolder,
+            bankIban: payload.bankIban,
+            bankCardNumber: payload.bankCardNumber || null,
+            bankName: payload.bankName || null,
+            requestedById: actor.id,
+          },
+        });
+
+        // Phase 6: read INSIDE this Serializable transaction — see
+        // function-level comment above for why this can't be a plain
+        // pre-transaction read.
+        const outstandingLiabilityTotal = await getOutstandingLiabilityTotal(tx, sellerId);
+
+        // Atomic reserve: debit only succeeds if the wallet exists AND has
+        // enough balance to cover both this withdrawal AND every
+        // outstanding liability (balance >= amount + outstandingLiabilityTotal
+        // <=> withdrawableAmount = balance - outstandingLiabilityTotal >=
+        // amount) — see function-level comment above. When
+        // outstandingLiabilityTotal is 0 this is exactly the pre-Phase-6
+        // check, unchanged.
+        const debited = await tx.wallet.updateMany({
+          where: { userId: sellerId, balance: { gte: Number(payload.amount) + outstandingLiabilityTotal } },
+          data: { balance: { decrement: payload.amount } },
+        });
+        if (debited.count !== 1) {
+          // Same existing error/convention for both "not enough balance at
+          // all" and "enough balance but some of it is reserved for an
+          // outstanding liability" — no new error system, per Phase 6 spec.
+          // A business-level failure, NEVER retried (see catch below).
+          throw ApiError.badRequest('موجودی کیف پول برای برداشت کافی نیست');
+        }
+
+        // Ledger — PAYOUT_RESERVE: mirrors the wallet debit above exactly,
+        // in the SAME transaction. eventId = PayoutRequest.id (see
+        // ledger.service.js#postPayoutReserve's own doc).
+        await postPayoutReserve(tx, {
+          eventId: payoutRequest.id,
+          actorId: null,
           sellerId,
           amount: payload.amount,
-          idempotencyKey,
-          bankAccountHolder: payload.bankAccountHolder,
-          bankIban: payload.bankIban,
-          bankCardNumber: payload.bankCardNumber || null,
-          bankName: payload.bankName || null,
-          requestedById: actor.id,
-        },
-      });
+        });
 
-      // Phase 6: read INSIDE this Serializable transaction — see
-      // function-level comment above for why this can't be a plain
-      // pre-transaction read.
-      const outstandingLiabilityTotal = await getOutstandingLiabilityTotal(tx, sellerId);
+        const wallet = await tx.wallet.findUnique({ where: { userId: sellerId } });
+        await tx.walletTransaction.create({
+          data: {
+            walletId: wallet.id,
+            type: 'DEBIT',
+            amount: payload.amount,
+            reason: `رزرو مبلغ درخواست برداشت ${payoutRequest.id}`,
+            refId: payoutRequest.id,
+          },
+        });
 
-      // Atomic reserve: debit only succeeds if the wallet exists AND has
-      // enough balance to cover both this withdrawal AND every
-      // outstanding liability (balance >= amount + outstandingLiabilityTotal
-      // <=> withdrawableAmount = balance - outstandingLiabilityTotal >=
-      // amount) — see function-level comment above. When
-      // outstandingLiabilityTotal is 0 this is exactly the pre-Phase-6
-      // check, unchanged.
-      const debited = await tx.wallet.updateMany({
-        where: { userId: sellerId, balance: { gte: Number(payload.amount) + outstandingLiabilityTotal } },
-        data: { balance: { decrement: payload.amount } },
-      });
-      if (debited.count !== 1) {
-        // Same existing error/convention for both "not enough balance at
-        // all" and "enough balance but some of it is reserved for an
-        // outstanding liability" — no new error system, per Phase 6 spec.
-        throw ApiError.badRequest('موجودی کیف پول برای برداشت کافی نیست');
+        return payoutRequest;
+      }, { isolationLevel: 'Serializable' });
+    } catch (err) {
+      // Lost the create race to a concurrent request with the SAME
+      // idempotencyKey (see function-level comment). This transaction never
+      // reached the wallet debit, so nothing was reserved on this side —
+      // just hand back the winner's row as an idempotent replay. Never
+      // retried — a duplicate key isn't a transient conflict.
+      if (err.code === 'P2002' && err.meta?.target?.includes('idempotencyKey')) {
+        // eslint-disable-next-line no-await-in-loop
+        const winner = await prisma.payoutRequest.findUnique({ where: { idempotencyKey } });
+        if (winner) {
+          if (winner.sellerId !== sellerId) throw ApiError.conflict('کلید idempotency قبلاً برای درخواست دیگری استفاده شده است');
+          return winner;
+        }
       }
-
-      // Ledger — PAYOUT_RESERVE: mirrors the wallet debit above exactly,
-      // in the SAME transaction. eventId = PayoutRequest.id (see
-      // ledger.service.js#postPayoutReserve's own doc).
-      await postPayoutReserve(tx, {
-        eventId: payoutRequest.id,
-        actorId: null,
-        sellerId,
-        amount: payload.amount,
-      });
-
-      const wallet = await tx.wallet.findUnique({ where: { userId: sellerId } });
-      await tx.walletTransaction.create({
-        data: {
-          walletId: wallet.id,
-          type: 'DEBIT',
-          amount: payload.amount,
-          reason: `رزرو مبلغ درخواست برداشت ${payoutRequest.id}`,
-          refId: payoutRequest.id,
-        },
-      });
-
-      return payoutRequest;
-    }, { isolationLevel: 'Serializable' });
-  } catch (err) {
-    // Lost the create race to a concurrent request with the SAME
-    // idempotencyKey (see function-level comment). This transaction never
-    // reached the wallet debit, so nothing was reserved on this side —
-    // just hand back the winner's row as an idempotent replay.
-    if (err.code === 'P2002' && err.meta?.target?.includes('idempotencyKey')) {
-      const winner = await prisma.payoutRequest.findUnique({ where: { idempotencyKey } });
-      if (winner) {
-        if (winner.sellerId !== sellerId) throw ApiError.conflict('کلید idempotency قبلاً برای درخواست دیگری استفاده شده است');
-        return winner;
+      // Serializable conflict (Prisma P2034) — this request lost a race with
+      // another concurrent operation touching the same seller's wallet
+      // and/or liabilities (another payout, a refund creating a new
+      // liability, a settlement recovering one). RC-B: retry the WHOLE
+      // transaction (next loop iteration, fresh state) up to
+      // P2034_MAX_ATTEMPTS times before giving up. Any other error
+      // (validation, insufficient balance, business-level) is thrown
+      // immediately without retrying.
+      if (err.code === 'P2034') {
+        if (attempt < P2034_MAX_ATTEMPTS) continue; // eslint-disable-line no-continue
+        // Final attempt still conflicted — same 409 convention as
+        // refundDeliveredOrder's identical P2034 handling; safe to retry
+        // at the HTTP level too.
+        throw ApiError.conflict('درخواست دیگری هم‌زمان روی کیف پول یا بدهی این فروشنده در حال انجام است؛ لطفاً دوباره تلاش کنید');
       }
+      throw err;
     }
-    // Serializable conflict (Prisma P2034) — this request lost a race with
-    // another concurrent operation touching the same seller's wallet
-    // and/or liabilities (another payout, a refund creating a new
-    // liability, a settlement recovering one). Same 409 convention as
-    // refundDeliveredOrder's identical P2034 handling; safe to retry.
-    if (err.code === 'P2034') throw ApiError.conflict('درخواست دیگری هم‌زمان روی کیف پول یا بدهی این فروشنده در حال انجام است؛ لطفاً دوباره تلاش کنید');
-    throw err;
   }
+  // Unreachable: the loop above always either returns or throws.
+  throw ApiError.conflict('درخواست دیگری هم‌زمان روی کیف پول یا بدهی این فروشنده در حال انجام است؛ لطفاً دوباره تلاش کنید');
 }
 
 /** Seller's own payout requests (WALLET_WITHDRAW_SELF, ownership enforced by scoping to sellerId). */
@@ -400,24 +433,59 @@ async function markProcessed(id, actor) {
  * retry on an already-FAILED row is idempotent (no second credit); any
  * other current status is an invalid transition and raises an explicit
  * error.
+ *
+ * RC-A: `failureReason` is optional at the route/validation layer (see
+ * payouts.validation.js#markFailedPayoutSchema) so that a request with an
+ * empty body can always reach this function instead of being stopped by
+ * a 400 before the state machine ever runs. Two branches:
+ *
+ *  - A non-empty `failureReason` IS provided: attempt the real atomic
+ *    claim (APPROVED -> FAILED), exactly as before — same claim/idempotent/
+ *    invalid-transition handling as every other transition in this file.
+ *  - No `failureReason` (or blank): NEVER attempt the claim/write — a
+ *    missing reason must not silently transition the row. Instead, read
+ *    the current status (no side effect either way) and let it decide:
+ *      - APPROVED: this WOULD be a genuine transition, but the mandatory
+ *        reason is missing -> 400, nothing is written.
+ *      - anything else (FAILED / REJECTED / PROCESSED / REQUESTED): same
+ *        idempotent-retry-or-invalid-transition resolution as the other
+ *        branch would have produced (an empty-body FAILED->FAILED retry
+ *        never needed to write failureReason again anyway, and an
+ *        invalid-transition call was never going to reach the write).
  */
 async function markFailed(id, failureReason, actor) {
-  const result = await prisma.$transaction(async (tx) => {
-    const claimed = await tx.payoutRequest.updateMany({
-      where: { id, status: 'APPROVED' },
-      data: {
-        status: 'FAILED', failureReason,
-      },
-    });
+  const hasReason = typeof failureReason === 'string' && failureReason.trim().length > 0;
 
-    const payoutRequest = await tx.payoutRequest.findUnique({ where: { id } });
-    if (!payoutRequest) throw ApiError.notFound('درخواست برداشت یافت نشد');
-    if (claimed.count === 0) {
-      assertIdempotentOrThrowInvalidTransition(payoutRequest, 'FAILED');
-      return payoutRequest; // Idempotent replay — already FAILED, no second credit.
+  const result = await prisma.$transaction(async (tx) => {
+    if (hasReason) {
+      const claimed = await tx.payoutRequest.updateMany({
+        where: { id, status: 'APPROVED' },
+        data: { status: 'FAILED', failureReason },
+      });
+
+      const payoutRequest = await tx.payoutRequest.findUnique({ where: { id } });
+      if (!payoutRequest) throw ApiError.notFound('درخواست برداشت یافت نشد');
+      if (claimed.count === 0) {
+        assertIdempotentOrThrowInvalidTransition(payoutRequest, 'FAILED');
+        return payoutRequest; // Idempotent replay — already FAILED, no second credit.
+      }
+
+      await releaseReservation(tx, payoutRequest, `بازگشت وجه برداشت ناموفق ${payoutRequest.id}`);
+      return payoutRequest;
     }
 
-    await releaseReservation(tx, payoutRequest, `بازگشت وجه برداشت ناموفق ${payoutRequest.id}`);
+    // No reason provided — read-only, never claims/writes.
+    const payoutRequest = await tx.payoutRequest.findUnique({ where: { id } });
+    if (!payoutRequest) throw ApiError.notFound('درخواست برداشت یافت نشد');
+    if (payoutRequest.status === 'APPROVED') {
+      // Genuine APPROVED -> FAILED transition requested, but the
+      // mandatory reason is missing. Nothing was written.
+      throw ApiError.badRequest('دلیل شکست الزامی است');
+    }
+    // Either idempotent retry (already FAILED, 200/no-op) or invalid
+    // transition (REJECTED/PROCESSED/REQUESTED, 409) — same helper as
+    // every other transition, no wallet/ledger side effect in this branch.
+    assertIdempotentOrThrowInvalidTransition(payoutRequest, 'FAILED');
     return payoutRequest;
   });
 

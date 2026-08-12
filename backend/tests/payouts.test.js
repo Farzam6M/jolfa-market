@@ -351,19 +351,33 @@ describe('Admin transitions', () => {
       return id;
     }
 
+    // RC-A: mark-failed now requires a non-empty failureReason for a
+    // genuine APPROVED -> FAILED transition (see
+    // payouts.service.js#markFailed) — this helper performs exactly that
+    // real transition, so it must supply one.
     async function freshFailed(amount = 20000) {
       const id = await freshApproved(amount);
-      await api.patch(`${PREFIX}/admin/payouts/${id}/mark-failed`).set('Authorization', admin.auth).send({});
+      await api.patch(`${PREFIX}/admin/payouts/${id}/mark-failed`).set('Authorization', admin.auth).send({ failureReason: 'test failure' });
       return id;
     }
 
+    // RC-C: `walletTransaction` rows for a payout share the SAME `refId`
+    // (the payoutRequest.id) for BOTH the DEBIT reservation (created at
+    // REQUESTED time) and the CREDIT release (created on reject/
+    // mark-failed) — see createPayout / releaseReservation. So the
+    // *total* count for a given id is naturally 2 after one successful
+    // reject or mark-failed (1 DEBIT + 1 CREDIT), not 1. The invariant
+    // this test actually cares about is narrower: a retried/duplicate
+    // reject or mark-failed must never create a SECOND release CREDIT.
+    // So we assert specifically on the CREDIT/release count instead of
+    // the raw total.
     async function expectUnchanged(id, expectedStatus, walletBefore) {
       const row = await prisma.payoutRequest.findUnique({ where: { id } });
       expect(row.status).toBe(expectedStatus);
       const walletAfter = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
       expect(Number(walletAfter.balance)).toBe(Number(walletBefore.balance));
-      const txCount = await prisma.walletTransaction.count({ where: { refId: id } });
-      return txCount;
+      const releaseCreditCount = await prisma.walletTransaction.count({ where: { refId: id, type: 'CREDIT' } });
+      return releaseCreditCount;
     }
 
     // ---- Approve ----

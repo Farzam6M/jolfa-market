@@ -29,8 +29,16 @@ const rejectPayoutSchema = z.object({
   reason: z.string().max(500).optional(),
 });
 
+// RC-A: failureReason is optional at the route/validation level so that
+// idempotent-retry (row already FAILED) and invalid-transition (row in
+// REJECTED/PROCESSED/...) requests with an empty body can reach the
+// service and be resolved by the state machine there, instead of being
+// stopped by a 400 before the service ever sees them. The "failureReason
+// is required for a genuine APPROVED -> FAILED transition" rule is
+// enforced INSIDE payouts.service.js#markFailed, where the actual current
+// state is known — see the comment there.
 const markFailedPayoutSchema = z.object({
-  failureReason: z.string().min(1, 'دلیل شکست الزامی است').max(500),
+  failureReason: z.string().min(1, 'دلیل شکست الزامی است').max(500).optional(),
 });
 
 const idParamSchema = z.object({
