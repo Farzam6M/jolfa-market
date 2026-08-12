@@ -188,6 +188,55 @@ const EVENT_ACCOUNT_MAP = {
     debitOwnerType: 'SELLER_WALLET',
     creditOwnerType: 'PLATFORM_CASH',
   },
+  // P2.4 — PAYMENT_CONFIRMED for a WALLET payment. Deliberately a SEPARATE
+  // mapping from PAYMENT_CONFIRMED above (which is GATEWAY-only, both legs
+  // platform-owned): a WALLET payment never touches PAYMENT_GATEWAY_CLEARING
+  // (no gateway is involved — the money already lived in the customer's own
+  // Wallet.balance), so its Ledger mirror is DEBIT CUSTOMER_WALLET(customerId)
+  // / CREDIT PLATFORM_CASH instead — mirroring payments.service.js#
+  // payWithWallet's real Wallet.balance debit (a decrement) exactly, fully
+  // repo-derived like PAYOUT_RESERVE/PAYOUT_RELEASE/REFUND above, not
+  // supplied externally like PAYMENT_CONFIRMED/SETTLEMENT's account choice.
+  // Both mappings post to the SAME LedgerEventType ('PAYMENT_CONFIRMED') —
+  // eventId is Payment.id either way, and a WALLET Payment.id and a GATEWAY
+  // Payment.id are always different rows, so no (eventType, eventId)
+  // collision is possible between the two.
+  PAYMENT_CONFIRMED_WALLET: {
+    debitOwnerType: 'CUSTOMER_WALLET',
+    creditOwnerType: 'PLATFORM_CASH',
+  },
+  // P2.4 — PAYMENT_REVERSED: the Ledger mirror of a PRE_DELIVERY_CANCELLATION
+  // refund (payments.service.js#refundWallet/refundGateway's required
+  // `origin` parameter) — i.e. a payment reversed before any settlement
+  // ever happened, so unlike REFUND above there is no seller/commission
+  // economics to reverse (see this file's own top-level comment and
+  // orders.service.js#markGatewayRefundProcessed's origin-based branching).
+  // Two sub-mappings, one per Payment.method this can apply to:
+  //   WALLET:  DEBIT PLATFORM_CASH / CREDIT CUSTOMER_WALLET(customerId) —
+  //            mirrors payments.service.js#refundWallet's real Wallet.balance
+  //            credit (an increment) exactly, same fully-repo-derived tier
+  //            as REFUND's CUSTOMER_WALLET leg above.
+  //   GATEWAY: DEBIT PLATFORM_CASH / CREDIT PAYMENT_GATEWAY_CLEARING — both
+  //            platform-owned, since a GATEWAY refund never touches any
+  //            CUSTOMER_WALLET-equivalent balance (payments.service.js#
+  //            refundGateway only records a REQUESTED PaymentRefund; no real
+  //            gateway API is ever called in this codebase — see that
+  //            function's own comment). Symmetric with PAYMENT_CONFIRMED's
+  //            existing DEBIT PAYMENT_GATEWAY_CLEARING / CREDIT PLATFORM_CASH
+  //            mapping above, reversed.
+  // Neither sub-mapping ever involves SELLER_WALLET or PLATFORM_REVENUE —
+  // deliberately, per the approved design: a pre-delivery cancellation has
+  // no settlement to reverse.
+  PAYMENT_REVERSED: {
+    WALLET: {
+      debitOwnerType: 'PLATFORM_CASH',
+      creditOwnerType: 'CUSTOMER_WALLET',
+    },
+    GATEWAY: {
+      debitOwnerType: 'PLATFORM_CASH',
+      creditOwnerType: 'PAYMENT_GATEWAY_CLEARING',
+    },
+  },
 };
 
 module.exports = {

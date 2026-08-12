@@ -12,16 +12,17 @@
  * truth — the Ledger has not been converted into (and does not yet
  * replace) Wallet.balance.
  *
- * COVERAGE IS NOT YET COMPLETE. Known gaps, confirmed by the P2.2 audit
- * and intentionally deferred (not fixed in P2.3):
- *   - WALLET-method payments (payments.service.js#payWithWallet) currently
- *     bypass Ledger posting entirely — only GATEWAY payments post
- *     PAYMENT_CONFIRMED.
- *   - Pre-delivery cancellation refunds (orders.service.js's CANCELLED
- *     transition) currently bypass Ledger posting — only the delivered-
- *     order refund path (refundDeliveredOrder) posts REFUND.
- * Because of these gaps, the Ledger must NOT be treated as the complete
- * financial source of truth yet.
+ * [P2.4 correction: the two gaps below are CLOSED as of P2.4.] WALLET
+ * payments now post PAYMENT_CONFIRMED via postWalletPaymentConfirmed, and
+ * pre-delivery cancellation refunds now post PAYMENT_REVERSED via
+ * postPaymentReversed (immediately for WALLET, deferred to
+ * markGatewayRefundProcessed's successful REQUESTED->PROCESSED claim for
+ * GATEWAY — see those wrappers' own doc comments). A PaymentRefund whose
+ * `origin`/`ledgerStatus` are NULL (created before P2.4) is still treated
+ * as a legacy row and deliberately skipped by automated Ledger posting —
+ * see orders.service.js#markGatewayRefundProcessed's legacy-row branch —
+ * so the Ledger is complete going forward but not retroactively for rows
+ * that predate these two columns.
  *
  * Implements the two generic, business-semantics-free primitives the P2.4
  * Phase 2 spec calls for:
@@ -62,6 +63,15 @@
  * transaction as that function's liability decrement and WalletTransaction
  * write. postRefund's own shortfall path (SellerPayoutLiability) remains
  * out of scope — see postRefund's own doc comment.
+ *
+ * P2.4 adds two more wrappers: postWalletPaymentConfirmed (WALLET-payment
+ * counterpart to postPaymentConfirmed, wired into payments.service.js#
+ * payWithWallet) and postPaymentReversed (WALLET/GATEWAY-branching
+ * PRE_DELIVERY_CANCELLATION reversal, wired into orders.service.js's
+ * CANCELLED transition and markGatewayRefundProcessed). As of P2.4,
+ * postRefund's own GATEWAY-refund posting is also deferred from refund-
+ * request time to markGatewayRefundProcessed's successful claim — see that
+ * function's own doc comment.
  */
 
 const { Prisma } = require('@prisma/client');
@@ -795,14 +805,144 @@ async function postLiabilityRecovery(tx, {
   });
 }
 
+/**
+ * Thin semantic wrapper over postJournal for the PAYMENT_CONFIRMED event —
+ * the WALLET-payment counterpart to postPaymentConfirmed above.
+ *
+ * Posts DEBIT CUSTOMER_WALLET(customerId) / CREDIT PLATFORM_CASH for
+ * `amount`, per ledger.constants.js's EVENT_ACCOUNT_MAP.PAYMENT_CONFIRMED_WALLET
+ * — see that file's comment for why this is a separate, fully repo-derived
+ * mapping from postPaymentConfirmed's GATEWAY-only one, not a variant of it.
+ *
+ * Called from payments.service.js#payWithWallet, inside the SAME transaction
+ * as that function's atomic Wallet.balance debit and Payment.create — never
+ * from confirmGateway (which remains postPaymentConfirmed-only).
+ *
+ * Same "operates inside the caller's transaction, opens none of its own"
+ * contract as the other wrappers. All idempotency (including not
+ * double-applying the Account.balance update on replay) is handled by
+ * postJournal itself via (eventType, eventId) — this wrapper adds no
+ * idempotency logic of its own. `eventId` is expected to be Payment.id
+ * (the WALLET Payment row payWithWallet just created).
+ *
+ * @param {import('@prisma/client').Prisma.TransactionClient} tx
+ * @param {object} params
+ * @param {string} params.eventId - Payment.id
+ * @param {string|null} [params.actorId]
+ * @param {string} [params.currency]
+ * @param {string} params.customerId - the paying customer's User.id
+ * @param {string|number|Prisma.Decimal} params.amount
+ * @returns {Promise<{journal: object, entries: object[], idempotentReplay: boolean}>}
+ */
+async function postWalletPaymentConfirmed(tx, {
+  eventId, actorId = null, currency = LEDGER_CURRENCY, customerId, amount,
+}) {
+  if (!customerId) throw ApiError.internal('postWalletPaymentConfirmed requires customerId');
+
+  const mapping = EVENT_ACCOUNT_MAP.PAYMENT_CONFIRMED_WALLET;
+
+  const customerAccount = await getOrCreateAccount(tx, mapping.debitOwnerType, customerId, currency);
+  const cashAccount = await getOrCreateAccount(tx, mapping.creditOwnerType, PLATFORM_LEDGER_OWNER_ID, currency);
+
+  return postJournal(tx, {
+    eventType: 'PAYMENT_CONFIRMED',
+    eventId,
+    actorId,
+    currency,
+    legs: [
+      { accountId: customerAccount.id, direction: 'DEBIT', amount },
+      { accountId: cashAccount.id, direction: 'CREDIT', amount },
+    ],
+  });
+}
+
+/**
+ * Thin semantic wrapper over postJournal for the PAYMENT_REVERSED event —
+ * a payment reversed before any settlement ever happened (origin
+ * PRE_DELIVERY_CANCELLATION only — see payments.service.js#refundWallet/
+ * refundGateway's required `origin` parameter and
+ * orders.service.js#markGatewayRefundProcessed's origin-based branching).
+ * Never used for a delivered-order refund — that remains postRefund/REFUND.
+ *
+ * `method` selects which of ledger.constants.js's
+ * EVENT_ACCOUNT_MAP.PAYMENT_REVERSED.{WALLET,GATEWAY} sub-mappings applies
+ * (see that file's comment for the reasoning behind each):
+ *   WALLET:  DEBIT PLATFORM_CASH / CREDIT CUSTOMER_WALLET(customerId) —
+ *            `customerId` is REQUIRED for this method (thrown loudly if
+ *            missing, same "fail loud rather than silently mis-post"
+ *            philosophy as refundWallet/refundGateway's required `origin`).
+ *   GATEWAY: DEBIT PLATFORM_CASH / CREDIT PAYMENT_GATEWAY_CLEARING — both
+ *            legs platform-owned; `customerId` is not needed and ignored.
+ *
+ * Called from two places, both inside the same transaction as the real
+ * money movement / status claim they mirror:
+ *   - orders.service.js#updateStatus's CANCELLED branch, WALLET-payment
+ *     path — immediately after refundWallet, same transaction (Ledger
+ *     posting is not deferred for WALLET, since the wallet credit is
+ *     immediate).
+ *   - orders.service.js#markGatewayRefundProcessed's Case A (origin
+ *     PRE_DELIVERY_CANCELLATION) — only after that function's own atomic
+ *     REQUESTED -> PROCESSED claim succeeds, since a GATEWAY reversal is
+ *     never posted at cancellation-request time (no real gateway reversal
+ *     has happened yet).
+ *
+ * Same "operates inside the caller's transaction, opens none of its own"
+ * contract as the other wrappers. All idempotency (including not
+ * double-applying the Account.balance update on replay) is handled by
+ * postJournal itself via (eventType, eventId) — this wrapper adds no
+ * idempotency logic of its own. `eventId` is expected to be Payment.id —
+ * a cancelled order's succeeded payment is refunded in full, exactly once,
+ * so (PAYMENT_REVERSED, Payment.id) is a safe, non-colliding idempotency key.
+ *
+ * @param {import('@prisma/client').Prisma.TransactionClient} tx
+ * @param {object} params
+ * @param {string} params.eventId - Payment.id
+ * @param {string|null} [params.actorId]
+ * @param {string} [params.currency]
+ * @param {'WALLET'|'GATEWAY'} params.method
+ * @param {string|null} [params.customerId] - required when method is WALLET
+ * @param {string|number|Prisma.Decimal} params.amount
+ * @returns {Promise<{journal: object, entries: object[], idempotentReplay: boolean}>}
+ */
+async function postPaymentReversed(tx, {
+  eventId, actorId = null, currency = LEDGER_CURRENCY, method, customerId = null, amount,
+}) {
+  if (method !== 'WALLET' && method !== 'GATEWAY') {
+    throw ApiError.internal('postPaymentReversed requires method WALLET or GATEWAY');
+  }
+  if (method === 'WALLET' && !customerId) {
+    throw ApiError.internal('postPaymentReversed requires customerId when method is WALLET');
+  }
+
+  const mapping = EVENT_ACCOUNT_MAP.PAYMENT_REVERSED[method];
+
+  const debitAccount = await getOrCreateAccount(tx, mapping.debitOwnerType, PLATFORM_LEDGER_OWNER_ID, currency);
+  const creditAccount = method === 'WALLET'
+    ? await getOrCreateAccount(tx, mapping.creditOwnerType, customerId, currency)
+    : await getOrCreateAccount(tx, mapping.creditOwnerType, PLATFORM_LEDGER_OWNER_ID, currency);
+
+  return postJournal(tx, {
+    eventType: 'PAYMENT_REVERSED',
+    eventId,
+    actorId,
+    currency,
+    legs: [
+      { accountId: debitAccount.id, direction: 'DEBIT', amount },
+      { accountId: creditAccount.id, direction: 'CREDIT', amount },
+    ],
+  });
+}
+
 module.exports = {
   getOrCreateAccount,
   postJournal,
   postPaymentConfirmed,
+  postWalletPaymentConfirmed,
   postSettlement,
   postPayoutReserve,
   postPayoutRelease,
   postPayoutProcessed,
   postRefund,
+  postPaymentReversed,
   postLiabilityRecovery,
 };
