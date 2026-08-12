@@ -372,9 +372,9 @@ describe('Delivered-order refund (settlement clawback)', () => {
     expect(Number(sellerWalletBefore.balance) - Number(sellerWalletAfter.balance)).toBe(Number(settlement.sellerEarning));
 
     const sellerTxs = await prisma.walletTransaction.findMany({
-      where: { walletId: sellerWalletAfter.id, reason: { contains: order.orderNumber } },
+      where: { walletId: sellerWalletAfter.id, type: 'DEBIT', reason: { contains: order.orderNumber } },
     });
-    expect(sellerTxs.length).toBe(1); // exactly one movement for this refund — none for platform commission
+    expect(sellerTxs.length).toBe(1); // exactly one DEBIT for this refund — none for platform commission
     expect(sellerTxs[0].type).toBe('DEBIT');
     expect(Number(sellerTxs[0].amount)).toBe(Number(settlement.sellerEarning));
   });
@@ -548,7 +548,21 @@ describe('Delivered-order refund (settlement clawback)', () => {
   });
 
   test('seller withdraws their full settlement via a payout, then a later refund on the same order still succeeds and the shortfall is tracked', async () => {
-    const withdrawOrder = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
+    // Isolated seller/store/product fixture — `seller` is shared across every
+    // other test in this describe block and, by the time this test runs, may
+    // already carry an OUTSTANDING SellerPayoutLiability from an earlier
+    // shortfall test. recoverSellerLiabilities correctly consumes a seller's
+    // NEXT settlement against any such liability before crediting their
+    // wallet (see orders.service.js#settleDeliveredOrder) — so reusing the
+    // shared `seller` here would non-deterministically zero out the wallet
+    // this test expects to withdraw from. A dedicated seller with no
+    // liability history keeps this test about the payout/refund interaction
+    // it's actually named for.
+    const withdrawSeller = await makeUser('SELLER', '54150000' + Math.floor(Math.random() * 9));
+    await makeApprovedStore(withdrawSeller.user.id, 'فروشگاه استرداد برداشت');
+    const withdrawProduct = await makeApprovedProduct(withdrawSeller.auth, admin.auth, category.id, { price: 100000, stock: 100 });
+
+    const withdrawOrder = await addToCartAndCheckout(customer.auth, [{ storeProduct: withdrawProduct, qty: 1 }]);
     await payWallet(customer.auth, withdrawOrder.id);
     await advanceToDelivered(withdrawOrder.id, admin.auth);
     const orderWithItems = await prisma.order.findUnique({ where: { id: withdrawOrder.id }, include: { items: true } });
@@ -556,14 +570,14 @@ describe('Delivered-order refund (settlement clawback)', () => {
     const settlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item.id } });
 
     // Seller withdraws exactly what this order settled — a legitimate Phase 5 payout.
-    const sellerWalletBeforePayout = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
-    const payout = await api.post(`${PREFIX}/payouts`).set('Authorization', seller.auth).send({
+    const sellerWalletBeforePayout = await prisma.wallet.findUnique({ where: { userId: withdrawSeller.user.id } });
+    const payout = await api.post(`${PREFIX}/payouts`).set('Authorization', withdrawSeller.auth).send({
       amount: Number(sellerWalletBeforePayout.balance),
       bankAccountHolder: 'علی رضایی',
       bankIban: 'IR820540102680020817909002',
     });
     expect(payout.status).toBe(201);
-    const sellerWalletAfterPayout = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+    const sellerWalletAfterPayout = await prisma.wallet.findUnique({ where: { userId: withdrawSeller.user.id } });
     expect(Number(sellerWalletAfterPayout.balance)).toBe(0);
 
     const customerWalletBefore = await prisma.wallet.findUnique({ where: { userId: customer.user.id } });
@@ -574,10 +588,10 @@ describe('Delivered-order refund (settlement clawback)', () => {
     const customerWalletAfter = await prisma.wallet.findUnique({ where: { userId: customer.user.id } });
     expect(Number(customerWalletAfter.balance)).toBe(Number(customerWalletBefore.balance) + Number(settlement.grossAmount));
 
-    const sellerWalletFinal = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
+    const sellerWalletFinal = await prisma.wallet.findUnique({ where: { userId: withdrawSeller.user.id } });
     expect(Number(sellerWalletFinal.balance)).toBe(0); // never went negative
 
-    const liability = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: withdrawOrder.id, sellerId: seller.user.id } });
+    const liability = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: withdrawOrder.id, sellerId: withdrawSeller.user.id } });
     expect(liability).not.toBeNull();
     expect(liability.status).toBe('OUTSTANDING');
     expect(Number(liability.amount)).toBe(Number(settlement.sellerEarning));

@@ -243,8 +243,19 @@ async function sumProcessedRefunds(tx, paymentId) {
  * and record settlement reversals in the SAME all-or-nothing transaction —
  * can run this as part of a larger atomic operation. Defaults to `prisma`
  * for standalone use (e.g. the pre-delivery cancellation path).
+ *
+ * `fullRefundableAmount` overrides what "fully refunded" means for the
+ * REFUNDED-flip check below. Defaults to the Payment's own `amount` (used
+ * by pre-delivery cancellation, which always refunds the whole payment
+ * including shipping — nothing has shipped yet). A delivered order's item
+ * refund, by contrast, only ever refunds item lines (shipping already
+ * happened and is non-refundable — see refundDeliveredOrder's docstring),
+ * so its caller passes the order's item subtotal here instead of the full
+ * payment amount; otherwise a full item refund could never reach
+ * payment.amount (which includes the non-refundable shipping fee) and the
+ * Payment would incorrectly stay SUCCESS forever.
  */
-async function refundWallet(paymentId, amount, idempotencyKey, actor, tx = prisma) {
+async function refundWallet(paymentId, amount, idempotencyKey, actor, tx = prisma, fullRefundableAmount = null) {
   const existing = await tx.paymentRefund.findUnique({ where: { idempotencyKey } });
   if (existing) return existing; // Idempotent replay — no second credit, no duplicate row.
 
@@ -286,11 +297,14 @@ async function refundWallet(paymentId, amount, idempotencyKey, actor, tx = prism
   });
 
   // Only flip the Payment itself to REFUNDED once its PROCESSED refunds
-  // add up to the full original amount — a partial refund (delivered-order
+  // add up to the full refundable amount — a partial refund (delivered-order
   // partial item refund) must leave the payment SUCCESS so it can still be
-  // read as "there is a successful payment behind this order".
+  // read as "there is a successful payment behind this order". Defaults to
+  // payment.amount (pre-delivery cancellation refunds the whole thing,
+  // shipping included); see fullRefundableAmount's doc above.
   const totalProcessed = await sumProcessedRefunds(tx, payment.id);
-  if (totalProcessed >= Number(payment.amount)) {
+  const refundThreshold = fullRefundableAmount != null ? Number(fullRefundableAmount) : Number(payment.amount);
+  if (totalProcessed >= refundThreshold) {
     await tx.payment.updateMany({ where: { id: payment.id, status: { not: 'REFUNDED' } }, data: { status: 'REFUNDED' } });
   }
 

@@ -806,9 +806,16 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
       // PaymentRefund row covers this whole call (possibly several
       // items/stores); each item gets its own reversal row below linking
       // back to it.
+      // A delivered order's item refunds never include shipping (it's
+      // non-refundable post-delivery — see this function's docstring), so
+      // "fully refunded" for THIS payment means every item's gross amount
+      // has been returned, i.e. order.subtotal — not order.total/payment.amount,
+      // which also bakes in the non-refundable shipping fee. Passing this
+      // override lets refundWallet flip Payment -> REFUNDED once all items
+      // are refunded, without ever refunding shipping itself.
       const idempotencyKey = crypto.randomUUID();
       const refund = payment.method === 'WALLET'
-        ? await refundWallet(payment.id, totalCustomerRefund, idempotencyKey, actor, tx)
+        ? await refundWallet(payment.id, totalCustomerRefund, idempotencyKey, actor, tx, Number(order.subtotal))
         : await refundGateway(payment.id, totalCustomerRefund, idempotencyKey, actor, tx);
 
       // Ledger — REFUND: no-shortfall path only. If ANY affected
