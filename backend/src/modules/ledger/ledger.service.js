@@ -1,13 +1,27 @@
 /**
  * P2.4 Phase 2 — Ledger Posting Service.
  *
- * Standalone module: nothing here is imported by payments.service.js /
- * orders.service.js / payouts.service.js / payout-liabilities.service.js /
- * commission-rules, and this module imports none of them. Per the P2.2/P2.3
- * design decision block in schema.prisma ("Ledger — Double-Entry
- * Foundation"), Wallet.balance and WalletTransaction remain the live,
- * unchanged source of truth this phase does not touch. This module is dead/
- * unwired code except for its own tests until a future phase wires it in.
+ * [P2.3 correction: this module is NOT standalone/unwired — see below.]
+ * This module IS imported by real business logic: payments.service.js
+ * (postPaymentConfirmed), orders.service.js (postSettlement, postRefund),
+ * payouts.service.js (postPayoutReserve, postPayoutRelease,
+ * postPayoutProcessed), and payout-liabilities.service.js
+ * (postLiabilityRecovery). Per the P2.2/P2.3 design decision block in
+ * schema.prisma ("Ledger — Double-Entry Foundation"), Wallet.balance and
+ * WalletTransaction remain the live, unchanged operational source of
+ * truth — the Ledger has not been converted into (and does not yet
+ * replace) Wallet.balance.
+ *
+ * COVERAGE IS NOT YET COMPLETE. Known gaps, confirmed by the P2.2 audit
+ * and intentionally deferred (not fixed in P2.3):
+ *   - WALLET-method payments (payments.service.js#payWithWallet) currently
+ *     bypass Ledger posting entirely — only GATEWAY payments post
+ *     PAYMENT_CONFIRMED.
+ *   - Pre-delivery cancellation refunds (orders.service.js's CANCELLED
+ *     transition) currently bypass Ledger posting — only the delivered-
+ *     order refund path (refundDeliveredOrder) posts REFUND.
+ * Because of these gaps, the Ledger must NOT be treated as the complete
+ * financial source of truth yet.
  *
  * Implements the two generic, business-semantics-free primitives the P2.4
  * Phase 2 spec calls for:
@@ -43,12 +57,11 @@
  * (the previously open PLATFORM_CASH-vs-PLATFORM_REVENUE question is now
  * resolved; see ledger.constants.js's EVENT_ACCOUNT_MAP comment).
  *
- * postLiabilityRecovery is a standalone Ledger wrapper only in this step —
- * it is not yet called from payout-liabilities.service.js#
- * recoverSellerLiabilities or anywhere else in the business layer. That
- * wiring is deferred to a future phase. postRefund's own shortfall path
- * (SellerPayoutLiability) is likewise still out of scope — see postRefund's
- * own doc comment.
+ * [P2.3 correction: postLiabilityRecovery IS wired.] It is called from
+ * payout-liabilities.service.js#recoverSellerLiabilities in the same
+ * transaction as that function's liability decrement and WalletTransaction
+ * write. postRefund's own shortfall path (SellerPayoutLiability) remains
+ * out of scope — see postRefund's own doc comment.
  */
 
 const { Prisma } = require('@prisma/client');

@@ -1,12 +1,17 @@
 /**
- * Tests for P2.4 Phase 2's standalone Ledger Posting Service
+ * Tests for P2.4 Phase 2's Ledger Posting Service
  * (src/modules/ledger/ledger.service.js).
  *
- * This module is intentionally unwired from every existing business flow
- * (see ledger.service.js's module-level comment), so — unlike
- * tests/payouts.test.js — these tests call getOrCreateAccount/postJournal
+ * [P2.3 correction: this module is NOT unwired from business flows — see
+ * ledger.service.js's module-level comment for its current wiring status
+ * (payments.service.js, orders.service.js, payouts.service.js,
+ * payout-liabilities.service.js) and known coverage gaps (WALLET
+ * payments, pre-delivery refunds).] This test file, however, still
+ * exercises the module directly: unlike tests/payouts.test.js, these
+ * tests call getOrCreateAccount/postJournal (and the event wrappers)
  * directly inside a real `prisma.$transaction`, with no HTTP layer, no
- * auth, and no seeded roles/users required.
+ * auth, and no seeded roles/users required — this phase does not add
+ * business-flow-level test coverage.
  *
  * These tests exercise the two generic primitives (getOrCreateAccount and
  * postJournal: leg balance validation, idempotency, and — per
@@ -16,11 +21,11 @@
  * postPayoutReserve / postPayoutRelease (P2.4 Phase 2 Step 4), postRefund
  * (P2.4 Phase 2 Step 5, no-shortfall path only), postPayoutProcessed
  * (P2.4 Phase 2 Step 7), and — added in P2.4 Phase 2 Step 10 —
- * postLiabilityRecovery. This step only tests the standalone Ledger
- * wrapper itself; postLiabilityRecovery is not yet wired into
- * payout-liabilities.service.js#recoverSellerLiabilities (deferred to a
- * future phase), so there is no business-flow coverage for that wiring
- * here.
+ * postLiabilityRecovery. [P2.3 correction: postLiabilityRecovery IS now
+ * wired into payout-liabilities.service.js#recoverSellerLiabilities — see
+ * ledger.service.js's doc comment for that function.] This file still
+ * only calls the wrapper directly, the same as the others; it does not
+ * add coverage that exercises it via the business-flow call site.
  *
  * Uses random UUIDs for every ownerId/eventId so repeated runs never
  * collide, and cleans up exactly the rows it created in `afterAll` —

@@ -1,9 +1,12 @@
 /**
  * P2.4 Phase 2 — Ledger Posting Service constants.
  *
- * Standalone module. Nothing here is imported by payments.service.js /
- * orders.service.js / payouts.service.js / payout-liabilities.service.js /
- * commission-rules yet — see ledger.service.js's module-level comment.
+ * [P2.3 correction: this is not a standalone/unwired module.] These
+ * constants are consumed by ledger.service.js's event wrappers, which are
+ * themselves imported by payments.service.js, orders.service.js,
+ * payouts.service.js, and payout-liabilities.service.js — see
+ * ledger.service.js's module-level comment for the current wiring status
+ * and known coverage gaps (WALLET payments, pre-delivery refunds).
  */
 
 // The fixed, well-known ownerId used for every PLATFORM_* Account
