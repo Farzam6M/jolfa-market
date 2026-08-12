@@ -178,7 +178,7 @@ describe('Pre-delivery cancellation refunds', () => {
     const payment = await payWallet(customer.auth, order.id);
 
     const walletAfterPay = await prisma.wallet.findUnique({ where: { userId: customer.user.id } });
-    expect(Number(walletAfterPay.balance)).toBe(Number(walletBefore.balance) - 100000);
+    expect(Number(walletAfterPay.balance)).toBe(Number(walletBefore.balance) - Number(payment.amount));
 
     const cancelled = await cancelOrder(order.id, admin.auth);
     expect(cancelled.status).toBe(200);
@@ -191,7 +191,7 @@ describe('Pre-delivery cancellation refunds', () => {
 
     const refund = await prisma.paymentRefund.findFirst({ where: { paymentId: payment.id } });
     expect(refund.status).toBe('PROCESSED');
-    expect(Number(refund.amount)).toBe(100000);
+    expect(Number(refund.amount)).toBe(Number(payment.amount));
   });
 
   test('GATEWAY cancellation records a REQUESTED PaymentRefund and credits no wallet', async () => {
@@ -210,7 +210,7 @@ describe('Pre-delivery cancellation refunds', () => {
 
     const refund = await prisma.paymentRefund.findFirst({ where: { paymentId: payment.id } });
     expect(refund.status).toBe('REQUESTED');
-    expect(Number(refund.amount)).toBe(100000);
+    expect(Number(refund.amount)).toBe(Number(payment.amount));
   });
 
   test('a retried refundWallet call with the same idempotencyKey is a no-op, not a double credit', async () => {
@@ -286,6 +286,8 @@ describe('Delivered-order refund (settlement clawback)', () => {
     seller = await makeUser('SELLER', '54110000' + Math.floor(Math.random() * 9));
     seller2 = await makeUser('SELLER', '54120000' + Math.floor(Math.random() * 9));
     admin = await makeUser('ADMIN', '54130000' + Math.floor(Math.random() * 9));
+    await prisma.wallet.create({ data: { userId: seller.user.id } });
+    await prisma.wallet.create({ data: { userId: seller2.user.id } });
     await makeApprovedStore(seller.user.id, 'فروشگاه استرداد ۱');
     const store2 = await makeApprovedStore(seller2.user.id, 'فروشگاه استرداد ۲');
     const cat = await api.post(`${PREFIX}/categories`).set('Authorization', admin.auth)
@@ -559,6 +561,7 @@ describe('Delivered-order refund (settlement clawback)', () => {
     // liability history keeps this test about the payout/refund interaction
     // it's actually named for.
     const withdrawSeller = await makeUser('SELLER', '54150000' + Math.floor(Math.random() * 9));
+    await prisma.wallet.create({ data: { userId: withdrawSeller.user.id } });
     await makeApprovedStore(withdrawSeller.user.id, 'فروشگاه استرداد برداشت');
     const withdrawProduct = await makeApprovedProduct(withdrawSeller.auth, admin.auth, category.id, { price: 100000, stock: 100 });
 
