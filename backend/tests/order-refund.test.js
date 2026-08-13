@@ -833,13 +833,28 @@ describe('P2.4 — Ledger integration', () => {
   });
 
   test('E) delivered WALLET refund with a shortfall: ledgerStatus is SHORTFALL_HELD, the liability links back to the refund, and no clean REFUND Journal is fabricated', async () => {
-    const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
+    // Dedicated seller/store/product fixture for this test only. `seller` is
+    // shared across every other test in this describe block (A, B, C, D, F,
+    // G, H) — forcing a shortfall on it here would leave a lingering
+    // OUTSTANDING SellerPayoutLiability that recoverSellerLiabilities would
+    // then silently consume out of that seller's NEXT settlement (see
+    // orders.service.js#settleDeliveredOrder), corrupting whichever later
+    // test happens to run next (e.g. test F, which expects a clean
+    // ledgerStatus = POSTABLE with no pre-existing liability in play). A
+    // seller isolated to this test keeps the shortfall — and the liability
+    // it creates — from ever touching the shared seller.
+    const sellerE = await makeUser('SELLER', '54230000' + Math.floor(Math.random() * 9));
+    await prisma.wallet.create({ data: { userId: sellerE.user.id } });
+    await makeApprovedStore(sellerE.user.id, 'فروشگاه لجر تست E');
+    const productE = await makeApprovedProduct(sellerE.auth, admin.auth, category.id, { price: 100000, stock: 100 });
+
+    const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: productE, qty: 1 }]);
     await payWallet(customer.auth, order.id);
     await advanceToDelivered(order.id, admin.auth);
     const orderWithItems = await prisma.order.findUnique({ where: { id: order.id }, include: { items: true } });
     const item = orderWithItems.items[0];
 
-    await prisma.wallet.update({ where: { userId: seller.user.id }, data: { balance: 0 } }); // force a shortfall
+    await prisma.wallet.update({ where: { userId: sellerE.user.id }, data: { balance: 0 } }); // force a shortfall
 
     const refundRes = await api.post(`${PREFIX}/orders/${order.id}/refund`).set('Authorization', admin.auth)
       .send({ items: [{ orderItemId: item.id, qty: 1 }] });
@@ -849,7 +864,7 @@ describe('P2.4 — Ledger integration', () => {
     expect(refund.origin).toBe('POST_DELIVERY_REFUND');
     expect(refund.ledgerStatus).toBe('SHORTFALL_HELD');
 
-    const liability = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: order.id, sellerId: seller.user.id, refundId: refund.id } });
+    const liability = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: order.id, sellerId: sellerE.user.id, refundId: refund.id } });
     expect(liability).not.toBeNull();
     expect(liability.refundId).toBe(refund.id);
 
