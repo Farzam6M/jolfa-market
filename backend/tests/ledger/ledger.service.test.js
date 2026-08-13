@@ -42,7 +42,7 @@ const crypto = require('crypto');
 const { Prisma } = require('@prisma/client');
 const { prisma } = require('../../src/config/database');
 const {
-  getOrCreateAccount, postJournal, postPaymentConfirmed, postSettlement, postPayoutReserve, postPayoutRelease, postPayoutProcessed, postRefund, postLiabilityRecovery,
+  getOrCreateAccount, postJournal, postPaymentConfirmed, postWalletPaymentConfirmed, postPaymentReversed, postSettlement, postPayoutReserve, postPayoutRelease, postPayoutProcessed, postRefund, postLiabilityRecovery,
 } = require('../../src/modules/ledger/ledger.service');
 const { PLATFORM_LEDGER_OWNER_ID } = require('../../src/modules/ledger/ledger.constants');
 
@@ -448,6 +448,254 @@ describe('postPaymentConfirmed', () => {
     entryRows.forEach((entry) => {
       expect(new Prisma.Decimal(entry.amount).equals(new Prisma.Decimal('999999999999'))).toBe(true);
     });
+  });
+});
+
+/**
+ * P2.4 — postWalletPaymentConfirmed: the WALLET-payment variant of
+ * PAYMENT_CONFIRMED (see EVENT_ACCOUNT_MAP.PAYMENT_CONFIRMED_WALLET in
+ * ledger.constants.js) — DEBIT CUSTOMER_WALLET(customerId) / CREDIT
+ * PLATFORM_CASH, as opposed to postPaymentConfirmed's GATEWAY-only DEBIT
+ * PAYMENT_GATEWAY_CLEARING / CREDIT PLATFORM_CASH above. Wired into
+ * payments.service.js#payWithWallet, in the same transaction as the wallet
+ * debit and Payment.create.
+ */
+describe('postWalletPaymentConfirmed', () => {
+  async function trackAccounts(customerId, currency = 'TMN') {
+    const customerAccount = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'CUSTOMER_WALLET', ownerId: customerId, currency } },
+    });
+    const cashAccount = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'PLATFORM_CASH', ownerId: PLATFORM_LEDGER_OWNER_ID, currency } },
+    });
+    if (customerAccount) createdAccountIds.push(customerAccount.id);
+    if (cashAccount) createdAccountIds.push(cashAccount.id);
+    return { customerAccount, cashAccount };
+  }
+
+  test('successful posting: PAYMENT_CONFIRMED Journal, correct eventId, DEBIT CUSTOMER_WALLET / CREDIT PLATFORM_CASH', async () => {
+    const eventId = crypto.randomUUID();
+    const customerId = crypto.randomUUID();
+    createdEventIds.push(['PAYMENT_CONFIRMED', eventId]);
+
+    const result = await withTx((tx) => postWalletPaymentConfirmed(tx, {
+      eventId, actorId: null, customerId, amount: '4200',
+    }));
+    await trackAccounts(customerId);
+
+    expect(result.idempotentReplay).toBe(false);
+
+    const journalRow = await prisma.journal.findUnique({ where: { id: result.journal.id } });
+    expect(journalRow.eventType).toBe('PAYMENT_CONFIRMED');
+    expect(journalRow.eventId).toBe(eventId);
+
+    const entryRows = await prisma.ledgerEntry.findMany({
+      where: { journalId: result.journal.id },
+      include: { account: true },
+    });
+    expect(entryRows).toHaveLength(2);
+
+    const debitEntry = entryRows.find((e) => e.direction === 'DEBIT');
+    const creditEntry = entryRows.find((e) => e.direction === 'CREDIT');
+    expect(debitEntry.account.ownerType).toBe('CUSTOMER_WALLET');
+    expect(debitEntry.account.ownerId).toBe(customerId);
+    expect(creditEntry.account.ownerType).toBe('PLATFORM_CASH');
+    expect(creditEntry.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(new Prisma.Decimal(debitEntry.amount).equals(new Prisma.Decimal('4200'))).toBe(true);
+    expect(new Prisma.Decimal(creditEntry.amount).equals(new Prisma.Decimal('4200'))).toBe(true);
+  });
+
+  test('reuses the same CUSTOMER_WALLET/PLATFORM_CASH accounts across two postings', async () => {
+    const customerId = crypto.randomUUID();
+    const firstEventId = crypto.randomUUID();
+    const secondEventId = crypto.randomUUID();
+    createdEventIds.push(['PAYMENT_CONFIRMED', firstEventId], ['PAYMENT_CONFIRMED', secondEventId]);
+
+    await withTx((tx) => postWalletPaymentConfirmed(tx, { eventId: firstEventId, customerId, amount: '100' }));
+    const { customerAccount: firstCustomer, cashAccount: firstCash } = await trackAccounts(customerId);
+
+    await withTx((tx) => postWalletPaymentConfirmed(tx, { eventId: secondEventId, customerId, amount: '150' }));
+    const { customerAccount: secondCustomer, cashAccount: secondCash } = await trackAccounts(customerId);
+
+    expect(secondCustomer.id).toBe(firstCustomer.id);
+    expect(secondCash.id).toBe(firstCash.id);
+  });
+
+  test('idempotent: same eventId does not create a second Journal or double-apply balance', async () => {
+    const eventId = crypto.randomUUID();
+    const customerId = crypto.randomUUID();
+    createdEventIds.push(['PAYMENT_CONFIRMED', eventId]);
+
+    const first = await withTx((tx) => postWalletPaymentConfirmed(tx, { eventId, customerId, amount: '900' }));
+    const { customerAccount, cashAccount } = await trackAccounts(customerId);
+    expect(first.idempotentReplay).toBe(false);
+
+    const balanceAfterFirst = {
+      customer: (await prisma.account.findUnique({ where: { id: customerAccount.id } })).balance,
+      cash: (await prisma.account.findUnique({ where: { id: cashAccount.id } })).balance,
+    };
+
+    const second = await withTx((tx) => postWalletPaymentConfirmed(tx, { eventId, customerId, amount: '900' }));
+    expect(second.idempotentReplay).toBe(true);
+    expect(second.journal.id).toBe(first.journal.id);
+
+    const journalRows = await prisma.journal.findMany({ where: { eventType: 'PAYMENT_CONFIRMED', eventId } });
+    expect(journalRows).toHaveLength(1);
+    const entryRows = await prisma.ledgerEntry.findMany({ where: { journalId: first.journal.id } });
+    expect(entryRows).toHaveLength(2); // not 4
+
+    const balanceAfterSecond = {
+      customer: (await prisma.account.findUnique({ where: { id: customerAccount.id } })).balance,
+      cash: (await prisma.account.findUnique({ where: { id: cashAccount.id } })).balance,
+    };
+    expect(new Prisma.Decimal(balanceAfterSecond.customer).equals(new Prisma.Decimal(balanceAfterFirst.customer))).toBe(true);
+    expect(new Prisma.Decimal(balanceAfterSecond.cash).equals(new Prisma.Decimal(balanceAfterFirst.cash))).toBe(true);
+  });
+
+  test('preserves exact Decimal precision for the supplied amount', async () => {
+    const eventId = crypto.randomUUID();
+    const customerId = crypto.randomUUID();
+    createdEventIds.push(['PAYMENT_CONFIRMED', eventId]);
+
+    const result = await withTx((tx) => postWalletPaymentConfirmed(tx, { eventId, customerId, amount: '123456789012' }));
+    await trackAccounts(customerId);
+
+    const entryRows = await prisma.ledgerEntry.findMany({ where: { journalId: result.journal.id } });
+    entryRows.forEach((entry) => {
+      expect(new Prisma.Decimal(entry.amount).equals(new Prisma.Decimal('123456789012'))).toBe(true);
+    });
+  });
+
+  test('rejects a missing customerId', async () => {
+    const eventId = crypto.randomUUID();
+    await expect(withTx((tx) => postWalletPaymentConfirmed(tx, { eventId, amount: '100' }))).rejects.toThrow();
+  });
+});
+
+/**
+ * P2.4 — postPaymentReversed: PRE_DELIVERY_CANCELLATION only (never used
+ * for a delivered-order refund — that stays postRefund/REFUND). `method`
+ * selects EVENT_ACCOUNT_MAP.PAYMENT_REVERSED.{WALLET,GATEWAY} — see that
+ * mapping's comment in ledger.constants.js.
+ */
+describe('postPaymentReversed', () => {
+  async function trackWalletAccounts(customerId, currency = 'TMN') {
+    const cashAccount = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'PLATFORM_CASH', ownerId: PLATFORM_LEDGER_OWNER_ID, currency } },
+    });
+    const customerAccount = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'CUSTOMER_WALLET', ownerId: customerId, currency } },
+    });
+    if (cashAccount) createdAccountIds.push(cashAccount.id);
+    if (customerAccount) createdAccountIds.push(customerAccount.id);
+    return { cashAccount, customerAccount };
+  }
+
+  async function trackGatewayAccounts(currency = 'TMN') {
+    const cashAccount = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'PLATFORM_CASH', ownerId: PLATFORM_LEDGER_OWNER_ID, currency } },
+    });
+    const clearingAccount = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'PAYMENT_GATEWAY_CLEARING', ownerId: PLATFORM_LEDGER_OWNER_ID, currency } },
+    });
+    if (cashAccount) createdAccountIds.push(cashAccount.id);
+    if (clearingAccount) createdAccountIds.push(clearingAccount.id);
+    return { cashAccount, clearingAccount };
+  }
+
+  test('WALLET: DEBIT PLATFORM_CASH / CREDIT CUSTOMER_WALLET(customerId), correct eventType/eventId', async () => {
+    const eventId = crypto.randomUUID();
+    const customerId = crypto.randomUUID();
+    createdEventIds.push(['PAYMENT_REVERSED', eventId]);
+
+    const result = await withTx((tx) => postPaymentReversed(tx, {
+      eventId, actorId: null, method: 'WALLET', customerId, amount: '3000',
+    }));
+    await trackWalletAccounts(customerId);
+
+    expect(result.idempotentReplay).toBe(false);
+
+    const journalRow = await prisma.journal.findUnique({ where: { id: result.journal.id } });
+    expect(journalRow.eventType).toBe('PAYMENT_REVERSED');
+    expect(journalRow.eventId).toBe(eventId);
+
+    const entryRows = await prisma.ledgerEntry.findMany({
+      where: { journalId: result.journal.id },
+      include: { account: true },
+    });
+    const debitEntry = entryRows.find((e) => e.direction === 'DEBIT');
+    const creditEntry = entryRows.find((e) => e.direction === 'CREDIT');
+    expect(debitEntry.account.ownerType).toBe('PLATFORM_CASH');
+    expect(debitEntry.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(creditEntry.account.ownerType).toBe('CUSTOMER_WALLET');
+    expect(creditEntry.account.ownerId).toBe(customerId);
+    expect(new Prisma.Decimal(debitEntry.amount).equals(new Prisma.Decimal('3000'))).toBe(true);
+    expect(new Prisma.Decimal(creditEntry.amount).equals(new Prisma.Decimal('3000'))).toBe(true);
+  });
+
+  test('GATEWAY: DEBIT PLATFORM_CASH / CREDIT PAYMENT_GATEWAY_CLEARING, no customerId required', async () => {
+    const eventId = crypto.randomUUID();
+    createdEventIds.push(['PAYMENT_REVERSED', eventId]);
+
+    const result = await withTx((tx) => postPaymentReversed(tx, {
+      eventId, actorId: null, method: 'GATEWAY', amount: '2500',
+    }));
+    await trackGatewayAccounts();
+
+    const entryRows = await prisma.ledgerEntry.findMany({
+      where: { journalId: result.journal.id },
+      include: { account: true },
+    });
+    const debitEntry = entryRows.find((e) => e.direction === 'DEBIT');
+    const creditEntry = entryRows.find((e) => e.direction === 'CREDIT');
+    expect(debitEntry.account.ownerType).toBe('PLATFORM_CASH');
+    expect(creditEntry.account.ownerType).toBe('PAYMENT_GATEWAY_CLEARING');
+    expect(creditEntry.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+  });
+
+  test('idempotent: same eventId (WALLET) does not create a second Journal or double-apply balance', async () => {
+    const eventId = crypto.randomUUID();
+    const customerId = crypto.randomUUID();
+    createdEventIds.push(['PAYMENT_REVERSED', eventId]);
+
+    const first = await withTx((tx) => postPaymentReversed(tx, {
+      eventId, method: 'WALLET', customerId, amount: '600',
+    }));
+    const { cashAccount, customerAccount } = await trackWalletAccounts(customerId);
+    expect(first.idempotentReplay).toBe(false);
+
+    const balanceAfterFirst = {
+      cash: (await prisma.account.findUnique({ where: { id: cashAccount.id } })).balance,
+      customer: (await prisma.account.findUnique({ where: { id: customerAccount.id } })).balance,
+    };
+
+    const second = await withTx((tx) => postPaymentReversed(tx, {
+      eventId, method: 'WALLET', customerId, amount: '600',
+    }));
+    expect(second.idempotentReplay).toBe(true);
+    expect(second.journal.id).toBe(first.journal.id);
+
+    const journalRows = await prisma.journal.findMany({ where: { eventType: 'PAYMENT_REVERSED', eventId } });
+    expect(journalRows).toHaveLength(1);
+    const entryRows = await prisma.ledgerEntry.findMany({ where: { journalId: first.journal.id } });
+    expect(entryRows).toHaveLength(2); // not 4
+
+    const balanceAfterSecond = {
+      cash: (await prisma.account.findUnique({ where: { id: cashAccount.id } })).balance,
+      customer: (await prisma.account.findUnique({ where: { id: customerAccount.id } })).balance,
+    };
+    expect(new Prisma.Decimal(balanceAfterSecond.cash).equals(new Prisma.Decimal(balanceAfterFirst.cash))).toBe(true);
+    expect(new Prisma.Decimal(balanceAfterSecond.customer).equals(new Prisma.Decimal(balanceAfterFirst.customer))).toBe(true);
+  });
+
+  test('rejects an invalid method', async () => {
+    const eventId = crypto.randomUUID();
+    await expect(withTx((tx) => postPaymentReversed(tx, { eventId, method: 'COD', amount: '100' }))).rejects.toThrow();
+  });
+
+  test('rejects a missing customerId when method is WALLET', async () => {
+    const eventId = crypto.randomUUID();
+    await expect(withTx((tx) => postPaymentReversed(tx, { eventId, method: 'WALLET', amount: '100' }))).rejects.toThrow();
   });
 });
 

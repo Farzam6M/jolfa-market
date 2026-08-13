@@ -1,10 +1,13 @@
 const crypto = require('crypto');
+const { Prisma } = require('@prisma/client');
 const { prisma } = require('../../config/database');
 const ApiError = require('../../utils/ApiError');
 const logger = require('../../utils/logger');
 const { pushNotification } = require('../notifications/notifications.service');
 const { logAdminActivity } = require('../admin/admin.service');
-const { postPaymentConfirmed } = require('../ledger/ledger.service');
+const {
+  postPaymentConfirmed, postWalletPaymentConfirmed, postRefund, postPaymentReversed,
+} = require('../ledger/ledger.service');
 
 async function payWithWallet(order, userId) {
   return prisma.$transaction(async (tx) => {
@@ -51,6 +54,19 @@ async function payWithWallet(order, userId) {
         orderId: order.id, method: 'WALLET', amount: order.total, status: 'SUCCESS', paidAt: new Date(),
       },
     });
+
+    // Ledger — PAYMENT_CONFIRMED (WALLET variant): posted in the SAME
+    // transaction as the wallet debit and Payment.create above, mirroring
+    // confirmGateway's own GATEWAY-only postPaymentConfirmed call. eventId
+    // = the WALLET Payment.id just created — never collides with a GATEWAY
+    // Payment.id (see ledger.constants.js's EVENT_ACCOUNT_MAP comment).
+    await postWalletPaymentConfirmed(tx, {
+      eventId: payment.id,
+      actorId: null,
+      customerId: userId,
+      amount: order.total,
+    });
+
     return payment;
   });
 }
@@ -254,8 +270,28 @@ async function sumProcessedRefunds(tx, paymentId) {
  * payment amount; otherwise a full item refund could never reach
  * payment.amount (which includes the non-refundable shipping fee) and the
  * Payment would incorrectly stay SUCCESS forever.
+ *
+ * `origin` (P2.4) — a PaymentRefundOrigin value, REQUIRED with no default so
+ * every call site must say explicitly which kind of refund this is rather
+ * than letting it be silently guessed later: 'PRE_DELIVERY_CANCELLATION'
+ * (orders.service.js#updateStatus's CANCELLED branch) or
+ * 'POST_DELIVERY_REFUND' (orders.service.js#refundDeliveredOrder). Persisted
+ * on the new PaymentRefund row and read back by
+ * orders.service.js#markGatewayRefundProcessed to decide which Ledger event
+ * (if any) to post — see that function's own doc comment. `ledgerStatus` is
+ * likewise always set explicitly (never left to a DB default) to the
+ * placeholder 'POSTABLE': for a PRE_DELIVERY_CANCELLATION refund the caller
+ * immediately posts postPaymentReversed and flips it to 'POSTED' in the same
+ * transaction; for a POST_DELIVERY_REFUND, refundDeliveredOrder overwrites it
+ * with the real POSTABLE/SHORTFALL_HELD outcome once its seller-wallet
+ * clawback (Pass 2) actually completes — never computed here, since this
+ * function has no visibility into that clawback.
  */
-async function refundWallet(paymentId, amount, idempotencyKey, actor, tx = prisma, fullRefundableAmount = null) {
+async function refundWallet(paymentId, amount, idempotencyKey, actor, origin, tx = prisma, fullRefundableAmount = null) {
+  if (origin !== 'PRE_DELIVERY_CANCELLATION' && origin !== 'POST_DELIVERY_REFUND') {
+    throw ApiError.internal('refundWallet requires an explicit origin (PRE_DELIVERY_CANCELLATION or POST_DELIVERY_REFUND)');
+  }
+
   const existing = await tx.paymentRefund.findUnique({ where: { idempotencyKey } });
   if (existing) return existing; // Idempotent replay — no second credit, no duplicate row.
 
@@ -293,6 +329,8 @@ async function refundWallet(paymentId, amount, idempotencyKey, actor, tx = prism
       idempotencyKey,
       requestedById: actor.id,
       processedAt: new Date(),
+      origin,
+      ledgerStatus: 'POSTABLE',
     },
   });
 
@@ -321,8 +359,25 @@ async function refundWallet(paymentId, amount, idempotencyKey, actor, tx = prism
  * PROCESSED.
  *
  * Same idempotency contract and `tx` parameter as refundWallet — see there.
+ *
+ * `origin` (P2.4) — same required, no-default PaymentRefundOrigin contract
+ * as refundWallet's — see that function's doc comment. Persisted here too;
+ * this is exactly what lets markGatewayRefundProcessed later decide, once
+ * the real off-platform reversal is confirmed, which Ledger event (if any)
+ * to post — without ever having to guess from current settlement state.
+ * `ledgerStatus` starts at the same 'POSTABLE' placeholder as refundWallet's
+ * — for PRE_DELIVERY_CANCELLATION it stays POSTABLE until
+ * markGatewayRefundProcessed's Case C posts PAYMENT_REVERSED and flips it to
+ * POSTED; for POST_DELIVERY_REFUND, refundDeliveredOrder immediately
+ * overwrites it with the real POSTABLE/SHORTFALL_HELD outcome once Pass 2's
+ * seller-wallet clawback completes (this function has no visibility into
+ * that clawback, same reasoning as refundWallet).
  */
-async function refundGateway(paymentId, amount, idempotencyKey, actor, tx = prisma) {
+async function refundGateway(paymentId, amount, idempotencyKey, actor, origin, tx = prisma) {
+  if (origin !== 'PRE_DELIVERY_CANCELLATION' && origin !== 'POST_DELIVERY_REFUND') {
+    throw ApiError.internal('refundGateway requires an explicit origin (PRE_DELIVERY_CANCELLATION or POST_DELIVERY_REFUND)');
+  }
+
   const existing = await tx.paymentRefund.findUnique({ where: { idempotencyKey } });
   if (existing) return existing;
 
@@ -339,6 +394,8 @@ async function refundGateway(paymentId, amount, idempotencyKey, actor, tx = pris
       reason: 'در انتظار تأیید استرداد درگاه پرداخت',
       idempotencyKey,
       requestedById: actor.id,
+      origin,
+      ledgerStatus: 'POSTABLE',
     },
   });
 }
@@ -350,6 +407,37 @@ async function refundGateway(paymentId, amount, idempotencyKey, actor, tx = pris
  * PROCESSED) so two concurrent "mark processed" calls for the same refund
  * can only succeed once; the loser gets back the already-processed row as
  * a graceful no-op instead of double-counting toward the payment total.
+ *
+ * P2.4 — this is also the ONLY place a GATEWAY refund's Ledger event is
+ * posted (never at refund-request time in refundWallet/refundGateway — see
+ * their own doc comments): only the caller that actually wins the
+ * REQUESTED -> PROCESSED claim above may post, and it branches strictly on
+ * the PERSISTED refund.origin / refund.ledgerStatus — never inferred from
+ * current OrderItemSettlement/Wallet.balance state (see
+ * payments.service.js#refundWallet's `origin`/`ledgerStatus` doc comment
+ * and PaymentRefundOrigin/PaymentRefundLedgerStatus's own schema.prisma
+ * comments):
+ *
+ *   - origin === 'PRE_DELIVERY_CANCELLATION': no settlement to reverse —
+ *     posts PAYMENT_REVERSED (GATEWAY leg), eventId = Payment.id, then
+ *     flips ledgerStatus -> 'POSTED'.
+ *   - origin === 'POST_DELIVERY_REFUND' && ledgerStatus === 'POSTABLE':
+ *     the seller-wallet clawback fully succeeded when this refund was
+ *     created (refundDeliveredOrder's Pass 2) — reconstructs
+ *     sellerRefunds/commissionAmount from the OrderItemSettlementReversal
+ *     rows THIS refund created (never recomputed from current wallet
+ *     state) and posts REFUND, eventId = PaymentRefund.id, then flips
+ *     ledgerStatus -> 'POSTED'.
+ *   - origin === 'POST_DELIVERY_REFUND' && ledgerStatus === 'SHORTFALL_HELD':
+ *     the clawback was incomplete — money movement above still becomes
+ *     PROCESSED, but NO Ledger journal is posted (fabricating a clean
+ *     REFUND here would misstate a settlement reversal that never fully
+ *     happened); left for manual reconciliation, ledgerStatus stays
+ *     SHORTFALL_HELD.
+ *   - origin/ledgerStatus NULL (legacy row, created before P2.4): money
+ *     movement above is NOT blocked by this — only the automated Ledger
+ *     posting is skipped, logged for manual reconciliation rather than
+ *     guessed.
  */
 async function markGatewayRefundProcessed(refundId, actor) {
   return prisma.$transaction(async (tx) => {
@@ -358,9 +446,9 @@ async function markGatewayRefundProcessed(refundId, actor) {
       data: { status: 'PROCESSED', processedAt: new Date() },
     });
 
-    const refund = await tx.paymentRefund.findUnique({ where: { id: refundId } });
+    let refund = await tx.paymentRefund.findUnique({ where: { id: refundId } });
     if (!refund) throw ApiError.notFound('درخواست استرداد یافت نشد');
-    if (claimed.count === 0) return refund; // Already PROCESSED (or was never REQUESTED) — no-op.
+    if (claimed.count === 0) return refund; // Already PROCESSED (or was never REQUESTED) — no-op, no second Ledger posting.
 
     const payment = await tx.payment.findUnique({ where: { id: refund.paymentId } });
     // Payment -> REFUNDED only once ALL of its PROCESSED refunds (across
@@ -370,6 +458,70 @@ async function markGatewayRefundProcessed(refundId, actor) {
     if (totalProcessed >= Number(payment.amount)) {
       await tx.payment.updateMany({ where: { id: payment.id, status: { not: 'REFUNDED' } }, data: { status: 'REFUNDED' } });
     }
+
+    if (refund.origin === 'PRE_DELIVERY_CANCELLATION') {
+      // Case C — GATEWAY pre-delivery cancellation reversal, deferred from
+      // updateStatus's CANCELLED branch (see that function's own comment)
+      // until this real REQUESTED -> PROCESSED confirmation. No seller
+      // wallet / platform revenue legs — nothing was ever settled.
+      await postPaymentReversed(tx, {
+        eventId: payment.id,
+        actorId: null,
+        method: 'GATEWAY',
+        amount: refund.amount,
+      });
+      refund = await tx.paymentRefund.update({ where: { id: refund.id }, data: { ledgerStatus: 'POSTED' } });
+    } else if (refund.origin === 'POST_DELIVERY_REFUND' && refund.ledgerStatus === 'POSTABLE') {
+      // Case A — reconstruct seller/commission reversal amounts from the
+      // OrderItemSettlementReversal rows THIS refund created (persisted
+      // historical data — safe to use; never recomputed from current
+      // Wallet.balance or re-derived from settlement state). storeId ->
+      // sellerId is resolved via OrderItemSettlement.store, matching
+      // schema.prisma's actual relation names.
+      const reversals = await tx.orderItemSettlementReversal.findMany({
+        where: { refundId: refund.id },
+        include: { settlement: { include: { store: { select: { sellerId: true } } } } },
+      });
+
+      const sellerTotals = new Map(); // sellerId -> Prisma.Decimal
+      let commissionTotal = new Prisma.Decimal(0);
+      // eslint-disable-next-line no-restricted-syntax
+      for (const reversal of reversals) {
+        const { sellerId } = reversal.settlement.store;
+        const prevAmount = sellerTotals.get(sellerId) || new Prisma.Decimal(0);
+        sellerTotals.set(sellerId, prevAmount.plus(new Prisma.Decimal(reversal.refundedSellerEarning)));
+        commissionTotal = commissionTotal.plus(new Prisma.Decimal(reversal.refundedCommissionAmount));
+      }
+
+      const order = await tx.order.findUnique({ where: { id: refund.orderId } });
+
+      await postRefund(tx, {
+        eventId: refund.id,
+        actorId: null,
+        customerId: order.userId,
+        customerAmount: refund.amount,
+        sellerRefunds: Array.from(sellerTotals.entries()).map(([sellerId, amount]) => ({ sellerId, amount })),
+        commissionAmount: commissionTotal,
+      });
+      refund = await tx.paymentRefund.update({ where: { id: refund.id }, data: { ledgerStatus: 'POSTED' } });
+    } else if (refund.origin === 'POST_DELIVERY_REFUND' && refund.ledgerStatus === 'SHORTFALL_HELD') {
+      // Case B — money movement above still completes (REQUESTED ->
+      // PROCESSED already claimed), but the Ledger must not fabricate a
+      // clean settlement reversal when the seller clawback was left
+      // incomplete at refund-creation time (see SellerPayoutLiability /
+      // refundDeliveredOrder). No postRefund call; ledgerStatus stays
+      // SHORTFALL_HELD, pending manual reconciliation.
+    } else {
+      // Case D — legacy row: origin and/or ledgerStatus is NULL, meaning
+      // this PaymentRefund predates the P2.4 columns. Do NOT infer origin
+      // from settlement existence, and do NOT infer shortfall from current
+      // Wallet.balance — both are exactly the guesses this design forbids.
+      // The money-movement transition above still applies unmodified;
+      // only the automated Ledger posting is skipped here, flagged for
+      // manual reconciliation via the existing logging convention.
+      logger.warn(`markGatewayRefundProcessed: PaymentRefund ${refund.id} has no origin/ledgerStatus (pre-P2.4 legacy row) — REQUESTED->PROCESSED transition applied normally, but no Ledger journal was posted; needs manual reconciliation`);
+    }
+
     return refund;
   }).then(async (refund) => {
     await logAdminActivity(actor.id, `تأیید دستی استرداد درگاه پرداخت ${refund.id}`);

@@ -219,8 +219,8 @@ describe('Pre-delivery cancellation refunds', () => {
     const walletAfterPay = await prisma.wallet.findUnique({ where: { userId: customer.user.id } });
 
     const idempotencyKey = `test-idem-${payment.id}`;
-    const first = await paymentsService.refundWallet(payment.id, Number(payment.amount), idempotencyKey, admin.user);
-    const second = await paymentsService.refundWallet(payment.id, Number(payment.amount), idempotencyKey, admin.user);
+    const first = await paymentsService.refundWallet(payment.id, Number(payment.amount), idempotencyKey, admin.user, 'PRE_DELIVERY_CANCELLATION');
+    const second = await paymentsService.refundWallet(payment.id, Number(payment.amount), idempotencyKey, admin.user, 'PRE_DELIVERY_CANCELLATION');
     expect(second.id).toBe(first.id); // the exact same row, not a new one
 
     const refunds = await prisma.paymentRefund.findMany({ where: { paymentId: payment.id } });
@@ -240,7 +240,7 @@ describe('Pre-delivery cancellation refunds', () => {
     expect(paymentAfter.status).toBe('REFUNDED');
 
     await expect(
-      paymentsService.refundWallet(payment.id, Number(payment.amount), `another-key-${payment.id}`, admin.user),
+      paymentsService.refundWallet(payment.id, Number(payment.amount), `another-key-${payment.id}`, admin.user, 'PRE_DELIVERY_CANCELLATION'),
     ).rejects.toThrow();
   });
 
@@ -669,5 +669,303 @@ describe('Delivered-order refund (settlement clawback)', () => {
     const settlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item.id } });
     const reversals = await prisma.orderItemSettlementReversal.findMany({ where: { settlementId: settlement.id } });
     expect(reversals.length).toBe(1); // exactly one refund landed, never two
+  });
+});
+
+/**
+ * P2.4 — Ledger integration around Payment / PaymentRefund.
+ *
+ * Exercises the Ledger side effects layered on top of Phase 4's refund/
+ * cancellation flows above: PAYMENT_CONFIRMED (WALLET variant) on payment,
+ * PAYMENT_REVERSED on pre-delivery cancellation (immediate for WALLET,
+ * deferred to markGatewayRefundProcessed for GATEWAY), and REFUND on a
+ * delivered-order refund (immediate for WALLET when the seller clawback
+ * fully succeeds, deferred to markGatewayRefundProcessed for GATEWAY —
+ * and, either way, never fabricated when the clawback left a
+ * SellerPayoutLiability shortfall). See payments.service.js#refundWallet/
+ * refundGateway/markGatewayRefundProcessed and orders.service.js#
+ * updateStatus/refundDeliveredOrder for the implementation this exercises.
+ */
+describe('P2.4 — Ledger integration', () => {
+  let customer;
+  let seller;
+  let admin;
+  let category;
+  let product;
+
+  async function findJournal(eventType, eventId) {
+    return prisma.journal.findUnique({ where: { eventType_eventId: { eventType, eventId } } });
+  }
+
+  async function entriesFor(journalId) {
+    return prisma.ledgerEntry.findMany({ where: { journalId }, include: { account: true } });
+  }
+
+  beforeAll(async () => {
+    customer = await makeUser('CUSTOMER', '54200000' + Math.floor(Math.random() * 9));
+    await prisma.wallet.create({ data: { userId: customer.user.id, balance: 100000000 } });
+    seller = await makeUser('SELLER', '54210000' + Math.floor(Math.random() * 9));
+    await prisma.wallet.create({ data: { userId: seller.user.id } });
+    admin = await makeUser('ADMIN', '54220000' + Math.floor(Math.random() * 9));
+    await makeApprovedStore(seller.user.id, 'فروشگاه لجر تست');
+    const cat = await api.post(`${PREFIX}/categories`).set('Authorization', admin.auth)
+      .send({ name: 'دسته لجر تست', slug: `ledger-integration-cat-${Date.now()}` });
+    category = cat.body.data;
+    product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 100000, stock: 100 });
+
+    // A GLOBAL CommissionRule is required for settlement on DELIVERED — same
+    // requirement as the "Delivered-order refund" describe block above.
+    const existingGlobal = await prisma.commissionRule.findFirst({ where: { scope: 'GLOBAL' } });
+    if (!existingGlobal) {
+      const rule = await api.post(`${PREFIX}/admin/commission-rules`).set('Authorization', admin.auth)
+        .send({ scope: 'GLOBAL', rate: 10 });
+      expect(rule.status).toBe(201);
+    }
+  });
+
+  test('A) WALLET payment posts a PAYMENT_CONFIRMED Journal (CUSTOMER_WALLET debit / PLATFORM_CASH credit) and a retried payment attempt does not duplicate it', async () => {
+    const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
+    const payment = await payWallet(customer.auth, order.id);
+
+    const journal = await findJournal('PAYMENT_CONFIRMED', payment.id);
+    expect(journal).not.toBeNull();
+
+    const entries = await entriesFor(journal.id);
+    expect(entries).toHaveLength(2);
+    const debit = entries.find((e) => e.direction === 'DEBIT');
+    const credit = entries.find((e) => e.direction === 'CREDIT');
+    expect(debit.account.ownerType).toBe('CUSTOMER_WALLET');
+    expect(debit.account.ownerId).toBe(customer.user.id);
+    expect(credit.account.ownerType).toBe('PLATFORM_CASH');
+    expect(Number(debit.amount)).toBe(Number(payment.amount));
+    expect(Number(credit.amount)).toBe(Number(payment.amount));
+
+    // Retried payment attempt: the order is no longer PENDING, so this is
+    // rejected before payWithWallet (and therefore postWalletPaymentConfirmed)
+    // ever runs again — the existing Journal must be untouched.
+    const retry = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth).send({ orderId: order.id, method: 'WALLET' });
+    expect(retry.status).toBe(409);
+
+    const journalsAfter = await prisma.journal.findMany({ where: { eventType: 'PAYMENT_CONFIRMED', eventId: payment.id } });
+    expect(journalsAfter).toHaveLength(1);
+  });
+
+  test('B) WALLET pre-delivery cancellation: origin is PRE_DELIVERY_CANCELLATION and a PAYMENT_REVERSED Journal is posted immediately', async () => {
+    const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
+    const payment = await payWallet(customer.auth, order.id);
+
+    const cancelled = await cancelOrder(order.id, admin.auth);
+    expect(cancelled.status).toBe(200);
+
+    const refund = await prisma.paymentRefund.findFirst({ where: { paymentId: payment.id } });
+    expect(refund.origin).toBe('PRE_DELIVERY_CANCELLATION');
+
+    const journal = await findJournal('PAYMENT_REVERSED', payment.id);
+    expect(journal).not.toBeNull();
+
+    const entries = await entriesFor(journal.id);
+    expect(entries).toHaveLength(2);
+    const debit = entries.find((e) => e.direction === 'DEBIT');
+    const credit = entries.find((e) => e.direction === 'CREDIT');
+    expect(debit.account.ownerType).toBe('PLATFORM_CASH');
+    expect(credit.account.ownerType).toBe('CUSTOMER_WALLET');
+    expect(credit.account.ownerId).toBe(customer.user.id);
+    expect(Number(credit.amount)).toBe(Number(payment.amount));
+  });
+
+  test('C) GATEWAY pre-delivery cancellation: the PAYMENT_REVERSED Journal is deferred until markGatewayRefundProcessed confirms it', async () => {
+    const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
+    const payment = await payGatewayAndConfirm(customer.auth, order.id);
+
+    const cancelled = await cancelOrder(order.id, admin.auth);
+    expect(cancelled.status).toBe(200);
+
+    const refund = await prisma.paymentRefund.findFirst({ where: { paymentId: payment.id } });
+    expect(refund.status).toBe('REQUESTED');
+    expect(refund.origin).toBe('PRE_DELIVERY_CANCELLATION');
+
+    const journalBefore = await findJournal('PAYMENT_REVERSED', payment.id);
+    expect(journalBefore).toBeNull(); // not posted yet — no real gateway reversal has been confirmed
+
+    const confirmed = await api.patch(`${PREFIX}/admin/payment-refunds/${refund.id}/mark-processed`).set('Authorization', admin.auth);
+    expect(confirmed.status).toBe(200);
+    expect(confirmed.body.data.status).toBe('PROCESSED');
+
+    const journalAfter = await findJournal('PAYMENT_REVERSED', payment.id);
+    expect(journalAfter).not.toBeNull();
+    const entries = await entriesFor(journalAfter.id);
+    const debit = entries.find((e) => e.direction === 'DEBIT');
+    const credit = entries.find((e) => e.direction === 'CREDIT');
+    expect(debit.account.ownerType).toBe('PLATFORM_CASH');
+    expect(credit.account.ownerType).toBe('PAYMENT_GATEWAY_CLEARING');
+  });
+
+  test('D) delivered WALLET refund with no shortfall: origin/ledgerStatus persisted and a REFUND Journal is posted immediately with correct legs', async () => {
+    const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
+    await payWallet(customer.auth, order.id);
+    await advanceToDelivered(order.id, admin.auth);
+    const orderWithItems = await prisma.order.findUnique({ where: { id: order.id }, include: { items: true } });
+    const item = orderWithItems.items[0];
+    const settlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item.id } });
+
+    const refundRes = await api.post(`${PREFIX}/orders/${order.id}/refund`).set('Authorization', admin.auth)
+      .send({ items: [{ orderItemId: item.id, qty: 1 }] });
+    expect(refundRes.status).toBe(200);
+
+    const refund = await prisma.paymentRefund.findUnique({ where: { id: refundRes.body.data.refund.id } });
+    expect(refund.origin).toBe('POST_DELIVERY_REFUND');
+    expect(refund.ledgerStatus).toBe('POSTED'); // WALLET + no shortfall posts immediately
+
+    const journal = await findJournal('REFUND', refund.id);
+    expect(journal).not.toBeNull();
+    const entries = await entriesFor(journal.id);
+    const customerLeg = entries.find((e) => e.account.ownerType === 'CUSTOMER_WALLET');
+    const sellerLeg = entries.find((e) => e.account.ownerType === 'SELLER_WALLET');
+    const revenueLeg = entries.find((e) => e.account.ownerType === 'PLATFORM_REVENUE');
+    expect(customerLeg.direction).toBe('CREDIT');
+    expect(customerLeg.account.ownerId).toBe(customer.user.id);
+    expect(Number(customerLeg.amount)).toBe(Number(settlement.grossAmount));
+    expect(sellerLeg.direction).toBe('DEBIT');
+    expect(sellerLeg.account.ownerId).toBe(seller.user.id);
+    expect(Number(sellerLeg.amount)).toBe(Number(settlement.sellerEarning));
+    expect(revenueLeg.direction).toBe('DEBIT');
+    expect(Number(revenueLeg.amount)).toBe(Number(settlement.commissionAmount));
+  });
+
+  test('E) delivered WALLET refund with a shortfall: ledgerStatus is SHORTFALL_HELD, the liability links back to the refund, and no clean REFUND Journal is fabricated', async () => {
+    const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
+    await payWallet(customer.auth, order.id);
+    await advanceToDelivered(order.id, admin.auth);
+    const orderWithItems = await prisma.order.findUnique({ where: { id: order.id }, include: { items: true } });
+    const item = orderWithItems.items[0];
+
+    await prisma.wallet.update({ where: { userId: seller.user.id }, data: { balance: 0 } }); // force a shortfall
+
+    const refundRes = await api.post(`${PREFIX}/orders/${order.id}/refund`).set('Authorization', admin.auth)
+      .send({ items: [{ orderItemId: item.id, qty: 1 }] });
+    expect(refundRes.status).toBe(200);
+
+    const refund = await prisma.paymentRefund.findUnique({ where: { id: refundRes.body.data.refund.id } });
+    expect(refund.origin).toBe('POST_DELIVERY_REFUND');
+    expect(refund.ledgerStatus).toBe('SHORTFALL_HELD');
+
+    const liability = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: order.id, sellerId: seller.user.id, refundId: refund.id } });
+    expect(liability).not.toBeNull();
+    expect(liability.refundId).toBe(refund.id);
+
+    const journal = await findJournal('REFUND', refund.id);
+    expect(journal).toBeNull(); // no fabricated clean settlement reversal
+  });
+
+  test('F) delivered GATEWAY refund with no shortfall: the REFUND Journal is deferred until markGatewayRefundProcessed confirms it', async () => {
+    const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
+    await payGatewayAndConfirm(customer.auth, order.id);
+    await advanceToDelivered(order.id, admin.auth);
+    const orderWithItems = await prisma.order.findUnique({ where: { id: order.id }, include: { items: true } });
+    const item = orderWithItems.items[0];
+    const settlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item.id } });
+
+    const refundRes = await api.post(`${PREFIX}/orders/${order.id}/refund`).set('Authorization', admin.auth)
+      .send({ items: [{ orderItemId: item.id, qty: 1 }] });
+    expect(refundRes.status).toBe(200);
+    const refundId = refundRes.body.data.refund.id;
+
+    const refundBefore = await prisma.paymentRefund.findUnique({ where: { id: refundId } });
+    expect(refundBefore.origin).toBe('POST_DELIVERY_REFUND');
+    expect(refundBefore.ledgerStatus).toBe('POSTABLE');
+    expect(refundBefore.status).toBe('REQUESTED');
+
+    const journalBefore = await findJournal('REFUND', refundId);
+    expect(journalBefore).toBeNull();
+
+    const confirmed = await api.patch(`${PREFIX}/admin/payment-refunds/${refundId}/mark-processed`).set('Authorization', admin.auth);
+    expect(confirmed.status).toBe(200);
+    expect(confirmed.body.data.status).toBe('PROCESSED');
+
+    const refundAfter = await prisma.paymentRefund.findUnique({ where: { id: refundId } });
+    expect(refundAfter.ledgerStatus).toBe('POSTED');
+
+    const journalAfter = await findJournal('REFUND', refundId);
+    expect(journalAfter).not.toBeNull();
+    const entries = await entriesFor(journalAfter.id);
+    const sellerLeg = entries.find((e) => e.account.ownerType === 'SELLER_WALLET');
+    expect(Number(sellerLeg.amount)).toBe(Number(settlement.sellerEarning));
+  });
+
+  test('G) delivered GATEWAY refund with a shortfall: SHORTFALL_HELD persists through markGatewayRefundProcessed and no clean REFUND Journal is ever fabricated', async () => {
+    const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
+    await payGatewayAndConfirm(customer.auth, order.id);
+    await advanceToDelivered(order.id, admin.auth);
+    const orderWithItems = await prisma.order.findUnique({ where: { id: order.id }, include: { items: true } });
+    const item = orderWithItems.items[0];
+
+    await prisma.wallet.update({ where: { userId: seller.user.id }, data: { balance: 0 } }); // force a shortfall
+
+    const refundRes = await api.post(`${PREFIX}/orders/${order.id}/refund`).set('Authorization', admin.auth)
+      .send({ items: [{ orderItemId: item.id, qty: 1 }] });
+    expect(refundRes.status).toBe(200);
+    const refundId = refundRes.body.data.refund.id;
+
+    const refundBefore = await prisma.paymentRefund.findUnique({ where: { id: refundId } });
+    expect(refundBefore.origin).toBe('POST_DELIVERY_REFUND');
+    expect(refundBefore.ledgerStatus).toBe('SHORTFALL_HELD');
+
+    const liability = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: order.id, sellerId: seller.user.id, refundId } });
+    expect(liability).not.toBeNull();
+
+    const confirmed = await api.patch(`${PREFIX}/admin/payment-refunds/${refundId}/mark-processed`).set('Authorization', admin.auth);
+    expect(confirmed.status).toBe(200);
+    expect(confirmed.body.data.status).toBe('PROCESSED'); // money-movement claim still succeeds
+
+    const journal = await findJournal('REFUND', refundId);
+    expect(journal).toBeNull(); // still no fabricated Journal, even after gateway confirmation
+
+    const refundAfter = await prisma.paymentRefund.findUnique({ where: { id: refundId } });
+    expect(refundAfter.ledgerStatus).toBe('SHORTFALL_HELD'); // unchanged — pending manual reconciliation
+  });
+
+  test('H) a legacy PaymentRefund (origin/ledgerStatus NULL) still processes money movement via markGatewayRefundProcessed without any inferred Ledger posting', async () => {
+    const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
+    const payment = await payGatewayAndConfirm(customer.auth, order.id);
+
+    // Bypass refundGateway (which now enforces a required origin) to
+    // simulate a row created before the P2.4 origin/ledgerStatus columns
+    // existed — exactly the case markGatewayRefundProcessed's Case D exists
+    // for.
+    const legacyRefund = await prisma.paymentRefund.create({
+      data: {
+        paymentId: payment.id,
+        orderId: order.id,
+        amount: payment.amount,
+        status: 'REQUESTED',
+        reason: 'استرداد قدیمی بدون origin',
+        idempotencyKey: `legacy-${payment.id}`,
+        requestedById: admin.user.id,
+        // origin / ledgerStatus deliberately omitted — NULL, as a real
+        // pre-P2.4 row would be.
+      },
+    });
+    expect(legacyRefund.origin).toBeNull();
+    expect(legacyRefund.ledgerStatus).toBeNull();
+
+    const confirmed = await api.patch(`${PREFIX}/admin/payment-refunds/${legacyRefund.id}/mark-processed`).set('Authorization', admin.auth);
+    expect(confirmed.status).toBe(200);
+    expect(confirmed.body.data.status).toBe('PROCESSED'); // money-movement transition still applies
+
+    const paymentAfter = await prisma.payment.findUnique({ where: { id: payment.id } });
+    expect(paymentAfter.status).toBe('REFUNDED'); // fully covered by this one legacy refund
+
+    // No Ledger journal was guessed for it, under either eventType it could
+    // conceivably have been (PAYMENT_REVERSED keyed by Payment.id, or REFUND
+    // keyed by PaymentRefund.id) — origin was never inferred from settlement
+    // existence, and no shortfall was inferred from current Wallet.balance.
+    const reversedJournal = await findJournal('PAYMENT_REVERSED', payment.id);
+    const refundJournal = await findJournal('REFUND', legacyRefund.id);
+    expect(reversedJournal).toBeNull();
+    expect(refundJournal).toBeNull();
+
+    const refundAfter = await prisma.paymentRefund.findUnique({ where: { id: legacyRefund.id } });
+    expect(refundAfter.origin).toBeNull();
+    expect(refundAfter.ledgerStatus).toBeNull(); // left untouched, not guessed
   });
 });

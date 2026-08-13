@@ -10,7 +10,9 @@ const { PERMISSIONS } = require('../roles/permissions.constants');
 const { resolveCommissionRate } = require('../commission-rules/commission-rules.service');
 const { refundWallet, refundGateway } = require('../payments/payments.service');
 const { recoverSellerLiabilities } = require('../payout-liabilities/payout-liabilities.service');
-const { postSettlement, postRefund } = require('../ledger/ledger.service');
+const {
+  postSettlement, postRefund, postPaymentReversed,
+} = require('../ledger/ledger.service');
 
 const STATUS_LABELS = {
   PENDING: 'در انتظار', CONFIRMED: 'تایید شده', PREPARING: 'در حال آماده‌سازی', SENT: 'ارسال شده', DELIVERED: 'تحویل داده شده', CANCELLED: 'لغو شده',
@@ -590,9 +592,31 @@ async function updateStatus(orderId, status, actor) {
       if (succeededPayment) {
         const idempotencyKey = `cancel-refund:${succeededPayment.id}`;
         if (succeededPayment.method === 'WALLET') {
-          await refundWallet(succeededPayment.id, succeededPayment.amount, idempotencyKey, actor, tx);
+          const refund = await refundWallet(succeededPayment.id, succeededPayment.amount, idempotencyKey, actor, 'PRE_DELIVERY_CANCELLATION', tx);
+          // Ledger — PAYMENT_REVERSED (WALLET): posted immediately, in the
+          // SAME transaction as refundWallet's own wallet credit above —
+          // unlike a GATEWAY reversal, a WALLET refund's money movement is
+          // real and immediate, so there is nothing to defer to (mirrors
+          // payWithWallet's own immediate PAYMENT_CONFIRMED posting).
+          // postJournal's own (eventType, eventId) idempotency makes this
+          // safe to call again on an idempotent-replay retry of this same
+          // transition; the ledgerStatus update below is likewise a no-op
+          // once already 'POSTED'.
+          await postPaymentReversed(tx, {
+            eventId: succeededPayment.id,
+            actorId: null,
+            method: 'WALLET',
+            customerId: order.userId,
+            amount: succeededPayment.amount,
+          });
+          await tx.paymentRefund.update({ where: { id: refund.id }, data: { ledgerStatus: 'POSTED' } });
         } else if (succeededPayment.method === 'GATEWAY') {
-          await refundGateway(succeededPayment.id, succeededPayment.amount, idempotencyKey, actor, tx);
+          // GATEWAY reversal is deliberately NOT posted here — no real
+          // gateway reversal has happened yet (refundGateway only records a
+          // REQUESTED PaymentRefund). The Ledger PAYMENT_REVERSED journal is
+          // posted only once an admin actually confirms it via
+          // markGatewayRefundProcessed's Case C.
+          await refundGateway(succeededPayment.id, succeededPayment.amount, idempotencyKey, actor, 'PRE_DELIVERY_CANCELLATION', tx);
         }
       }
     }
@@ -715,6 +739,27 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
         });
       }
 
+      // Pass 1.5 — create the customer-side PaymentRefund NOW, before Pass 2,
+      // so its id exists for SellerPayoutLiability.refundId below (P2.4:
+      // SellerPayoutLiability now links back to the exact refund whose
+      // clawback produced it — see that column's schema.prisma doc comment
+      // — so the refund row must exist before any liability row does).
+      // WALLET credits the customer immediately here, same as before this
+      // reordering; GATEWAY only records a REQUESTED row, same as before —
+      // reordering this earlier changes nothing about either function's own
+      // behavior, only when refund.id becomes available to this function.
+      // A delivered order's item refunds never include shipping (it's
+      // non-refundable post-delivery — see this function's docstring), so
+      // "fully refunded" for THIS payment means every item's gross amount
+      // has been returned, i.e. order.subtotal — not order.total/payment.amount,
+      // which also bakes in the non-refundable shipping fee. Passing this
+      // override lets refundWallet flip Payment -> REFUNDED once all items
+      // are refunded, without ever refunding shipping itself.
+      const idempotencyKey = crypto.randomUUID();
+      const refund = payment.method === 'WALLET'
+        ? await refundWallet(payment.id, totalCustomerRefund, idempotencyKey, actor, 'POST_DELIVERY_REFUND', tx, Number(order.subtotal))
+        : await refundGateway(payment.id, totalCustomerRefund, idempotencyKey, actor, 'POST_DELIVERY_REFUND', tx);
+
       // Pass 2 — the money movement. The customer refund must be able to
       // complete even if a seller's wallet can no longer fully cover their
       // clawback (e.g. they already withdrew it via a PayoutRequest — see
@@ -725,7 +770,7 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
       // Tracks whether ANY affected store had a shortfall this call — the
       // Ledger REFUND journal (no fake balancing leg possible for the
       // shortfall path) is only posted when this stays false; see Pass 2
-      // below and the postRefund call after the PaymentRefund is created.
+      // below and the postRefund call after Pass 2 completes.
       let anyShortfall = false;
 
       // eslint-disable-next-line no-restricted-syntax
@@ -793,6 +838,11 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
               sellerId,
               orderId: order.id,
               storeId,
+              // P2.4 — links this liability back to the exact refund whose
+              // clawback attempt produced it (refund.id now exists — see
+              // Pass 1.5 above — never associated later by orderId alone,
+              // which would be ambiguous across multiple refunds/stores).
+              refundId: refund.id,
               amount: shortfall,
               reason: `کسری کیف پول هنگام استرداد سفارش ${order.orderNumber} — قابل واریز مجدد از تسویه‌ها/برداشت‌های بعدی`,
             },
@@ -800,31 +850,26 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
         }
       }
 
-      // Customer-side refund: WALLET credits immediately, GATEWAY only
-      // records a REQUESTED PaymentRefund pending manual confirmation —
-      // see payments.service.js#refundWallet / refundGateway. One
-      // PaymentRefund row covers this whole call (possibly several
-      // items/stores); each item gets its own reversal row below linking
-      // back to it.
-      // A delivered order's item refunds never include shipping (it's
-      // non-refundable post-delivery — see this function's docstring), so
-      // "fully refunded" for THIS payment means every item's gross amount
-      // has been returned, i.e. order.subtotal — not order.total/payment.amount,
-      // which also bakes in the non-refundable shipping fee. Passing this
-      // override lets refundWallet flip Payment -> REFUNDED once all items
-      // are refunded, without ever refunding shipping itself.
-      const idempotencyKey = crypto.randomUUID();
-      const refund = payment.method === 'WALLET'
-        ? await refundWallet(payment.id, totalCustomerRefund, idempotencyKey, actor, tx, Number(order.subtotal))
-        : await refundGateway(payment.id, totalCustomerRefund, idempotencyKey, actor, tx);
-
-      // Ledger — REFUND: no-shortfall path only. If ANY affected
-      // seller/store had a shortfall this call, postRefund is skipped
-      // entirely — no fake balancing leg, no new Ledger account; the
-      // refund business operation and its SellerPayoutLiability row(s)
-      // above are unaffected either way. eventId = PaymentRefund.id,
-      // same transaction.
-      if (!anyShortfall) {
+      // P2.4 — persist the real ledgerStatus outcome of THIS call now that
+      // Pass 2's seller-wallet clawback has actually run (never computed
+      // later, never inferred from current Wallet.balance — see
+      // PaymentRefundLedgerStatus's schema.prisma doc comment).
+      //
+      // WALLET: money movement is immediate, so the Ledger REFUND event is
+      // still posted immediately too, exactly as before this change — only
+      // when there was no shortfall. On a shortfall, no REFUND is posted
+      // (fabricating a clean settlement reversal would misstate an
+      // incomplete clawback) and there is no later confirmation step for a
+      // WALLET refund (it is already PROCESSED) to post it from — the gap
+      // is left for manual reconciliation, same as the GATEWAY shortfall
+      // case below.
+      //
+      // GATEWAY: postRefund is NEVER called here regardless of anyShortfall
+      // — deferred until markGatewayRefundProcessed's own claim succeeds
+      // (Case A posts it for POSTABLE, Case B deliberately skips it for
+      // SHORTFALL_HELD) — see that function's doc comment.
+      let finalRefund;
+      if (payment.method === 'WALLET' && !anyShortfall) {
         await postRefund(tx, {
           eventId: refund.id,
           actorId: null,
@@ -832,6 +877,12 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
           customerAmount: totalCustomerRefund,
           sellerRefunds: Array.from(storeDebits.values()).map(({ sellerId, amount }) => ({ sellerId, amount })),
           commissionAmount: totalCommission,
+        });
+        finalRefund = await tx.paymentRefund.update({ where: { id: refund.id }, data: { ledgerStatus: 'POSTED' } });
+      } else {
+        finalRefund = await tx.paymentRefund.update({
+          where: { id: refund.id },
+          data: { ledgerStatus: anyShortfall ? 'SHORTFALL_HELD' : 'POSTABLE' },
         });
       }
 
@@ -851,7 +902,7 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
         });
       }
 
-      return { refund, totalCustomerRefund, itemsRefunded: refundLines.length };
+      return { refund: finalRefund, totalCustomerRefund, itemsRefunded: refundLines.length };
     }, { isolationLevel: 'Serializable' });
   } catch (err) {
     // A Serializable transaction conflict (Prisma P2034) means this refund
