@@ -237,6 +237,31 @@ const EVENT_ACCOUNT_MAP = {
       creditOwnerType: 'PAYMENT_GATEWAY_CLEARING',
     },
   },
+  // P2.5 Part B — OPENING_BALANCE. Decision Gate 3 (approved): the
+  // migration CREDITs the wallet account being initialized (increasing its
+  // Ledger balance from 0 toward Wallet.balance at the cutover instant) and
+  // DEBITs PLATFORM_CASH as the balancing counterpart — same direction
+  // convention as every other wrapper in this codebase that adds funds to a
+  // wallet (CREDIT increments, DEBIT decrements Account.balance; compare
+  // postSettlement/postRefund, which also CREDIT the wallet they fund).
+  // [P2.5 Part B correction] An earlier revision had this backwards (DEBIT
+  // wallet / CREDIT PLATFORM_CASH), copied literally from the P2.5 spec's
+  // illustrative wording without checking it against this codebase's own
+  // convention — see postOpeningBalance's own doc comment for the full
+  // explanation. `debitOwnerType` names PLATFORM_CASH here (the account
+  // that is debited), mirroring the naming convention already used by
+  // PAYOUT_PROCESSED/PAYMENT_REVERSED above where the platform-owned side
+  // is named by its own direction. The wallet side's ownerType is
+  // caller-supplied per account (CUSTOMER_WALLET or SELLER_WALLET — never
+  // both for the same account), not fixed here, since a single migration
+  // run touches accounts of both owner types. This is an
+  // accounting-initialization mapping approved for the P2.5 migration
+  // only — see scripts/p2_5-opening-balance-migration.js's header comment —
+  // not a reconstruction of any real historical payment/settlement/refund
+  // event.
+  OPENING_BALANCE: {
+    debitOwnerType: 'PLATFORM_CASH',
+  },
 };
 
 module.exports = {

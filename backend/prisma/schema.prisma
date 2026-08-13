@@ -1062,6 +1062,16 @@ enum LedgerEventType {
   // orders.service.js#markGatewayRefundProcessed's origin-based branching).
   // Never used for a delivered-order refund — that remains REFUND.
   PAYMENT_REVERSED
+  // P2.5 Part B — one-time Ledger initialization for a CUSTOMER_WALLET or
+  // SELLER_WALLET account whose historical financial events predate (or are
+  // otherwise not safely reconstructable into) typed Ledger journals. Posted
+  // exactly once per eligible account by the P2.5 opening-balance migration
+  // (scripts/p2_5-opening-balance-migration.js), eventId =
+  // `OPENING_BALANCE:${accountId}`. Deliberately NOT reused for, or by, any
+  // other event type — it represents an accounting initialization, not a
+  // reconstructed payment/refund/settlement (see that script's own header
+  // comment and the P2.5 Part B decision log it references).
+  OPENING_BALANCE
 }
 
 // A financial account in the double-entry sense — NOT the existing Wallet

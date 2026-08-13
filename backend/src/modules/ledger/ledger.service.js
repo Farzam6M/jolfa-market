@@ -188,10 +188,16 @@ function sumByDirection(legs, direction) {
  * @param {string|null} [params.actorId]
  * @param {string} [params.currency]
  * @param {Array<{accountId: string, direction: 'DEBIT'|'CREDIT', amount: string|number|Prisma.Decimal}>} params.legs
+ * @param {Date} [params.createdAt] - P2.5 Part B addition. Explicit Journal
+ *   timestamp override; defaults to the column's own `@default(now())` when
+ *   omitted, so every pre-P2.5 caller is unaffected. Added solely so the
+ *   opening-balance migration can stamp every Journal in one batch with the
+ *   same fixed cutover instant (P2.5 spec §8.5) instead of each call's own
+ *   real `now()` — no other caller in this codebase passes it.
  * @returns {Promise<{journal: object, entries: object[], idempotentReplay: boolean}>}
  */
 async function postJournal(tx, {
-  eventType, eventId, actorId = null, currency = LEDGER_CURRENCY, legs,
+  eventType, eventId, actorId = null, currency = LEDGER_CURRENCY, legs, createdAt,
 }) {
   if (!tx) throw ApiError.internal('postJournal requires an in-flight transaction client');
   if (!eventType) throw ApiError.badRequest('postJournal requires eventType');
@@ -233,7 +239,11 @@ async function postJournal(tx, {
   try {
     const journal = await tx.journal.create({
       data: {
-        eventType, eventId, actorId, currency,
+        eventType,
+        eventId,
+        actorId,
+        currency,
+        ...(createdAt ? { createdAt } : {}),
       },
     });
     const entries = [];
@@ -933,12 +943,93 @@ async function postPaymentReversed(tx, {
   });
 }
 
+/**
+ * Thin semantic wrapper over postJournal for the P2.5 Part B OPENING_BALANCE
+ * event. Posts CREDIT <ownerType>(ownerId) / DEBIT PLATFORM_CASH for
+ * `amount` — the mapping in ledger.constants.js's
+ * EVENT_ACCOUNT_MAP.OPENING_BALANCE, approved for the P2.5 opening-balance
+ * migration only (Decision Gate 3). This is NOT a reconstruction of any real
+ * historical payment/settlement/refund/payout event — it is a one-time
+ * accounting initialization of a CUSTOMER_WALLET or SELLER_WALLET account
+ * from Wallet.balance at a fixed migration cutover instant. Never called
+ * from any live runtime financial code path — only from
+ * scripts/p2_5-opening-balance-migration.js.
+ *
+ * [P2.5 Part B correction] The wallet leg is CREDIT (not DEBIT — a prior
+ * revision of this wrapper copied the DEBIT/CREDIT wording from the P2.5
+ * spec's illustrative example literally, without checking it against this
+ * codebase's own established Account.balance convention). postJournal's
+ * balance-update code increments Account.balance on CREDIT and decrements
+ * it on DEBIT, and every other wired wrapper in this file that adds money
+ * to a CUSTOMER_WALLET/SELLER_WALLET follows that same convention:
+ * postSettlement and postRefund both CREDIT the wallet they're crediting;
+ * postWalletPaymentConfirmed and postLiabilityRecovery both DEBIT the
+ * wallet when money leaves it. A DEBIT here would have decreased a
+ * freshly-created (zero-balance) wallet account into negative territory
+ * for a positive opening amount — the opposite of what "initialize this
+ * account's balance to match Wallet.balance" requires. CREDIT wallet /
+ * DEBIT PLATFORM_CASH is the correct direction under this codebase's
+ * convention, matching every other event that adds funds to a wallet.
+ *
+ * `ownerType` is caller-supplied (CUSTOMER_WALLET or SELLER_WALLET) since a
+ * single migration run initializes accounts of both owner types; unlike
+ * every other wrapper in this file, OPENING_BALANCE's credited side is not
+ * fixed to one owner type in EVENT_ACCOUNT_MAP.
+ *
+ * `eventId` MUST be `OPENING_BALANCE:${account.id}` (P2.5 spec §8.1) — the
+ * caller (the migration script) is responsible for constructing it from the
+ * account row already resolved via getOrCreateAccount, so this wrapper
+ * accepts it as-is rather than re-deriving it, keeping the eventId
+ * convention visible and auditable at the call site.
+ *
+ * Same "operates inside the caller's transaction, opens none of its own"
+ * contract as the other wrappers. All idempotency (including not
+ * double-applying the Account.balance update on replay) is handled by
+ * postJournal itself via (eventType, eventId) — this wrapper adds no
+ * idempotency logic of its own.
+ *
+ * @param {import('@prisma/client').Prisma.TransactionClient} tx
+ * @param {object} params
+ * @param {string} params.eventId - `OPENING_BALANCE:${accountId}`
+ * @param {'CUSTOMER_WALLET'|'SELLER_WALLET'} params.ownerType
+ * @param {string} params.accountId - the already-resolved wallet Account.id
+ * @param {string|number|Prisma.Decimal} params.amount - Wallet.balance at the fixed cutover instant; must be > 0
+ * @param {Date} params.cutoverAt - the single fixed cutover timestamp for the whole migration batch (P2.5 spec §8.5)
+ * @param {string} [params.currency]
+ * @returns {Promise<{journal: object, entries: object[], idempotentReplay: boolean}>}
+ */
+async function postOpeningBalance(tx, {
+  eventId, ownerType, accountId, amount, cutoverAt, currency = LEDGER_CURRENCY,
+}) {
+  if (ownerType !== 'CUSTOMER_WALLET' && ownerType !== 'SELLER_WALLET') {
+    throw ApiError.internal('postOpeningBalance requires ownerType CUSTOMER_WALLET or SELLER_WALLET');
+  }
+  if (!accountId) throw ApiError.internal('postOpeningBalance requires accountId');
+  if (!cutoverAt) throw ApiError.internal('postOpeningBalance requires cutoverAt');
+
+  const mapping = EVENT_ACCOUNT_MAP.OPENING_BALANCE;
+  const cashAccount = await getOrCreateAccount(tx, mapping.debitOwnerType, PLATFORM_LEDGER_OWNER_ID, currency);
+
+  return postJournal(tx, {
+    eventType: 'OPENING_BALANCE',
+    eventId,
+    actorId: null,
+    currency,
+    createdAt: cutoverAt,
+    legs: [
+      { accountId, direction: 'CREDIT', amount },
+      { accountId: cashAccount.id, direction: 'DEBIT', amount },
+    ],
+  });
+}
+
 module.exports = {
   getOrCreateAccount,
   postJournal,
   postPaymentConfirmed,
   postWalletPaymentConfirmed,
   postSettlement,
+  postOpeningBalance,
   postPayoutReserve,
   postPayoutRelease,
   postPayoutProcessed,
