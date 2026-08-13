@@ -467,4 +467,8 @@ if (require.main === module) {
     .finally(() => prisma.$disconnect());
 }
 
-module.exports = { runMigration, classifyOwnerType };
+module.exports = {
+  runMigration,
+  classifyOwnerType,
+  postOpeningBalanceForWallet,
+};
