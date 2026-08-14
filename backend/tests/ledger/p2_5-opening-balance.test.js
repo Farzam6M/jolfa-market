@@ -31,9 +31,23 @@
  * suites, and never depend on execution order. Cleanup in `afterAll`
  * removes only rows this file created — LedgerEntry/Journal/Account by
  * tracked id, Order by tracked id, User by tracked id (Wallet/Store cascade
- * from User deletion; Order does not, so it is deleted first) — the shared
- * PLATFORM_CASH account itself is never deleted, only reused (same
- * convention as ledger.service.test.js's own PLATFORM_CASH handling).
+ * from User deletion; Order does not, so it is deleted first).
+ *
+ * PLATFORM_CASH is shared/singleton (ownerType='PLATFORM_CASH', ownerId=
+ * PLATFORM_LEDGER_OWNER_ID) and every postOpeningBalance/postJournal call
+ * in this file mutates its cached Account.balance column as a DEBIT leg —
+ * deleting only the LedgerEntry/Journal rows this file created (as above)
+ * would leave that cached balance permanently drifted by this file's own
+ * posted amounts, since postJournal's balance increment/decrement is
+ * independent of the LedgerEntry row itself. `beforeAll` snapshots
+ * PLATFORM_CASH's pre-test { id, balance } (or records that it did not yet
+ * exist); `afterAll` then either restores that exact balance (if it
+ * pre-existed — this file never touches its prior Journal/LedgerEntry
+ * rows, only its own tracked ones, so only the cached column needs
+ * correcting) or removes the account entirely (if this file created it
+ * fresh and no foreign LedgerEntry rows remain on it afterward). Net
+ * effect either way: PLATFORM_CASH is left in exactly the state this file
+ * found it in.
  *
  * Requires a real Postgres database (DATABASE_URL), migrated:
  *   NODE_ENV=test npx jest tests/ledger/p2_5-opening-balance.test.js --runInBand
@@ -49,6 +63,15 @@ const {
 } = require('../../scripts/p2_5-opening-balance-migration');
 
 let roles;
+// Captured in `beforeAll`, before this file posts anything — either the
+// pre-existing PLATFORM_CASH Account row's { id, balance }, or `null` if
+// no PLATFORM_CASH account existed yet. Used by `afterAll` to leave
+// PLATFORM_CASH in EXACTLY the state this file found it in: restore the
+// original cached balance if the account pre-existed (its own prior
+// Journal/LedgerEntry rows are never touched by this file's cleanup, only
+// its own tracked ones are, so only the cached balance column needs
+// correcting), or remove the account entirely if this file created it.
+let platformCashSnapshot;
 
 const createdUserIds = [];
 const createdOrderIds = [];
@@ -136,6 +159,41 @@ afterAll(async () => {
     // Cascades Wallet + Store.
     await prisma.user.deleteMany({ where: { id: { in: createdUserIds } } });
   }
+
+  // Leave PLATFORM_CASH in exactly the state this file found it in.
+  // Must run AFTER the LedgerEntry/Journal cleanup above, so the "any
+  // entries left on it?" check below reflects only rows outside this
+  // file's own tracked events.
+  const platformCashNow = await prisma.account.findUnique({
+    where: {
+      ownerType_ownerId_currency: { ownerType: 'PLATFORM_CASH', ownerId: PLATFORM_LEDGER_OWNER_ID, currency: LEDGER_CURRENCY },
+    },
+  });
+  if (platformCashNow) {
+    if (platformCashSnapshot) {
+      // Pre-existed this file's run: this file never deleted its prior
+      // Journal/LedgerEntry rows (only its own tracked ones), so the only
+      // thing this file could have thrown off is the cached balance
+      // column — restore it to the exact pre-test value. A direct set
+      // (not a computed increment/decrement) so this is correct
+      // regardless of how many postings this file made.
+      await prisma.account.update({
+        where: { id: platformCashNow.id },
+        data: { balance: platformCashSnapshot.balance },
+      });
+    } else {
+      // Did not exist before this file ran, so this file itself created
+      // it (via getOrCreateAccount inside postOpeningBalance/postJournal).
+      // Only remove it if no LedgerEntry rows remain on it — if any do,
+      // something outside this file's own tracked events touched it
+      // concurrently, and deleting it would be unsafe.
+      const remainingEntries = await prisma.ledgerEntry.count({ where: { accountId: platformCashNow.id } });
+      if (remainingEntries === 0) {
+        await prisma.account.delete({ where: { id: platformCashNow.id } });
+      }
+    }
+  }
+
   await prisma.$disconnect();
 });
 
@@ -145,6 +203,18 @@ beforeAll(async () => {
   if (!roles.CUSTOMER || !roles.SELLER) {
     throw new Error('P2.5 tests require CUSTOMER and SELLER roles to be seeded (run prisma/seed.js)');
   }
+
+  // Snapshot PLATFORM_CASH's state BEFORE this file posts anything, so
+  // afterAll can restore it exactly (see platformCashSnapshot's doc
+  // comment above).
+  const existingPlatformCash = await prisma.account.findUnique({
+    where: {
+      ownerType_ownerId_currency: { ownerType: 'PLATFORM_CASH', ownerId: PLATFORM_LEDGER_OWNER_ID, currency: LEDGER_CURRENCY },
+    },
+  });
+  platformCashSnapshot = existingPlatformCash
+    ? { id: existingPlatformCash.id, balance: existingPlatformCash.balance.toString() }
+    : null;
 });
 
 // ─────────────────────────────────────────────────────────────────────────
