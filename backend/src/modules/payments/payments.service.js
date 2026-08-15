@@ -92,31 +92,29 @@ async function initGatewayPayment(order) {
   });
 }
 
-async function payCashOnDelivery(order) {
-  return prisma.$transaction(async (tx) => {
-    // Same atomic claim as payWithWallet — see comment there.
-    const claimed = await tx.order.updateMany({ where: { id: order.id, status: 'PENDING' }, data: { status: 'CONFIRMED' } });
-    if (claimed.count === 0) throw ApiError.conflict('این سفارش قبلاً پرداخت شده یا در وضعیت دیگری است');
-
-    const payment = await tx.payment.create({
-      data: {
-        orderId: order.id, method: 'CASH_ON_DELIVERY', amount: order.total, status: 'PENDING',
-      },
-    });
-    return payment;
-  });
-}
-
+// CASH_ON_DELIVERY is out of scope (P2.7 — COD scope closure): no code path
+// in this codebase ever creates a COD Payment, transitions one to SUCCESS,
+// collects COD cash, or posts a COD Ledger event. paySchema (see
+// payments.validation.js) already rejects 'CASH_ON_DELIVERY' at the HTTP
+// boundary before this function is ever reached, but `method` is re-checked
+// explicitly here too — an internal/authoritative guard rather than a
+// silent fallback, so this service can never be made to create an
+// unsupported-method Payment even if called some other way in the future.
+// Historical rows with method = CASH_ON_DELIVERY may still exist from
+// before this closure (see this repo's PaymentMethod enum, which is left
+// unchanged for that reason) — they are read-only history now, never a
+// path new payments can take.
 async function pay(userId, { orderId, method }) {
+  if (method !== 'WALLET' && method !== 'GATEWAY') {
+    throw ApiError.badRequest('روش پرداخت پشتیبانی نمی‌شود');
+  }
+
   const order = await prisma.order.findUnique({ where: { id: orderId } });
   if (!order) throw ApiError.notFound('سفارش یافت نشد');
   if (order.userId !== userId) throw ApiError.forbidden('این سفارش متعلق به شما نیست');
   if (order.status !== 'PENDING') throw ApiError.conflict('این سفارش قبلاً پرداخت شده یا در وضعیت دیگری است');
 
-  let payment;
-  if (method === 'WALLET') payment = await payWithWallet(order, userId);
-  else if (method === 'GATEWAY') payment = await initGatewayPayment(order);
-  else payment = await payCashOnDelivery(order);
+  const payment = method === 'WALLET' ? await payWithWallet(order, userId) : await initGatewayPayment(order);
 
   if (payment.status === 'SUCCESS') {
     await pushNotification({ icon: 'i-wallet', text: `پرداخت سفارش ${order.orderNumber} با موفقیت انجام شد`, scope: 'USER', targetUserId: userId });

@@ -157,21 +157,6 @@ describe('Pre-delivery cancellation refunds', () => {
     product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 100000, stock: 100 });
   });
 
-  test('COD cancellation produces no refund — COD is never SUCCESS before delivery', async () => {
-    const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
-    await payCOD(customer.auth, order.id);
-
-    const cancelled = await cancelOrder(order.id, admin.auth);
-    expect(cancelled.status).toBe(200);
-    expect(cancelled.body.data.status).toBe('CANCELLED');
-
-    const refunds = await prisma.paymentRefund.findMany({ where: { orderId: order.id } });
-    expect(refunds.length).toBe(0);
-
-    const payment = await prisma.payment.findFirst({ where: { orderId: order.id } });
-    expect(payment.status).toBe('PENDING'); // untouched — nothing was ever charged
-  });
-
   test('WALLET cancellation credits the customer wallet back and marks the Payment REFUNDED', async () => {
     const walletBefore = await prisma.wallet.findUnique({ where: { userId: customer.user.id } });
     const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);

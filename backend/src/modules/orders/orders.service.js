@@ -546,7 +546,9 @@ async function updateStatus(orderId, status, actor) {
       // check above and both attempt to settle — this makes "is it still
       // SENT" and "flip it to DELIVERED" one atomic DB operation, the same
       // compare-and-swap pattern used for stock (checkout) and payments
-      // (payWithWallet/payCashOnDelivery claiming PENDING->CONFIRMED).
+      // (payWithWallet claiming PENDING->CONFIRMED; historical COD orders
+      // claimed PENDING->CONFIRMED the same way before COD was closed out
+      // as an unsupported payment method — see payments.service.js#pay).
       const claimed = await tx.order.updateMany({ where: { id: orderId, status: 'SENT' }, data: { status } });
       if (claimed.count === 0) {
         // Lost the race to a concurrent request that already delivered
@@ -574,10 +576,11 @@ async function updateStatus(orderId, status, actor) {
 
       // Pre-delivery cancellation refund (Phase 4). Only a payment that
       // actually SUCCEEDED needs reversing:
-      //   - COD is never SUCCESS at this point in the flow (see
-      //     payments.service.js#payCashOnDelivery — nothing in this
-      //     codebase ever marks a COD payment SUCCESS before delivery), so
-      //     it naturally falls through with no refund, matching the
+      //   - COD is never SUCCESS at this point in the flow — no code path
+      //     in this codebase ever marks a COD payment SUCCESS before
+      //     delivery, and new COD payments can no longer be created at all
+      //     (see payments.service.js#pay) — so any (historical) COD
+      //     payment naturally falls through with no refund, matching the
       //     "COD was never charged" rule.
       //   - WALLET is refunded immediately (money lives entirely in this
       //     app).

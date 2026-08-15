@@ -722,23 +722,6 @@ describe('Payments', () => {
     category = cat.body.data;
   });
 
-  test('cash-on-delivery: payment stays PENDING but the order is CONFIRMED', async () => {
-    const product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 15000, stock: 5 });
-    await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: product.id, qty: 1 });
-    const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', customer.auth).send({});
-
-    const pay = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
-      .send({ orderId: order.body.data.id, method: 'CASH_ON_DELIVERY' });
-    expect(pay.status).toBe(201);
-    expect(pay.body.data.status).toBe('PENDING');
-    // Payment amount is order.total (subtotal + the flat SHIPPING_FEE of
-    // 45000 from cart.service.js), not just the product's price/subtotal.
-    expect(Number(pay.body.data.amount)).toBe(15000 + 45000);
-
-    const updatedOrder = await prisma.order.findUnique({ where: { id: order.body.data.id } });
-    expect(updatedOrder.status).toBe('CONFIRMED');
-  });
-
   test('a client cannot forge the payment amount — it always comes from the order', async () => {
     const product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 15000, stock: 5 });
     await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: product.id, qty: 1 });
@@ -746,7 +729,7 @@ describe('Payments', () => {
 
     const pay = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
       .send({
-        orderId: order.body.data.id, method: 'CASH_ON_DELIVERY', amount: 1,
+        orderId: order.body.data.id, method: 'GATEWAY', amount: 1,
       }); // "amount" isn't part of the schema — must be silently stripped, not applied
     expect(pay.status).toBe(201);
     // order.total = subtotal (15000) + shipping (45000), never the forged "1".
@@ -760,7 +743,7 @@ describe('Payments', () => {
     const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', customer.auth).send({});
 
     const res = await api.post(`${PREFIX}/payments`).set('Authorization', otherCustomer.auth)
-      .send({ orderId: order.body.data.id, method: 'CASH_ON_DELIVERY' });
+      .send({ orderId: order.body.data.id, method: 'GATEWAY' });
     expect(res.status).toBe(403);
   });
 
@@ -824,9 +807,9 @@ describe('Payments', () => {
     const stillOrder = await prisma.order.findUnique({ where: { id: order.body.data.id } });
     expect(stillOrder.status).toBe('PENDING'); // not CONFIRMED, not stuck — customer can still retry payment
 
-    // The order is still PENDING, so a second, different-method payment attempt succeeds.
+    // The order is still PENDING, so a second payment attempt succeeds.
     const retry = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
-      .send({ orderId: order.body.data.id, method: 'CASH_ON_DELIVERY' });
+      .send({ orderId: order.body.data.id, method: 'GATEWAY' });
     expect(retry.status).toBe(201);
   });
 
@@ -882,17 +865,24 @@ describe('Payments', () => {
   });
 
   test('cannot pay an order that is already paid/confirmed', async () => {
-    const product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 15000, stock: 5 });
-    await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth).send({ productId: product.id, qty: 1 });
-    const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', customer.auth).send({});
-    await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
-      .send({ orderId: order.body.data.id, method: 'CASH_ON_DELIVERY' });
+    // Dedicated, wallet-funded customer (rather than the shared `customer`)
+    // so the first payment attempt actually confirms the order synchronously
+    // — WALLET is the only supported method that does so immediately, which
+    // this test needs in order to then exercise the already-paid conflict.
+    const paidCustomer = await makeUser('CUSTOMER', '52400000' + Math.floor(Math.random() * 9));
+    await prisma.wallet.create({ data: { userId: paidCustomer.user.id, balance: 100000 } });
 
-    const again = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
-      .send({ orderId: order.body.data.id, method: 'CASH_ON_DELIVERY' });
+    const product = await makeApprovedProduct(seller.auth, admin.auth, category.id, { price: 15000, stock: 5 });
+    await api.post(`${PREFIX}/cart/items`).set('Authorization', paidCustomer.auth).send({ productId: product.id, qty: 1 });
+    const order = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', paidCustomer.auth).send({});
+    await api.post(`${PREFIX}/payments`).set('Authorization', paidCustomer.auth)
+      .send({ orderId: order.body.data.id, method: 'WALLET' });
+
+    const again = await api.post(`${PREFIX}/payments`).set('Authorization', paidCustomer.auth)
+      .send({ orderId: order.body.data.id, method: 'WALLET' });
     expect(again.status).toBe(409);
 
-    const viaGateway = await api.post(`${PREFIX}/payments`).set('Authorization', customer.auth)
+    const viaGateway = await api.post(`${PREFIX}/payments`).set('Authorization', paidCustomer.auth)
       .send({ orderId: order.body.data.id, method: 'GATEWAY' });
     expect(viaGateway.status).toBe(409);
   });

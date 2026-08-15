@@ -1,8 +1,13 @@
 const { z } = require('zod');
 
+// CASH_ON_DELIVERY is intentionally excluded here (P2.7 — COD scope
+// closure): it remains a valid PaymentMethod enum value at the DB level
+// (historical rows may still carry it — see payments.service.js#pay's own
+// comment), and listQuerySchema below still allows filtering by it for
+// exactly that reason, but it must never be accepted for a NEW payment.
 const paySchema = z.object({
   orderId: z.string().uuid(),
-  method: z.enum(['WALLET', 'GATEWAY', 'CASH_ON_DELIVERY']),
+  method: z.enum(['WALLET', 'GATEWAY']),
 });
 
 // Generic placeholder shape for a gateway webhook payload — every real
