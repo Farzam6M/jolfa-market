@@ -29,9 +29,27 @@
  * signals are real Store/Order existence, not mockable), each with a
  * unique suffix so tests never collide with each other or with other
  * suites, and never depend on execution order. Cleanup in `afterAll`
- * removes only rows this file created — LedgerEntry/Journal/Account by
- * tracked id, Order by tracked id, User by tracked id (Wallet/Store cascade
- * from User deletion; Order does not, so it is deleted first).
+ * removes the LedgerEntry/Journal/Account rows this file created, by
+ * tracked id, routed through the P2.6 Step 2F maintenance client (see
+ * tests/helpers/maintenance-client.js) since jolfa_app intentionally has
+ * no DELETE on those tables.
+ *
+ * P2.6 Step 2F correction: this file's Order/User fixtures are
+ * DELIBERATELY NOT deleted in `afterAll` (createdOrderIds/createdUserIds
+ * are still tracked, for clarity/possible future use, but nothing
+ * iterates them for deletion). `orders.userId` is `ON DELETE RESTRICT`
+ * (see the 20260716222658_init migration), so a created User cannot be
+ * removed while its Order still exists; and no role — not jolfa_app, not
+ * jolfa_maintenance — is granted DELETE on `orders` (a deliberate
+ * least-privilege boundary: `orders` is a real business table with no
+ * production `src/` code path that deletes a row from it, so no test
+ * role is widened just for cleanup convenience). Leaving these rows
+ * behind matches the convention already used by every other test suite
+ * in this repo that creates Order rows (e.g. order-refund.test.js,
+ * order-settlement.test.js, admin-sellers-deletion.test.js,
+ * chat-notifications-socket.test.js) — none of them delete their Order
+ * or owning User fixtures either. Each fixture here has a unique random
+ * suffix, so leftover rows never collide with or affect later runs.
  *
  * PLATFORM_CASH is shared/singleton (ownerType='PLATFORM_CASH', ownerId=
  * PLATFORM_LEDGER_OWNER_ID) and every postOpeningBalance/postJournal call
@@ -55,6 +73,7 @@
 const crypto = require('crypto');
 const { Prisma } = require('@prisma/client');
 const { prisma } = require('../../src/config/database');
+const { getMaintenanceClient, disconnectMaintenanceClient } = require('../helpers/maintenance-client');
 const { postJournal, getOrCreateAccount } = require('../../src/modules/ledger/ledger.service');
 const { PLATFORM_LEDGER_OWNER_ID, LEDGER_CURRENCY } = require('../../src/modules/ledger/ledger.constants');
 const {
@@ -136,6 +155,12 @@ async function makeOrder(userId, total = '1000') {
 }
 
 afterAll(async () => {
+  // P2.6 Step 2F: journals/ledger_entries/ledger_accounts DELETE requires
+  // the jolfa_maintenance role — the shared `prisma` client (jolfa_app)
+  // is used below only for read-only lookups. See
+  // tests/helpers/maintenance-client.js.
+  const maintenance = getMaintenanceClient();
+
   // Children first (FK onDelete: Restrict on ledger_entries ->
   // journals/ledger_accounts), same convention as ledger.service.test.js.
   const journalWhere = { OR: createdEventIds.map(([eventType, eventId]) => ({ eventType, eventId })) };
@@ -143,22 +168,20 @@ afterAll(async () => {
     const journals = await prisma.journal.findMany({ where: journalWhere, select: { id: true } });
     const journalIds = journals.map((j) => j.id);
     if (journalIds.length > 0) {
-      await prisma.ledgerEntry.deleteMany({ where: { journalId: { in: journalIds } } });
+      await maintenance.ledgerEntry.deleteMany({ where: { journalId: { in: journalIds } } });
     }
-    await prisma.journal.deleteMany({ where: journalWhere });
+    await maintenance.journal.deleteMany({ where: journalWhere });
   }
   if (createdAccountIds.length > 0) {
     // Never includes the shared PLATFORM_CASH account id — only the
     // per-test CUSTOMER_WALLET/SELLER_WALLET accounts this file created.
-    await prisma.account.deleteMany({ where: { id: { in: createdAccountIds } } });
+    await maintenance.account.deleteMany({ where: { id: { in: createdAccountIds } } });
   }
-  if (createdOrderIds.length > 0) {
-    await prisma.order.deleteMany({ where: { id: { in: createdOrderIds } } });
-  }
-  if (createdUserIds.length > 0) {
-    // Cascades Wallet + Store.
-    await prisma.user.deleteMany({ where: { id: { in: createdUserIds } } });
-  }
+
+  // P2.6 Step 2F: Order/User fixtures (createdOrderIds/createdUserIds)
+  // are intentionally NOT deleted here — see the file-level doc comment
+  // above ("orders.userId is ON DELETE RESTRICT, and no role is granted
+  // DELETE on orders") for why, and why leaving them is safe.
 
   // Leave PLATFORM_CASH in exactly the state this file found it in.
   // Must run AFTER the LedgerEntry/Journal cleanup above, so the "any
@@ -176,7 +199,9 @@ afterAll(async () => {
       // thing this file could have thrown off is the cached balance
       // column — restore it to the exact pre-test value. A direct set
       // (not a computed increment/decrement) so this is correct
-      // regardless of how many postings this file made.
+      // regardless of how many postings this file made. This is a plain
+      // UPDATE on ledger_accounts, which jolfa_app is already granted, so
+      // it stays on the shared `prisma` client, not the maintenance one.
       await prisma.account.update({
         where: { id: platformCashNow.id },
         data: { balance: platformCashSnapshot.balance },
@@ -186,14 +211,16 @@ afterAll(async () => {
       // it (via getOrCreateAccount inside postOpeningBalance/postJournal).
       // Only remove it if no LedgerEntry rows remain on it — if any do,
       // something outside this file's own tracked events touched it
-      // concurrently, and deleting it would be unsafe.
+      // concurrently, and deleting it would be unsafe. A DELETE on
+      // ledger_accounts, so this goes through the maintenance client.
       const remainingEntries = await prisma.ledgerEntry.count({ where: { accountId: platformCashNow.id } });
       if (remainingEntries === 0) {
-        await prisma.account.delete({ where: { id: platformCashNow.id } });
+        await maintenance.account.delete({ where: { id: platformCashNow.id } });
       }
     }
   }
 
+  await disconnectMaintenanceClient();
   await prisma.$disconnect();
 });
 

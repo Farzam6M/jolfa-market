@@ -41,6 +41,7 @@
 const crypto = require('crypto');
 const { Prisma } = require('@prisma/client');
 const { prisma } = require('../../src/config/database');
+const { getMaintenanceClient, disconnectMaintenanceClient } = require('../helpers/maintenance-client');
 const {
   getOrCreateAccount, postJournal, postPaymentConfirmed, postWalletPaymentConfirmed, postPaymentReversed, postSettlement, postPayoutReserve, postPayoutRelease, postPayoutProcessed, postRefund, postLiabilityRecovery,
 } = require('../../src/modules/ledger/ledger.service');
@@ -60,6 +61,14 @@ async function makeAccount(tx, ownerType, ownerId) {
 }
 
 afterAll(async () => {
+  // P2.6 Step 2F: journals/ledger_entries/ledger_accounts are immutable
+  // under the ledger_immutability_guard trigger and jolfa_app's grants —
+  // only a session authenticated as jolfa_maintenance may DELETE them.
+  // The shared `prisma` client (jolfa_app) is used for the read-only
+  // lookups below; only the actual deleteMany calls go through the
+  // maintenance client. See tests/helpers/maintenance-client.js.
+  const maintenance = getMaintenanceClient();
+
   // Children first (FK onDelete: Restrict on ledger_entries -> journals/
   // ledger_accounts, per the 20260811000000_ledger_foundation migration).
   const journalWhere = {
@@ -69,13 +78,14 @@ afterAll(async () => {
     const journals = await prisma.journal.findMany({ where: journalWhere, select: { id: true } });
     const journalIds = journals.map((j) => j.id);
     if (journalIds.length > 0) {
-      await prisma.ledgerEntry.deleteMany({ where: { journalId: { in: journalIds } } });
+      await maintenance.ledgerEntry.deleteMany({ where: { journalId: { in: journalIds } } });
     }
-    await prisma.journal.deleteMany({ where: journalWhere });
+    await maintenance.journal.deleteMany({ where: journalWhere });
   }
   if (createdAccountIds.length > 0) {
-    await prisma.account.deleteMany({ where: { id: { in: createdAccountIds } } });
+    await maintenance.account.deleteMany({ where: { id: { in: createdAccountIds } } });
   }
+  await disconnectMaintenanceClient();
   await prisma.$disconnect();
 });
 
