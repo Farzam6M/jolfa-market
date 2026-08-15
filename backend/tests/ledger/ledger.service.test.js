@@ -83,7 +83,31 @@ afterAll(async () => {
     await maintenance.journal.deleteMany({ where: journalWhere });
   }
   if (createdAccountIds.length > 0) {
-    await maintenance.account.deleteMany({ where: { id: { in: createdAccountIds } } });
+    // Never delete the shared/singleton PLATFORM_* accounts (ownerId ===
+    // PLATFORM_LEDGER_OWNER_ID) — trackPlatformAccounts/trackAccounts
+    // above push their ids into createdAccountIds alongside this file's
+    // genuinely per-test (random-ownerId) accounts, but PLATFORM_CASH /
+    // PLATFORM_REVENUE / PAYMENT_GATEWAY_CLEARING are platform-wide
+    // infrastructure rows also written to by other test suites that
+    // exercise the same business-flow code (e.g. order-refund.test.js),
+    // which do not delete their own Journal/LedgerEntry rows in cleanup.
+    // Deleting the shared account here would violate
+    // ledger_entries_accountId_fkey (ON DELETE RESTRICT, per the
+    // 20260811000000_ledger_foundation migration) for entries this file
+    // never created and has no way to know about. Same convention
+    // tests/ledger/p2_5-opening-balance.test.js already uses for
+    // PLATFORM_CASH — only uniquely-owned (random ownerId) accounts are
+    // safe to remove.
+    const ownedAccounts = await prisma.account.findMany({
+      where: { id: { in: createdAccountIds } },
+      select: { id: true, ownerId: true },
+    });
+    const deletableAccountIds = ownedAccounts
+      .filter((a) => a.ownerId !== PLATFORM_LEDGER_OWNER_ID)
+      .map((a) => a.id);
+    if (deletableAccountIds.length > 0) {
+      await maintenance.account.deleteMany({ where: { id: { in: deletableAccountIds } } });
+    }
   }
   await disconnectMaintenanceClient();
   await prisma.$disconnect();

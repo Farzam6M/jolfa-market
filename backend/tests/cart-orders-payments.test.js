@@ -43,17 +43,43 @@ let roles;
 
 async function makeUser(roleKey, mobileSuffix) {
   const passwordHash = await bcrypt.hash('Passw0rd!23', 4);
-  const user = await prisma.user.create({
-    data: {
-      name: `Test ${roleKey} ${mobileSuffix}`,
-      mobile: `09${mobileSuffix}`,
-      passwordHash,
-      roleId: roles[roleKey].id,
-      status: 'ACTIVE',
-    },
-  });
-  const token = signAccessToken({ sub: user.id });
-  return { user, token, auth: `Bearer ${token}` };
+  // This suite never deletes the User rows it creates (Users are left
+  // behind across runs, same convention already documented for Order/User
+  // fixtures elsewhere in this repo, e.g. tests/ledger/p2_5-opening-balance
+  // .test.js). Every call site's mobileSuffix ends in only a single random
+  // digit (Math.random() * 9), a 9-value pool that's fine for avoiding
+  // collisions *within* one run but is guaranteed to eventually collide
+  // with a same-prefix row a prior run already left behind. On that one
+  // specific conflict, retry a few times with the trailing 3 digits
+  // rerandomized (1000x the pool) instead of failing outright — this does
+  // not change the mobile on the happy path, so it's a no-op for a clean
+  // database and only kicks in against real stale-data collisions.
+  let lastError;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      const mobile = `09${mobileSuffix}`;
+      // eslint-disable-next-line no-await-in-loop
+      const user = await prisma.user.create({
+        data: {
+          name: `Test ${roleKey} ${mobileSuffix}`,
+          mobile,
+          passwordHash,
+          roleId: roles[roleKey].id,
+          status: 'ACTIVE',
+        },
+      });
+      const token = signAccessToken({ sub: user.id });
+      return { user, token, auth: `Bearer ${token}` };
+    } catch (err) {
+      if (err.code === 'P2002' && err.meta?.target?.includes('mobile')) {
+        lastError = err;
+        mobileSuffix = mobileSuffix.slice(0, -3) + String(Math.floor(Math.random() * 1000)).padStart(3, '0');
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
 }
 
 async function makeApprovedStore(sellerId, name) {
