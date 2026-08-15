@@ -17,6 +17,7 @@
  */
 const request = require('supertest');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const app = require('../src/app');
 const { prisma } = require('../src/config/database');
 const { signAccessToken } = require('../src/utils/tokens');
@@ -25,6 +26,28 @@ const api = request(app);
 const PREFIX = process.env.API_PREFIX || '/api/v1';
 
 let roles;
+
+/**
+ * Generates a collision-resistant 9-digit mobile suffix for synthetic test
+ * users (the app requires mobile to match /^09\d{9}$/, so this value is
+ * always exactly 9 digits).
+ *
+ * The previous pattern ('<8-digit block prefix>' + Math.floor(Math.random() * 9))
+ * left only 9 possible endings per block, which collided with rows already
+ * created by this same suite on a prior run, and with rows created by other
+ * suites sharing the '54' synthetic-mobile namespace (e.g.
+ * order-refund.test.js) against the same persistent, never-truncated test
+ * database.
+ *
+ * `block` is a 2-digit code that preserves the original per-scenario
+ * grouping (still human-readable when eyeballing rows in the DB); the
+ * 5-digit cryptographically random tail gives each block a 100,000-value
+ * collision space instead of 9.
+ */
+function uniqueMobileSuffix(block) {
+  const random5 = crypto.randomInt(0, 100000).toString().padStart(5, '0');
+  return `54${block}${random5}`;
+}
 
 async function makeUser(roleKey, mobileSuffix) {
   const passwordHash = await bcrypt.hash('Passw0rd!23', 4);
@@ -125,9 +148,9 @@ describe('Phase 6 — Liability recovery on settlement', () => {
   let store;
 
   beforeAll(async () => {
-    customer = await makeUser('CUSTOMER', '54000000' + Math.floor(Math.random() * 9));
-    seller = await makeUser('SELLER', '54010000' + Math.floor(Math.random() * 9));
-    admin = await makeUser('ADMIN', '54020000' + Math.floor(Math.random() * 9));
+    customer = await makeUser('CUSTOMER', uniqueMobileSuffix('00'));
+    seller = await makeUser('SELLER', uniqueMobileSuffix('01'));
+    admin = await makeUser('ADMIN', uniqueMobileSuffix('02'));
     store = await makeApprovedStore(seller.user.id, 'فروشگاه بدهی');
     const cat = await api.post(`${PREFIX}/categories`).set('Authorization', admin.auth)
       .send({ name: 'دسته بدهی', slug: `liability-cat-${Date.now()}` });
@@ -202,7 +225,7 @@ describe('Phase 6 — Liability recovery on settlement', () => {
     // between this test's own older/newer liabilities in FIFO (createdAt)
     // order and consume the settlement earning meant for `newer` — same
     // isolation pattern as the 'concurrent settlements' test below.
-    const fifoSeller = await makeUser('SELLER', '54015000' + Math.floor(Math.random() * 9));
+    const fifoSeller = await makeUser('SELLER', uniqueMobileSuffix('03'));
     const fifoStore = await makeApprovedStore(fifoSeller.user.id, 'فروشگاه ترتیب FIFO');
     const fifoProduct = await makeApprovedProduct(fifoSeller.auth, admin.auth, category.id, { price: 40000, stock: 999 });
     await prisma.wallet.upsert({
@@ -244,7 +267,7 @@ describe('Phase 6 — Liability recovery on settlement', () => {
     // 14000/22000/0 math below, which assumes this test's own liability is
     // the only OUTSTANDING one for its seller. Same isolation pattern as
     // the FIFO and 'concurrent settlements' tests.
-    const multiSettleSeller = await makeUser('SELLER', '54018000' + Math.floor(Math.random() * 9));
+    const multiSettleSeller = await makeUser('SELLER', uniqueMobileSuffix('04'));
     const multiSettleStore = await makeApprovedStore(multiSettleSeller.user.id, 'فروشگاه تسویه چندگانه');
     const multiSettleProduct = await makeApprovedProduct(multiSettleSeller.auth, admin.auth, category.id, { price: 40000, stock: 999 });
     await prisma.wallet.upsert({
@@ -271,7 +294,7 @@ describe('Phase 6 — Liability recovery on settlement', () => {
   });
 
   test('seller with no outstanding liability behaves exactly as before Phase 6', async () => {
-    const freshSeller = await makeUser('SELLER', '54030000' + Math.floor(Math.random() * 9));
+    const freshSeller = await makeUser('SELLER', uniqueMobileSuffix('05'));
     const freshStore = await makeApprovedStore(freshSeller.user.id, 'فروشگاه بدون بدهی');
     const freshProduct = await makeApprovedProduct(freshSeller.auth, admin.auth, category.id, { price: 40000, stock: 999 });
     void freshStore;
@@ -294,7 +317,7 @@ describe('Phase 6 — Liability recovery on settlement', () => {
   });
 
   test("seller A's liability is never touched by seller B's settlement", async () => {
-    const sellerB = await makeUser('SELLER', '54040000' + Math.floor(Math.random() * 9));
+    const sellerB = await makeUser('SELLER', uniqueMobileSuffix('06'));
     const storeB = await makeApprovedStore(sellerB.user.id, 'فروشگاه ب');
     const productB = await makeApprovedProduct(sellerB.auth, admin.auth, category.id, { price: 40000, stock: 999 });
     await prisma.wallet.upsert({
@@ -313,7 +336,7 @@ describe('Phase 6 — Liability recovery on settlement', () => {
   });
 
   test('concurrent settlements for the same seller never double-recover the same liability', async () => {
-    const racer = await makeUser('SELLER', '54050000' + Math.floor(Math.random() * 9));
+    const racer = await makeUser('SELLER', uniqueMobileSuffix('07'));
     const racerStore = await makeApprovedStore(racer.user.id, 'فروشگاه هم‌زمان');
     const racerProduct = await makeApprovedProduct(racer.auth, admin.auth, category.id, { price: 40000, stock: 999 });
     await prisma.wallet.upsert({
@@ -360,8 +383,8 @@ describe('Phase 6 — Payout capped by outstanding liability', () => {
   let admin;
 
   beforeAll(async () => {
-    seller = await makeUser('SELLER', '54060000' + Math.floor(Math.random() * 9));
-    admin = await makeUser('ADMIN', '54070000' + Math.floor(Math.random() * 9));
+    seller = await makeUser('SELLER', uniqueMobileSuffix('08'));
+    admin = await makeUser('ADMIN', uniqueMobileSuffix('09'));
   });
 
   test('payout is capped at wallet.balance - outstandingLiabilityTotal', async () => {
@@ -370,7 +393,7 @@ describe('Phase 6 — Payout capped by outstanding liability', () => {
     });
     const store = await makeApprovedStore(seller.user.id, 'فروشگاه سقف برداشت');
     // Need a real order/store FK for the liability row.
-    const customer = await makeUser('CUSTOMER', '54080000' + Math.floor(Math.random() * 9));
+    const customer = await makeUser('CUSTOMER', uniqueMobileSuffix('10'));
     const category = await api.post(`${PREFIX}/categories`).set('Authorization', admin.auth)
       .send({ name: 'دسته سقف برداشت', slug: `payout-cap-cat-${Date.now()}` });
     const product = await makeApprovedProduct(seller.auth, admin.auth, category.body.data.id, { price: 10000, stock: 999 });
@@ -394,9 +417,9 @@ describe('Phase 6 — Payout capped by outstanding liability', () => {
   });
 
   test('payout is 0 when liability equals or exceeds wallet balance', async () => {
-    const racer = await makeUser('SELLER', '54090000' + Math.floor(Math.random() * 9));
+    const racer = await makeUser('SELLER', uniqueMobileSuffix('11'));
     const store = await makeApprovedStore(racer.user.id, 'فروشگاه بدهی کامل');
-    const customer = await makeUser('CUSTOMER', '54100000' + Math.floor(Math.random() * 9));
+    const customer = await makeUser('CUSTOMER', uniqueMobileSuffix('12'));
     const category = await api.post(`${PREFIX}/categories`).set('Authorization', admin.auth)
       .send({ name: 'دسته بدهی کامل', slug: `payout-full-liability-cat-${Date.now()}` });
     const product = await makeApprovedProduct(racer.auth, admin.auth, category.body.data.id, { price: 10000, stock: 999 });
@@ -410,7 +433,7 @@ describe('Phase 6 — Payout capped by outstanding liability', () => {
   });
 
   test('payout works normally when liability = 0 (unchanged pre-Phase-6 behavior)', async () => {
-    const racer = await makeUser('SELLER', '54110000' + Math.floor(Math.random() * 9));
+    const racer = await makeUser('SELLER', uniqueMobileSuffix('13'));
     await prisma.wallet.create({ data: { userId: racer.user.id, balance: 100000 } });
 
     const res = await api.post(`${PREFIX}/payouts`).set('Authorization', racer.auth).send({ amount: 100000, ...validBank() });
@@ -427,8 +450,8 @@ describe('Phase 6 — Admin liability visibility', () => {
   let store;
 
   beforeAll(async () => {
-    seller = await makeUser('SELLER', '54120000' + Math.floor(Math.random() * 9));
-    admin = await makeUser('ADMIN', '54130000' + Math.floor(Math.random() * 9));
+    seller = await makeUser('SELLER', uniqueMobileSuffix('14'));
+    admin = await makeUser('ADMIN', uniqueMobileSuffix('15'));
     store = await makeApprovedStore(seller.user.id, 'فروشگاه نمایش بدهی');
     await prisma.wallet.upsert({
       where: { userId: seller.user.id }, update: { balance: 0 }, create: { userId: seller.user.id, balance: 0 },
@@ -436,7 +459,7 @@ describe('Phase 6 — Admin liability visibility', () => {
   });
 
   test('GET /admin/payout-liabilities lists liabilities with status/seller filters and pagination', async () => {
-    const customer = await makeUser('CUSTOMER', '54140000' + Math.floor(Math.random() * 9));
+    const customer = await makeUser('CUSTOMER', uniqueMobileSuffix('16'));
     const category = await api.post(`${PREFIX}/categories`).set('Authorization', admin.auth)
       .send({ name: 'دسته نمایش بدهی', slug: `admin-liability-cat-${Date.now()}` });
     const product = await makeApprovedProduct(seller.auth, admin.auth, category.body.data.id, { price: 10000, stock: 999 });
@@ -458,13 +481,13 @@ describe('Phase 6 — Admin liability visibility', () => {
   });
 
   test('a customer gets 403', async () => {
-    const customer = await makeUser('CUSTOMER', '54150000' + Math.floor(Math.random() * 9));
+    const customer = await makeUser('CUSTOMER', uniqueMobileSuffix('17'));
     const res = await api.get(`${PREFIX}/admin/payout-liabilities`).set('Authorization', customer.auth);
     expect(res.status).toBe(403);
   });
 
   test('there is no manual-recovery endpoint (Phase 6 is automatic-only)', async () => {
-    const customer = await makeUser('CUSTOMER', '54160000' + Math.floor(Math.random() * 9));
+    const customer = await makeUser('CUSTOMER', uniqueMobileSuffix('18'));
     const category = await api.post(`${PREFIX}/categories`).set('Authorization', admin.auth)
       .send({ name: 'دسته بدون بازیابی دستی', slug: `no-manual-recovery-cat-${Date.now()}` });
     const product = await makeApprovedProduct(seller.auth, admin.auth, category.body.data.id, { price: 10000, stock: 999 });
