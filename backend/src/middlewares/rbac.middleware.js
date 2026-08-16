@@ -58,6 +58,16 @@ function requireOwnerOr(overridePermission, getOwnerId) {
         return next();
       }
       const ownerId = await getOwnerId(req);
+      // `ownerId === null` means the resource itself doesn't exist (see
+      // products.service#getOwnerUserId, the only current getOwnerId
+      // implementation: it returns null when the StoreProduct lookup finds
+      // nothing). That's a "not found", not an authorization failure — this
+      // middleware has no way to tell "doesn't exist" from "exists but isn't
+      // mine" on its own, but the service layer does (its own `if
+      // (!storeProduct) throw ApiError.notFound(...)` check), so let the
+      // request through here and let the service produce the correct 404
+      // instead of masking it behind a 403.
+      if (ownerId === null) return next();
       if (ownerId && ownerId === req.user.id) return next();
       return next(ApiError.forbidden('دسترسی به این منبع مجاز نیست'));
     } catch (err) { next(err); }

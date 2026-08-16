@@ -70,9 +70,18 @@ async function makeApprovedStore(sellerId, name) {
   });
 }
 
-async function makeCategory(adminAuth, name) {
+/**
+ * `name` is kept Persian (readable in test output); `slugPrefix` is a
+ * separate, caller-supplied ASCII identifier. categories.validation.js
+ * requires `slug` to match /^[a-z0-9-]+$/ — deriving it from a Persian
+ * `name` (as this helper previously did) leaves the Persian characters
+ * untouched and always fails that regex with a 400, before the category
+ * is ever created. Same pattern as commission-resolution.test.js /
+ * categories-images.test.js (e.g. `slug: \`settlement-cat-${Date.now()}\``).
+ */
+async function makeCategory(adminAuth, name, slugPrefix) {
   const res = await api.post(`${PREFIX}/categories`).set('Authorization', adminAuth)
-    .send({ name, slug: `${name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}` });
+    .send({ name, slug: `${slugPrefix}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}` });
   return res.body.data;
 }
 
@@ -108,7 +117,7 @@ describe('Store suspension', () => {
     seller = await makeUser('SELLER');
     admin = await makeUser('ADMIN');
     store = await makeApprovedStore(seller.user.id, `فروشگاه تعلیق ${Date.now()}`);
-    category = await makeCategory(admin.auth, `دسته تعلیق ${Date.now()}`);
+    category = await makeCategory(admin.auth, `دسته تعلیق ${Date.now()}`, 'suspension-cat');
   });
 
   test('a suspended store cannot create a new offer', async () => {
@@ -174,7 +183,7 @@ describe('Multi-store isolation (two stores selling the same shared Product)', (
     const sellerB = await makeUser('SELLER');
     const storeA = await makeApprovedStore(sellerA.user.id, `فروشگاه الف ${Date.now()}`);
     const storeB = await makeApprovedStore(sellerB.user.id, `فروشگاه ب ${Date.now()}`);
-    const category = await makeCategory(admin.auth, `دسته اشتراکی ${Date.now()}`);
+    const category = await makeCategory(admin.auth, `دسته اشتراکی ${Date.now()}`, 'shared-cat');
 
     const identity = {
       name: 'گوشی مشترک بین دو فروشگاه', brand: 'برند-اشتراکی', model: 'مدل-X', categoryId: category.id,
@@ -225,7 +234,7 @@ describe('Seller removal preserves data outside the seller\'s own store', () => 
     const seller = await makeUser('SELLER');
     const customer = await makeUser('CUSTOMER');
     await makeApprovedStore(seller.user.id, `فروشگاه بقا ${Date.now()}`);
-    const category = await makeCategory(admin.auth, `دسته بقا ${Date.now()}`);
+    const category = await makeCategory(admin.auth, `دسته بقا ${Date.now()}`, 'survival-cat');
     const offer = await makeApprovedOffer(seller.auth, admin.auth, category.id, { name: `محصول بقا ${Date.now()}`, stock: 5 });
 
     // Customer buys it (so a review is eligible) and separately still has a second unit sitting in the cart.
@@ -263,7 +272,7 @@ describe('Generic seller deactivation (PATCH /users/:id/status) vs. DELETE /admi
     const admin = await makeUser('ADMIN');
     const seller = await makeUser('SELLER');
     const store = await makeApprovedStore(seller.user.id, `فروشگاه غیرفعال‌سازی ${Date.now()}`);
-    const category = await makeCategory(admin.auth, `دسته غیرفعال‌سازی ${Date.now()}`);
+    const category = await makeCategory(admin.auth, `دسته غیرفعال‌سازی ${Date.now()}`, 'deactivation-cat');
     const offer = await makeApprovedOffer(seller.auth, admin.auth, category.id, { name: `محصول غیرفعال‌سازی ${Date.now()}` });
 
     const res = await api.patch(`${PREFIX}/users/${seller.user.id}/status`).set('Authorization', admin.auth).send({ status: 'SUSPENDED' });
@@ -279,9 +288,12 @@ describe('Generic seller deactivation (PATCH /users/:id/status) vs. DELETE /admi
     const userAfter = await prisma.user.findUnique({ where: { id: seller.user.id } });
     expect(userAfter.deletedAt).toBeNull();
 
-    // The suspended seller can no longer authenticate.
+    // The suspended seller can no longer authenticate. auth.service.js#login
+    // throws ApiError.forbidden() (403) for a recognized-but-inactive account
+    // (distinct from invalid-credentials, which is 401) — see the explicit
+    // 'حساب کاربری غیرفعال یا مسدود شده است' check there.
     const login = await api.post(`${PREFIX}/auth/login`).send({ mobile: seller.user.mobile, password: 'Passw0rd!23' });
-    expect(login.status).toBe(401);
+    expect(login.status).toBe(403);
 
     // The global Product row is untouched.
     const productStill = await prisma.product.findUnique({ where: { id: offer.productId } });

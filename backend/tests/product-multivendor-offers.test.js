@@ -64,9 +64,18 @@ async function makeApprovedStore(sellerId, name) {
   });
 }
 
-async function makeCategory(adminAuth, name) {
+/**
+ * `name` is kept Persian (readable in test output); `slugPrefix` is a
+ * separate, caller-supplied ASCII identifier. categories.validation.js
+ * requires `slug` to match /^[a-z0-9-]+$/ — deriving it from a Persian
+ * `name` (as this helper previously did) leaves the Persian characters
+ * untouched and always fails that regex with a 400, before the category
+ * is ever created. Same pattern as commission-resolution.test.js /
+ * categories-images.test.js (e.g. `slug: \`settlement-cat-${Date.now()}\``).
+ */
+async function makeCategory(adminAuth, name, slugPrefix) {
   const res = await api.post(`${PREFIX}/categories`).set('Authorization', adminAuth)
-    .send({ name, slug: `${name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}` });
+    .send({ name, slug: `${slugPrefix}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}` });
   return res.body.data;
 }
 
@@ -115,7 +124,7 @@ describe('GET /products/:productId/offers', () => {
     storeA = await makeApprovedStore(sellerA.user.id, `فروشگاه چندفروشنده الف ${Date.now()}`);
     storeB = await makeApprovedStore(sellerB.user.id, `فروشگاه چندفروشنده ب ${Date.now()}`);
     storeC = await makeApprovedStore(sellerC.user.id, `فروشگاه چندفروشنده ج ${Date.now()}`);
-    category = await makeCategory(admin.auth, `دسته چندفروشنده ${Date.now()}`);
+    category = await makeCategory(admin.auth, `دسته چندفروشنده ${Date.now()}`, 'multivendor-cat');
 
     identity = {
       name: `گوشی چندفروشنده ${Date.now()}`, brand: 'برند-چند', model: 'مدل-Y', capacity: '256GB', color: 'نقره‌ای',
@@ -181,7 +190,12 @@ describe('GET /products/:productId/offers', () => {
 
     const addToCart = await api.post(`${PREFIX}/cart/items`).set('Authorization', customer.auth)
       .send({ productId: cheapest.id, qty: 1 });
-    expect(addToCart.status).toBe(201);
+    // POST /cart/items returns 200, not 201, for both a new and a merged cart
+    // item — see cart.controller.js#addItem (res.json(...), no res.status(201))
+    // and the established contract already asserted by
+    // tests/cart-orders-payments.test.js ('add, update quantity, and remove
+    // reflect in the cart...': expect(add.status).toBe(200)).
+    expect(addToCart.status).toBe(200);
 
     const cart = await api.get(`${PREFIX}/cart`).set('Authorization', customer.auth);
     expect(cart.body.data.items.some((it) => it.productId === cheapest.id)).toBe(true);
@@ -249,7 +263,7 @@ describe('Two stores selling the same Product remain fully independent through t
     const sellerY = await makeUser('SELLER');
     const storeX = await makeApprovedStore(sellerX.user.id, `فروشگاه ایزوله ایکس ${Date.now()}`);
     const storeY = await makeApprovedStore(sellerY.user.id, `فروشگاه ایزوله ایگرگ ${Date.now()}`);
-    const category = await makeCategory(admin.auth, `دسته ایزوله ${Date.now()}`);
+    const category = await makeCategory(admin.auth, `دسته ایزوله ${Date.now()}`, 'isolate-cat');
 
     const identity = {
       name: `محصول ایزوله ${Date.now()}`, brand: 'برند-ایزوله', model: 'مدل-Z', capacity: '64GB', color: 'سفید',

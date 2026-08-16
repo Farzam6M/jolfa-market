@@ -26,13 +26,26 @@ const PREFIX = process.env.API_PREFIX || '/api/v1';
 
 let roles; // { CUSTOMER, SELLER, ADMIN, SUPER_ADMIN } -> role row
 let category;
+let mobileCounter = 0;
 
+/**
+ * `mobileSuffix` (caller-supplied, e.g. '44444444' + Math.floor(Math.random() * 9))
+ * only spans 9 possible values per call site and collides with rows left behind
+ * by earlier runs against this persistent (non-reset) test database. The actual
+ * `mobile` value is generated here instead — Date.now() tail + an in-process
+ * counter, the same general Date.now()+counter pattern already used by
+ * nextMobile() in product-multivendor-offers.test.js / seller-store-isolation.
+ * test.js — independent of the caller-supplied `mobileSuffix`, which is kept
+ * only for the (non-unique) `name` field, for readable test output.
+ */
 async function makeUser(roleKey, mobileSuffix) {
   const passwordHash = await bcrypt.hash('Passw0rd!23', 4);
+  mobileCounter += 1;
+  const mobile = `09${String(Date.now()).slice(-6)}${String(mobileCounter).padStart(3, '0')}`;
   const user = await prisma.user.create({
     data: {
       name: `Test ${roleKey} ${mobileSuffix}`,
-      mobile: `09${mobileSuffix}`,
+      mobile,
       passwordHash,
       roleId: roles[roleKey].id,
       status: 'ACTIVE',
@@ -196,6 +209,14 @@ describe('Product management by a seller', () => {
     });
     const id = created.body.data.id;
 
+    // Same admin moderation pattern used elsewhere in this file (see
+    // 'admin can moderate (approve) a pending product' below) — the product
+    // starts PENDING and updateStock() intentionally never changes moderation
+    // status on its own, so the "must NOT be PENDING" assertion below only
+    // makes sense once the product has actually been approved first.
+    await api.patch(`${PREFIX}/products/${id}/moderate`).set('Authorization', admin.auth)
+      .send({ status: 'APPROVED' });
+
     const inc = await api.patch(`${PREFIX}/products/${id}/stock`).set('Authorization', sellerA.auth)
       .send({ stock: 5, mode: 'INCREMENT' });
     expect(inc.status).toBe(200);
@@ -318,14 +339,24 @@ describe('Product management by a seller', () => {
 describe('Customer browsing (view / search / filter / details)', () => {
   let seller;
   let approvedProduct;
+  let searchName;
 
   beforeAll(async () => {
     seller = await makeUser('SELLER', '99911111' + Math.floor(Math.random() * 9));
     const admin = await makeUser('ADMIN', '99922222' + Math.floor(Math.random() * 9));
     await makeApprovedStore(seller.user.id, 'فروشگاه مشتری تست');
 
+    // A unique-per-run suffix on `name` keeps this run's Product.identityKey
+    // distinct from every earlier run's (identityKey is derived from name/
+    // brand/model/capacity/color only — see products.service.js#buildIdentityKey).
+    // Without it, repeated runs against this persistent (non-reset) database
+    // all resolve to the SAME shared Product row, and the "representative
+    // offer" the listing picks for it is the cheapest of ALL of them (see
+    // buildProductLevelPage) — which, at an identical hardcoded price, may be
+    // an older run's StoreProduct rather than this run's `approvedProduct`.
+    searchName = `کفش ورزشی مخصوص تست جستجو ${Date.now()}`;
     const created = await api.post(`${PREFIX}/products`).set('Authorization', seller.auth).send({
-      name: 'کفش ورزشی مخصوص تست جستجو', categoryId: category.id, price: 250000, stock: 20,
+      name: searchName, categoryId: category.id, price: 250000, stock: 20,
     });
     approvedProduct = created.body.data;
     await api.patch(`${PREFIX}/products/${approvedProduct.id}/moderate`).set('Authorization', admin.auth)
@@ -340,7 +371,7 @@ describe('Customer browsing (view / search / filter / details)', () => {
   });
 
   test('customer can search products by name', async () => {
-    const res = await api.get(`${PREFIX}/products`).query({ q: 'ورزشی مخصوص تست جستجو' });
+    const res = await api.get(`${PREFIX}/products`).query({ q: searchName });
     expect(res.status).toBe(200);
     expect(res.body.data.items.some((p) => p.id === approvedProduct.id)).toBe(true);
   });
