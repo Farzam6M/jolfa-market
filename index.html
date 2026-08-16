@@ -1194,6 +1194,64 @@
   </div>
 </div>
 
+
+<!-- ════════════════ CUSTOMER ORDER DETAIL — PHASE 2A: GET /orders/:id واقعی ════════════════ -->
+<div class="page" id="page-orderdetail">
+  <div class="page-banner">
+    <div class="page-breadcrumb" aria-label="مسیر صفحه">
+      <span onclick="nav('home')">خانه</span><span class="mb-sep">/</span>
+      <span onclick="backToCustOrders()">سفارش‌های من</span><span class="mb-sep">/</span>
+      <span class="mb-act">جزئیات سفارش</span>
+    </div>
+    <div class="page-banner-inner">
+      <div><h1><svg viewBox="0 0 24 24"><use href="#i-box"/></svg> جزئیات سفارش</h1><p>اقلام، وضعیت، آدرس تحویل و اطلاعات پرداخت سفارش شما</p></div>
+    </div>
+  </div>
+  <div class="content-page" style="max-width:900px;">
+    <button class="btn-verify" style="margin-bottom:18px;display:flex;align-items:center;gap:6px;width:fit-content;" onclick="backToCustOrders()">
+      <svg viewBox="0 0 24 24" width="14" height="14"><path d="M15 5l-7 7 7 7" stroke="currentColor" stroke-width="2.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      بازگشت به سفارش‌ها
+    </button>
+
+    <div id="odLoading" class="pending-note" style="display:none;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> در حال دریافت جزئیات سفارش...</div>
+    <div id="odNotFound" class="pending-note" style="display:none;background:#FEE2E2;border-color:#FCA5A5;color:#B91C1C;"><svg viewBox="0 0 24 24" style="stroke:#B91C1C;"><use href="#i-info"/></svg> <span id="odNotFoundMsg">سفارش موردنظر پیدا نشد.</span></div>
+
+    <div id="odContent" style="display:none;">
+      <div class="dash-card">
+        <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;align-items:center;">
+          <div>
+            <h3 style="margin-bottom:4px;" id="odOrderNumber">کد سفارش: #</h3>
+            <div style="font-size:12px;color:var(--gray-500);" id="odCreatedAt"></div>
+          </div>
+          <div class="order-status" id="odStatusBadge"></div>
+        </div>
+      </div>
+
+      <div id="odStoresList"></div>
+
+      <div class="dash-card" style="margin-top:16px;">
+        <h3>آدرس تحویل</h3>
+        <div id="odAddress"></div>
+      </div>
+
+      <div class="dash-card" style="margin-top:16px;" id="odSummaryCard">
+        <h3>خلاصه مالی</h3>
+        <div id="odSummary"></div>
+      </div>
+
+      <div class="dash-card" style="margin-top:16px;" id="odPaymentCard">
+        <h3>وضعیت پرداخت</h3>
+        <div id="odPaymentList"></div>
+      </div>
+
+      <div class="dash-card" style="margin-top:16px;display:none;" id="odRefundCard">
+        <h3>بازگشت وجه</h3>
+        <div id="odRefundList"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ════════════════ WHOLESALE BUYING (CUSTOMER) ════════════════ -->
 <div class="page" id="page-wholesale">
   <div class="page-banner">
@@ -4973,7 +5031,7 @@ function orderItemHtml(o) {
   const localStatus = ORDER_STATUS_TO_LOCAL[o.status] || 'process';
   const statusLabel = ORDER_STATUS_LABEL_FA[o.status] || o.status;
   const thumb = `<svg viewBox="0 0 24 24" width="20" height="20" style="stroke:var(--gray-500);"><use href="#i-box"/></svg>`;
-  return `<div class="order-item" data-cord-status="${localStatus}" onclick="goToOrderDetail('${o.id}')"><div class="order-th">${thumb}</div><div class="order-info"><div class="on">${orderTitleFromItems(o.items)}</div><div class="od">${orderTimeAgoFa(o.createdAt)} • کد سفارش: #${escapeHtml(o.orderNumber || o.id)}</div></div><div class="order-status st-${localStatus}">${escapeHtml(statusLabel)}</div></div>`;
+  return `<div class="order-item" data-cord-status="${localStatus}" onclick="goToOrderDetail('${escJsAttr(o.id)}')"><div class="order-th">${thumb}</div><div class="order-info"><div class="on">${orderTitleFromItems(o.items)}</div><div class="od">${orderTimeAgoFa(o.createdAt)} • کد سفارش: #${escapeHtml(o.orderNumber || o.id)}</div></div><div class="order-status st-${localStatus}">${escapeHtml(statusLabel)}</div></div>`;
 }
 /* هر بار روی /orders/mine واقعی سرور صدا می‌زند (کش نمی‌شود) تا بعد از هر
    پرداخت/سفارش تازه، لیست همیشه به‌روز باشد. */
@@ -4995,15 +5053,195 @@ async function renderCustOrders() {
   list.innerHTML = orders.length ? orders.map(orderItemHtml).join('')
     : '<div class="pending-note"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> هنوز سفارشی ثبت نکرده‌اید</div>';
 }
-/* کلیک روی یک ردیف سفارش: فعلاً صفحه اختصاصی جزئیات سفارش در UI موجود نیست؛
-   یک toast خلاصه وضعیت را نشان می‌دهد تا چیزی «شکسته» به‌نظر نرسد. */
+/* ═══════════ Customer panel: Order Detail — PHASE 2A: GET /orders/:id واقعی ═══════════
+   طبق orders.service.js#getById، برای مالک سفارش (customer) پاسخ کامل شامل items (هر
+   کدام با store/product تودرتو)، address، payments و refunds برمی‌گردد. این بخش فقط
+   همان مقادیر را Format و نمایش می‌دهد — هیچ مبلغی (qty×price، subtotal، total، کارمزد،
+   سهم فروشنده) در فرانت محاسبه یا از نو ساخته نمی‌شود؛ Backend همیشه Source of Truth
+   مالی باقی می‌ماند. */
+const PAYMENT_METHOD_LABEL_FA = { WALLET: 'کیف پول', GATEWAY: 'درگاه بانکی', CASH_ON_DELIVERY: 'پرداخت در محل' };
+const PAYMENT_STATUS_LABEL_FA = { PENDING: 'در انتظار', SUCCESS: 'موفق', FAILED: 'ناموفق', REFUNDED: 'بازگشت داده شده' };
+const REFUND_STATUS_LABEL_FA = { REQUESTED: 'در حال بررسی', PROCESSED: 'انجام شده', FAILED: 'ناموفق' };
+
+/* شمارندهٔ درخواست فعلی: اگر کاربر سریع بین دو سفارش جابه‌جا شود، فقط آخرین
+   درخواست اجازهٔ Render دارد — پاسخ دیرهنگام یک سفارش قبلی هیچ‌وقت روی
+   سفارش جدید نمی‌نشیند (Stale Data Guard). */
+let _orderDetailReqToken = 0;
+
 async function goToOrderDetail(orderId) {
+  nav('orderdetail');
+  const myToken = ++_orderDetailReqToken;
+  const loadingEl = document.getElementById('odLoading');
+  const notFoundEl = document.getElementById('odNotFound');
+  const contentEl = document.getElementById('odContent');
+  if (contentEl) contentEl.style.display = 'none';
+  if (notFoundEl) notFoundEl.style.display = 'none';
+  if (loadingEl) loadingEl.style.display = 'flex';
   try {
     const o = await authApiFetch('/orders/' + encodeURIComponent(orderId), { method: 'GET' });
-    toast('وضعیت سفارش #' + (o.orderNumber || o.id) + ': ' + (ORDER_STATUS_LABEL_FA[o.status] || o.status));
+    if (myToken !== _orderDetailReqToken) return; // یک سفارش دیگر در همین حین باز شده — این پاسخ دیرهنگام نادیده گرفته می‌شود
+    renderOrderDetail(o);
   } catch (err) {
-    toast((err && err.message) || 'دریافت جزئیات سفارش ممکن نشد');
+    if (myToken !== _orderDetailReqToken) return;
+    if (loadingEl) loadingEl.style.display = 'none';
+    if (notFoundEl) {
+      const msgEl = document.getElementById('odNotFoundMsg');
+      // پیام واقعی بک‌اند (فارسی) برای 404/403/سایر خطاها همان‌طور که هست نمایش داده می‌شود.
+      if (msgEl) msgEl.textContent = (err && err.message) || 'دریافت جزئیات سفارش ممکن نشد.';
+      notFoundEl.style.display = 'flex';
+    }
   }
+}
+
+function renderOrderDetail(o) {
+  const loadingEl = document.getElementById('odLoading');
+  const notFoundEl = document.getElementById('odNotFound');
+  const contentEl = document.getElementById('odContent');
+  if (loadingEl) loadingEl.style.display = 'none';
+  if (notFoundEl) notFoundEl.style.display = 'none';
+  if (contentEl) contentEl.style.display = 'block';
+
+  const orderNumberEl = document.getElementById('odOrderNumber');
+  if (orderNumberEl) orderNumberEl.textContent = 'کد سفارش: #' + escapeHtml(o.orderNumber || o.id || '');
+  const createdAtEl = document.getElementById('odCreatedAt');
+  if (createdAtEl) createdAtEl.textContent = o.createdAt ? orderTimeAgoFa(o.createdAt) : '';
+  const statusBadge = document.getElementById('odStatusBadge');
+  if (statusBadge) {
+    const localStatus = ORDER_STATUS_TO_LOCAL[o.status] || 'process';
+    statusBadge.className = 'order-status st-' + localStatus;
+    statusBadge.textContent = ORDER_STATUS_LABEL_FA[o.status] || o.status || '';
+  }
+
+  renderOrderDetailStores(o.items);
+  renderOrderDetailAddress(o.address);
+  renderOrderDetailSummary(o);
+  renderOrderDetailPayments(o.payments);
+  renderOrderDetailRefunds(o.refunds);
+}
+
+/* اقلام سفارش بر اساس item.store گروه‌بندی می‌شوند تا سفارش چندفروشنده‌ای
+   (مثلاً ۲ قلم از فروشگاه A و ۱ قلم از فروشگاه B) دقیقاً همان ساختار را در
+   UI نشان دهد. برای سفارش تک‌فروشنده‌ای همین منطق فقط یک گروه تولید می‌کند —
+   بدون هیچ مسیر کد جداگانه یا پیچیدگی اضافه. اگر Item فاقد store باشد (مثلاً
+   پاسخ کوتاه‌شدهٔ seller-safe که در این مسیر مصرف نمی‌شود)، در یک گروه
+   عمومی «نامشخص» قرار می‌گیرد تا چیزی از دست نرود. */
+function groupOrderItemsByStore(items) {
+  const groups = [];
+  const byKey = {};
+  (items || []).forEach((it) => {
+    const store = it.store || null;
+    const key = store ? store.id : '__unknown__';
+    if (!byKey[key]) { byKey[key] = { store, items: [] }; groups.push(byKey[key]); }
+    byKey[key].items.push(it);
+  });
+  return groups;
+}
+function orderDetailItemRowHtml(it) {
+  // اولویت با nameSnapshot است چون Snapshot تاریخی لحظهٔ خرید است و با تغییر
+  // بعدی محصول در کاتالوگ فعلی خراب نمی‌شود؛ product.name فقط fallback است.
+  const name = it.nameSnapshot || (it.product && it.product.name) || 'کالا';
+  return `<div class="summary-row">
+    <span>${escapeHtml(name)} × ${fa(it.qty)}</span>
+    <span>${fmtPriceFa(it.priceSnapshot)} تومان</span>
+  </div>`;
+}
+function orderDetailStoreGroupHtml(group) {
+  const storeName = (group.store && group.store.name) || 'فروشگاه';
+  return `<div class="dash-card" style="margin-top:16px;">
+    <div class="form-section-title"><svg viewBox="0 0 24 24"><use href="#i-store"/></svg> فروشگاه: ${escapeHtml(storeName)}</div>
+    <div>${group.items.map(orderDetailItemRowHtml).join('')}</div>
+  </div>`;
+}
+function renderOrderDetailStores(items) {
+  const wrap = document.getElementById('odStoresList');
+  if (!wrap) return;
+  const groups = groupOrderItemsByStore(items);
+  wrap.innerHTML = groups.length
+    ? groups.map(orderDetailStoreGroupHtml).join('')
+    : '<div class="pending-note" style="margin-top:16px;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> اطلاعات اقلام این سفارش موجود نیست</div>';
+}
+
+function renderOrderDetailAddress(addr) {
+  const wrap = document.getElementById('odAddress');
+  if (!wrap) return;
+  if (!addr) {
+    wrap.innerHTML = '<div class="pending-note" style="margin-top:0;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> آدرس ثبت نشده</div>';
+    return;
+  }
+  wrap.innerHTML = `
+    <div class="summary-row"><span>نام گیرنده</span><span>${escapeHtml(addr.fullName || '—')}</span></div>
+    <div class="summary-row"><span>تلفن</span><span>${escapeHtml(addr.phone || '—')}</span></div>
+    <div class="summary-row"><span>استان</span><span>${escapeHtml(addr.province || '—')}</span></div>
+    <div class="summary-row"><span>شهر</span><span>${escapeHtml(addr.city || '—')}</span></div>
+    <div class="summary-row"><span>آدرس</span><span>${escapeHtml(addr.addressLine || '—')}</span></div>
+    <div class="summary-row"><span>کد پستی</span><span>${escapeHtml(addr.postalCode || '—')}</span></div>
+  `;
+}
+
+/* فقط سه مقدار مستقیماً از بک‌اند (subtotal/shippingFee/total) Format و نمایش
+   داده می‌شوند — هیچ جمع/ضرب/کسری در فرانت انجام نمی‌شود. */
+function renderOrderDetailSummary(o) {
+  const card = document.getElementById('odSummaryCard');
+  const wrap = document.getElementById('odSummary');
+  if (!wrap || !card) return;
+  const hasAny = (o.subtotal != null) || (o.shippingFee != null) || (o.total != null);
+  if (!hasAny) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+  wrap.innerHTML = ''
+    + (o.subtotal != null ? `<div class="summary-row"><span>جمع کالاها</span><span>${fmtPriceFa(o.subtotal)} تومان</span></div>` : '')
+    + (o.shippingFee != null ? `<div class="summary-row"><span>هزینه ارسال</span><span>${fmtPriceFa(o.shippingFee)} تومان</span></div>` : '')
+    + (o.total != null ? `<div class="summary-row total"><span>مبلغ قابل پرداخت</span><span>${fmtPriceFa(o.total)} تومان</span></div>` : '');
+}
+
+function orderDetailPaymentRowHtml(p) {
+  const method = PAYMENT_METHOD_LABEL_FA[p.method] || p.method || '';
+  const status = PAYMENT_STATUS_LABEL_FA[p.status] || p.status || '';
+  return `<div class="summary-row">
+    <span>${escapeHtml(method)} — ${escapeHtml(status)}</span>
+    <span>${fmtPriceFa(p.amount)} تومان</span>
+  </div>`;
+}
+function renderOrderDetailPayments(payments) {
+  const card = document.getElementById('odPaymentCard');
+  const wrap = document.getElementById('odPaymentList');
+  if (!wrap || !card) return;
+  if (!payments || !payments.length) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+  wrap.innerHTML = payments.map(orderDetailPaymentRowHtml).join('');
+}
+
+/* فقط فیلدهای امن و مفید برای Customer نمایش داده می‌شوند: status/amount/date/reason.
+   requestedById، ledgerStatus، origin و reversals عمداً به UI نمی‌آیند چون
+   Internal/Backend-level هستند و ربطی به تجربهٔ مشتری ندارند. */
+function orderDetailRefundRowHtml(r) {
+  const status = REFUND_STATUS_LABEL_FA[r.status] || r.status || '';
+  const reasonHtml = r.reason ? `<div style="font-size:11.5px;color:var(--gray-500);margin-top:2px;">${escapeHtml(r.reason)}</div>` : '';
+  return `<div class="summary-row" style="flex-direction:column;align-items:flex-start;gap:4px;">
+    <div style="display:flex;justify-content:space-between;width:100%;">
+      <span>${escapeHtml(status)}</span>
+      <span>${fmtPriceFa(r.amount)} تومان</span>
+    </div>
+    <div style="font-size:11px;color:var(--gray-400);">${escapeHtml(orderTimeAgoFa(r.createdAt))}</div>
+    ${reasonHtml}
+  </div>`;
+}
+function renderOrderDetailRefunds(refunds) {
+  const card = document.getElementById('odRefundCard');
+  const wrap = document.getElementById('odRefundList');
+  if (!wrap || !card) return;
+  if (!refunds || !refunds.length) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+  wrap.innerHTML = refunds.map(orderDetailRefundRowHtml).join('');
+}
+
+/* بازگشت به تب «سفارش‌های من» در پنل مشتری — از همان الگوی موجود
+   nav('profile') + custTab(...) استفاده می‌کند (دقیقاً مثل requireCompleteProfile)،
+   بدون هیچ Router یا معماری جدید. */
+function backToCustOrders() {
+  nav('profile');
+  resetMobileDashToList('#page-profile');
+  const ordersTab = document.querySelector('#page-profile .dash-mi[title="سفارش‌های من"]');
+  if (ordersTab) custTab(ordersTab, 'corders');
 }
 function filterCustOrders(el, status) {
   document.querySelectorAll('#cust-corders .cat-filter-item').forEach(x => x.classList.remove('act'));
