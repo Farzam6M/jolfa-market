@@ -977,6 +977,47 @@ model SellerPayoutLiability {
   status SellerLiabilityStatus  @default(OUTSTANDING)
   reason String?
 
+  // P2.9 — the shortfall amount AT CREATION TIME, immutable thereafter.
+  // `amount` above is deliberately the MUTABLE remaining balance
+  // (decremented in place by recoverSellerLiabilities' FIFO recovery — see
+  // that field's own doc comment and payout-liabilities.service.js), so it
+  // can no longer answer "what was this liability's shortfall when its
+  // REFUND Journal was posted" once any recovery has happened against it.
+  // originalAmount exists solely to answer that question — most critically
+  // for a GATEWAY refund, whose REFUND Journal is posted at
+  // markGatewayRefundProcessed confirmation time, arbitrarily later than
+  // this row's creation, by which point `amount` may have already been
+  // partially or fully recovered. Nullable + never backfilled, same
+  // legacy-row convention as refundId/PaymentRefund.origin/ledgerStatus:
+  // NULL means this row predates P2.9 (or, in principle, has no
+  // receivable-backed REFUND leg at all) and remains a legacy liability
+  // recovered against PLATFORM_CASH forever (see
+  // ledgerReceivableEntryId's own comment and
+  // payout-liabilities.service.js#recoverSellerLiabilities' branch).
+  originalAmount Decimal? @db.Decimal(12, 0)
+
+  // P2.9 — the exact LedgerEntry representing THIS liability's own
+  // PLATFORM_RECEIVABLE DEBIT leg inside its REFUND Journal — deliberately
+  // NOT a reference to the Journal itself. A single PaymentRefund produces
+  // exactly one REFUND Journal (Journal.eventId = PaymentRefund.id), but a
+  // multi-seller/multi-store shortfall refund can post MULTIPLE
+  // PLATFORM_RECEIVABLE legs into that same Journal, all against the same
+  // singleton PLATFORM_RECEIVABLE Account — so a Journal-level reference
+  // cannot, on its own, identify which specific leg/amount belongs to
+  // which liability whenever two shortfalls in the same refund happen to
+  // share an amount. Pointing at the LedgerEntry row itself removes that
+  // ambiguity with no LedgerEntry schema change (postJournal already
+  // returns entries in the same order as the legs it was given). NULL for
+  // every legacy/historical liability (never backfilled — see
+  // originalAmount's own comment) and for any liability whose REFUND
+  // Journal has not been posted yet (e.g. a GATEWAY shortfall still
+  // awaiting markGatewayRefundProcessed confirmation). Never used to
+  // mutate Ledger history — journals/ledger_entries remain
+  // insert-only/immutable at the DB layer regardless (see the
+  // 20260815000000_ledger_immutability_trigger migration).
+  ledgerReceivableEntryId String?
+  ledgerReceivableEntry   LedgerEntry? @relation(fields: [ledgerReceivableEntryId], references: [id], onDelete: Restrict)
+
   createdAt   DateTime  @default(now())
   recoveredAt DateTime?
 
@@ -988,6 +1029,17 @@ model SellerPayoutLiability {
   // (WHERE sellerId = ? AND status = 'OUTSTANDING' ORDER BY createdAt ASC)
   // and the admin listing's sellerId+status filter both hit this shape.
   @@index([sellerId, status, createdAt])
+  // P2.9 — DB-enforced version of the "at most one shortfall liability per
+  // (order, store) per refund" invariant that refundDeliveredOrder's Pass 2
+  // already relies on implicitly (its storeDebits Map creates at most one
+  // liability per storeId per call). refundId is nullable — Postgres
+  // treats every NULL as distinct under a unique index, so this never
+  // constrains legacy rows (refundId IS NULL) against each other. Required
+  // by P2.9's store-scoped Gateway reconstruction (markGatewayRefundProcessed),
+  // which looks up exactly one liability per (refundId, storeId) to recover
+  // that store's immutable originalAmount.
+  @@unique([refundId, storeId])
+  @@index([ledgerReceivableEntryId])
   @@map("seller_payout_liabilities")
 }
 
@@ -1031,6 +1083,21 @@ enum LedgerAccountOwnerType {
   PLATFORM_CASH            // ownerId = PLATFORM_LEDGER_OWNER_ID. Platform-controlled collected cash.
   PAYMENT_GATEWAY_CLEARING // ownerId = PLATFORM_LEDGER_OWNER_ID. In-flight gateway funds (speculative — see design doc §4/§12.5, no real gateway wired in yet).
   PAYOUT_CLEARING          // ownerId = PLATFORM_LEDGER_OWNER_ID. Reserved-but-not-yet-transferred seller payouts.
+  // P2.9 — ownerId = PLATFORM_LEDGER_OWNER_ID. Singleton platform receivable
+  // claim against sellers for delivered-order refund shortfalls (Model C —
+  // see SellerPayoutLiability.originalAmount/ledgerReceivableEntryId doc
+  // comments and ledger.constants.js's EVENT_ACCOUNT_MAP.REFUND comment).
+  // Expected to carry a NEGATIVE Account.balance under this codebase's
+  // CREDIT-increments/DEBIT-decrements convention: a new shortfall DEBITs
+  // it (more negative), a recovery CREDITs it (toward zero). This is NOT
+  // corruption — schema.prisma has no CHECK constraint forcing any
+  // Account.balance non-negative. Added in its own migration stage (added
+  // enum value only) BEFORE any application code references it — the same
+  // two-stage sequencing already used for LedgerEventType.OPENING_BALANCE
+  // (see the 20260814000000_ledger_opening_balance_event_type migration's
+  // own comment on why a newly added Postgres enum value cannot be used in
+  // the same transaction that adds it).
+  PLATFORM_RECEIVABLE
 }
 
 enum LedgerAccountStatus {
@@ -1176,6 +1243,15 @@ model LedgerEntry {
   // enforced by the posting service, not a DB constraint, in this phase.
   currency  String          @default("TMN")
   createdAt DateTime        @default(now())
+
+  // P2.9 — the SellerPayoutLiability row(s) that point back at THIS entry
+  // as their exact PLATFORM_RECEIVABLE DEBIT leg (see
+  // SellerPayoutLiability.ledgerReceivableEntryId's own doc comment).
+  // Normally at most one, but declared as a list per Prisma's standard
+  // one-to-many relation shape; this entry itself is never mutated by
+  // that linkage (LedgerEntry rows stay insert-only/immutable — see the
+  // 20260815000000_ledger_immutability_trigger migration).
+  receivableLiabilities SellerPayoutLiability[]
 
   // Statement / reconciliation queries (design doc §5, §10): "every entry
   // for this account, in order" is the dominant read pattern once postings

@@ -132,12 +132,27 @@ async function recoverSellerLiabilities(tx, sellerId, earningAmount, orderItemSe
     // (never liability.id alone), since a single liability may be
     // partially recovered across multiple future settlements. Posted in
     // the SAME transaction as the recovery/decrement above.
+    //
+    // [P2.9 — Model C, P2.8 Finding A] `receivableBacked` selects
+    // postLiabilityRecovery's CREDIT target: a liability whose REFUND
+    // Journal posted a PLATFORM_RECEIVABLE claim for it
+    // (ledgerReceivableEntryId != null) recovers back into
+    // PLATFORM_RECEIVABLE, reducing that specific outstanding claim;
+    // every other liability (ledgerReceivableEntryId == NULL — legacy,
+    // pre-P2.9, or otherwise never receivable-backed) keeps crediting
+    // PLATFORM_CASH exactly as before P2.9, permanently, not just during a
+    // transition window (historical liabilities are never retroactively
+    // backfilled with a receivable leg — see that column's own
+    // schema.prisma doc comment). Read from the SAME `liability` row this
+    // loop already fetched above (findMany at the top of this function),
+    // not re-queried.
     // eslint-disable-next-line no-await-in-loop
     await postLiabilityRecovery(tx, {
       eventId: `${orderItemSettlementId}:${liability.id}`,
       actorId: null,
       sellerId,
       amount: recoverable,
+      receivableBacked: liability.ledgerReceivableEntryId != null,
     });
 
     remaining -= recoverable;

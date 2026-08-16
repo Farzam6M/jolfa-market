@@ -1471,6 +1471,7 @@ describe('postRefund', () => {
     const eventId = crypto.randomUUID();
     const customerId = crypto.randomUUID();
     const sellerId = crypto.randomUUID();
+    const storeId = crypto.randomUUID();
     createdEventIds.push(['REFUND', eventId]);
 
     // customerAmount 10000 = sellerRefund 9000 + commission 1000.
@@ -1480,12 +1481,13 @@ describe('postRefund', () => {
       currency: 'TMN',
       customerId,
       customerAmount: '10000',
-      sellerRefunds: [{ sellerId, amount: '9000' }],
+      sellerRefunds: [{ storeId, sellerId, collectedAmount: '9000' }],
       commissionAmount: '1000',
     }));
     await trackAccounts(customerId, [sellerId]);
 
     expect(result.idempotentReplay).toBe(false);
+    expect(result.receivableEntryByStoreId.size).toBe(0); // no shortfall — no PLATFORM_RECEIVABLE leg at all
 
     const journalRow = await prisma.journal.findUnique({ where: { id: result.journal.id } });
     expect(journalRow.eventType).toBe('REFUND');
@@ -1518,6 +1520,8 @@ describe('postRefund', () => {
     const customerId = crypto.randomUUID();
     const sellerA = crypto.randomUUID();
     const sellerB = crypto.randomUUID();
+    const storeA = crypto.randomUUID();
+    const storeB = crypto.randomUUID();
     createdEventIds.push(['REFUND', eventId]);
 
     // customerAmount 10000 = sellerA 4000 + sellerB 5000 + commission 1000.
@@ -1527,8 +1531,8 @@ describe('postRefund', () => {
       customerId,
       customerAmount: '10000',
       sellerRefunds: [
-        { sellerId: sellerA, amount: '4000' },
-        { sellerId: sellerB, amount: '5000' },
+        { storeId: storeA, sellerId: sellerA, collectedAmount: '4000' },
+        { storeId: storeB, sellerId: sellerB, collectedAmount: '5000' },
       ],
       commissionAmount: '1000',
     }));
@@ -1553,17 +1557,18 @@ describe('postRefund', () => {
   test('accounts are not duplicated across repeated refunds for the same customer/seller', async () => {
     const customerId = crypto.randomUUID();
     const sellerId = crypto.randomUUID();
+    const storeId = crypto.randomUUID();
     const firstEventId = crypto.randomUUID();
     const secondEventId = crypto.randomUUID();
     createdEventIds.push(['REFUND', firstEventId], ['REFUND', secondEventId]);
 
     await withTx((tx) => postRefund(tx, {
-      eventId: firstEventId, currency: 'TMN', customerId, customerAmount: '2000', sellerRefunds: [{ sellerId, amount: '1800' }], commissionAmount: '200',
+      eventId: firstEventId, currency: 'TMN', customerId, customerAmount: '2000', sellerRefunds: [{ storeId, sellerId, collectedAmount: '1800' }], commissionAmount: '200',
     }));
     const first = await trackAccounts(customerId, [sellerId]);
 
     await withTx((tx) => postRefund(tx, {
-      eventId: secondEventId, currency: 'TMN', customerId, customerAmount: '3000', sellerRefunds: [{ sellerId, amount: '2700' }], commissionAmount: '300',
+      eventId: secondEventId, currency: 'TMN', customerId, customerAmount: '3000', sellerRefunds: [{ storeId, sellerId, collectedAmount: '2700' }], commissionAmount: '300',
     }));
     const second = await trackAccounts(customerId, [sellerId]);
 
@@ -1581,10 +1586,11 @@ describe('postRefund', () => {
     const eventId = crypto.randomUUID();
     const customerId = crypto.randomUUID();
     const sellerId = crypto.randomUUID();
+    const storeId = crypto.randomUUID();
     createdEventIds.push(['REFUND', eventId]);
 
     const args = {
-      eventId, currency: 'TMN', customerId, customerAmount: '5000', sellerRefunds: [{ sellerId, amount: '4500' }], commissionAmount: '500',
+      eventId, currency: 'TMN', customerId, customerAmount: '5000', sellerRefunds: [{ storeId, sellerId, collectedAmount: '4500' }], commissionAmount: '500',
     };
 
     const first = await withTx((tx) => postRefund(tx, args));
@@ -1620,6 +1626,7 @@ describe('postRefund', () => {
     const eventId = crypto.randomUUID();
     const customerId = crypto.randomUUID();
     const sellerId = crypto.randomUUID();
+    const storeId = crypto.randomUUID();
     createdEventIds.push(['REFUND', eventId]);
 
     // customerAmount 999999999999 = seller 900000000000 + commission 99999999999.
@@ -1628,7 +1635,7 @@ describe('postRefund', () => {
       currency: 'TMN',
       customerId,
       customerAmount: '999999999999',
-      sellerRefunds: [{ sellerId, amount: '900000000000' }],
+      sellerRefunds: [{ storeId, sellerId, collectedAmount: '900000000000' }],
       commissionAmount: '99999999999',
     }));
     await trackAccounts(customerId, [sellerId]);
@@ -1645,14 +1652,15 @@ describe('postRefund', () => {
     expect(new Prisma.Decimal(sellerEntry.amount).equals(new Prisma.Decimal('900000000000'))).toBe(true);
   });
 
-  test('an inconsistent split (customerAmount !== sum(sellerRefunds) + commission) is rejected, not silently posted unbalanced', async () => {
+  test('an inconsistent split (customerAmount !== sum(collected)+sum(shortfall)+commission) is rejected, not silently posted unbalanced', async () => {
     const eventId = crypto.randomUUID();
     const customerId = crypto.randomUUID();
     const sellerId = crypto.randomUUID();
+    const storeId = crypto.randomUUID();
 
     // customerAmount 10000 but seller(9000) + commission(500) = 9500 != 10000.
     await expect(withTx((tx) => postRefund(tx, {
-      eventId, currency: 'TMN', customerId, customerAmount: '10000', sellerRefunds: [{ sellerId, amount: '9000' }], commissionAmount: '500',
+      eventId, currency: 'TMN', customerId, customerAmount: '10000', sellerRefunds: [{ storeId, sellerId, collectedAmount: '9000' }], commissionAmount: '500',
     }))).rejects.toMatchObject({ statusCode: 400 });
 
     const journalRow = await prisma.journal.findUnique({
@@ -1666,10 +1674,11 @@ describe('postRefund', () => {
     const eventId = crypto.randomUUID();
     const customerId = crypto.randomUUID();
     const sellerId = crypto.randomUUID();
+    const storeId = crypto.randomUUID();
     createdEventIds.push(['REFUND', eventId]);
 
     const result = await withTx((tx) => postRefund(tx, {
-      eventId, currency: 'TMN', customerId, customerAmount: '4000', sellerRefunds: [{ sellerId, amount: '4000' }], commissionAmount: '0',
+      eventId, currency: 'TMN', customerId, customerAmount: '4000', sellerRefunds: [{ storeId, sellerId, collectedAmount: '4000' }], commissionAmount: '0',
     }));
     await trackAccounts(customerId, [sellerId]);
 
@@ -1686,10 +1695,11 @@ describe('postRefund', () => {
     const eventId = crypto.randomUUID();
     const customerId = crypto.randomUUID();
     const sellerId = crypto.randomUUID();
+    const storeId = crypto.randomUUID();
     createdEventIds.push(['REFUND', eventId]);
 
     const result = await withTx((tx) => postRefund(tx, {
-      eventId, currency: 'TMN', customerId, customerAmount: '4000', sellerRefunds: [{ sellerId, amount: '0' }], commissionAmount: '4000',
+      eventId, currency: 'TMN', customerId, customerAmount: '4000', sellerRefunds: [{ storeId, sellerId, collectedAmount: '0' }], commissionAmount: '4000',
     }));
     await trackAccounts(customerId, [sellerId]);
 
@@ -1700,6 +1710,131 @@ describe('postRefund', () => {
     expect(entryRows).toHaveLength(2);
     expect(entryRows.some((e) => e.account.ownerType === 'SELLER_WALLET')).toBe(false);
     expect(entryRows.some((e) => e.account.ownerType === 'PLATFORM_REVENUE')).toBe(true);
+  });
+
+  // ── P2.9 — Model C (P2.8 Finding A) ──────────────────────────────────────
+
+  test('P2.9: a full shortfall posts a DEBIT PLATFORM_RECEIVABLE leg instead of a SELLER_WALLET leg, and resolves it in receivableEntryByStoreId', async () => {
+    const eventId = crypto.randomUUID();
+    const customerId = crypto.randomUUID();
+    const sellerId = crypto.randomUUID();
+    const storeId = crypto.randomUUID();
+    createdEventIds.push(['REFUND', eventId]);
+
+    // customerAmount 10000 = collected 0 + commission 1000 + shortfall 9000.
+    const result = await withTx((tx) => postRefund(tx, {
+      eventId,
+      currency: 'TMN',
+      customerId,
+      customerAmount: '10000',
+      sellerRefunds: [{
+        storeId, sellerId, collectedAmount: '0', shortfallAmount: '9000',
+      }],
+      commissionAmount: '1000',
+    }));
+    await trackAccounts(customerId, [sellerId]);
+    createdAccountIds.push(...(await prisma.account.findMany({
+      where: { ownerType: 'PLATFORM_RECEIVABLE', ownerId: PLATFORM_LEDGER_OWNER_ID, currency: 'TMN' },
+    })).map((a) => a.id));
+
+    expect(result.receivableEntryByStoreId.size).toBe(1);
+    const receivableEntry = result.receivableEntryByStoreId.get(storeId);
+    expect(receivableEntry).toBeDefined();
+
+    const entryRows = await prisma.ledgerEntry.findMany({
+      where: { journalId: result.journal.id },
+      include: { account: true },
+    });
+    // CREDIT CUSTOMER_WALLET + DEBIT PLATFORM_REVENUE + DEBIT PLATFORM_RECEIVABLE — no SELLER_WALLET leg (0 collected).
+    expect(entryRows).toHaveLength(3);
+    expect(entryRows.some((e) => e.account.ownerType === 'SELLER_WALLET')).toBe(false);
+    const receivableRow = entryRows.find((e) => e.account.ownerType === 'PLATFORM_RECEIVABLE');
+    expect(receivableRow).toBeDefined();
+    expect(receivableRow.id).toBe(receivableEntry.id);
+    expect(receivableRow.direction).toBe('DEBIT');
+    expect(new Prisma.Decimal(receivableRow.amount).equals(new Prisma.Decimal('9000'))).toBe(true);
+  });
+
+  test('P2.9: a partial shortfall posts both a SELLER_WALLET leg (collected) and a PLATFORM_RECEIVABLE leg (shortfall) that sum to the requested clawback', async () => {
+    const eventId = crypto.randomUUID();
+    const customerId = crypto.randomUUID();
+    const sellerId = crypto.randomUUID();
+    const storeId = crypto.randomUUID();
+    createdEventIds.push(['REFUND', eventId]);
+
+    // requested clawback 9000 = collected 6000 + shortfall 3000; customerAmount 10000 = 6000 + 1000(commission) + 3000.
+    const result = await withTx((tx) => postRefund(tx, {
+      eventId,
+      currency: 'TMN',
+      customerId,
+      customerAmount: '10000',
+      sellerRefunds: [{
+        storeId, sellerId, collectedAmount: '6000', shortfallAmount: '3000',
+      }],
+      commissionAmount: '1000',
+    }));
+    await trackAccounts(customerId, [sellerId]);
+    createdAccountIds.push(...(await prisma.account.findMany({
+      where: { ownerType: 'PLATFORM_RECEIVABLE', ownerId: PLATFORM_LEDGER_OWNER_ID, currency: 'TMN' },
+    })).map((a) => a.id));
+
+    const entryRows = await prisma.ledgerEntry.findMany({
+      where: { journalId: result.journal.id },
+      include: { account: true },
+    });
+    expect(entryRows).toHaveLength(4);
+    const sellerRow = entryRows.find((e) => e.account.ownerType === 'SELLER_WALLET');
+    const receivableRow = entryRows.find((e) => e.account.ownerType === 'PLATFORM_RECEIVABLE');
+    expect(new Prisma.Decimal(sellerRow.amount).equals(new Prisma.Decimal('6000'))).toBe(true);
+    expect(new Prisma.Decimal(receivableRow.amount).equals(new Prisma.Decimal('3000'))).toBe(true);
+    expect(result.receivableEntryByStoreId.get(storeId).id).toBe(receivableRow.id);
+  });
+
+  test('P2.9: two stores with an identical shortfall amount in the same refund still resolve to two distinct PLATFORM_RECEIVABLE LedgerEntry rows (F1 regression)', async () => {
+    const eventId = crypto.randomUUID();
+    const customerId = crypto.randomUUID();
+    const sellerA = crypto.randomUUID();
+    const sellerB = crypto.randomUUID();
+    const storeA = crypto.randomUUID();
+    const storeB = crypto.randomUUID();
+    createdEventIds.push(['REFUND', eventId]);
+
+    // Both stores have IDENTICAL shortfalls (5000) — the exact ambiguity
+    // the original design's `ledgerReceivableJournalId` proposal could not
+    // resolve; ledgerReceivableEntryId (a specific LedgerEntry, not just a
+    // Journal) must still pair each store with its OWN row.
+    const result = await withTx((tx) => postRefund(tx, {
+      eventId,
+      currency: 'TMN',
+      customerId,
+      customerAmount: '10000',
+      sellerRefunds: [
+        {
+          storeId: storeA, sellerId: sellerA, collectedAmount: '0', shortfallAmount: '5000',
+        },
+        {
+          storeId: storeB, sellerId: sellerB, collectedAmount: '0', shortfallAmount: '5000',
+        },
+      ],
+      commissionAmount: '0',
+    }));
+    await trackAccounts(customerId, [sellerA, sellerB]);
+    createdAccountIds.push(...(await prisma.account.findMany({
+      where: { ownerType: 'PLATFORM_RECEIVABLE', ownerId: PLATFORM_LEDGER_OWNER_ID, currency: 'TMN' },
+    })).map((a) => a.id));
+
+    expect(result.receivableEntryByStoreId.size).toBe(2);
+    const entryA = result.receivableEntryByStoreId.get(storeA);
+    const entryB = result.receivableEntryByStoreId.get(storeB);
+    expect(entryA).toBeDefined();
+    expect(entryB).toBeDefined();
+    expect(entryA.id).not.toBe(entryB.id); // two DISTINCT rows, not one shared reference
+
+    const receivableRows = await prisma.ledgerEntry.findMany({
+      where: { journalId: result.journal.id, account: { ownerType: 'PLATFORM_RECEIVABLE' } },
+    });
+    expect(receivableRows).toHaveLength(2);
+    expect(receivableRows.map((r) => r.id).sort()).toEqual([entryA.id, entryB.id].sort());
   });
 });
 
@@ -1745,6 +1880,36 @@ describe('postLiabilityRecovery', () => {
     expect(creditEntry.account.ownerType).toBe('PLATFORM_CASH');
     expect(creditEntry.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
     expect(new Prisma.Decimal(debitEntry.amount).equals(new Prisma.Decimal('3000'))).toBe(true);
+    expect(new Prisma.Decimal(creditEntry.amount).equals(new Prisma.Decimal('3000'))).toBe(true);
+  });
+
+  test('P2.9: receivableBacked: true credits PLATFORM_RECEIVABLE instead of PLATFORM_CASH', async () => {
+    const sellerId = crypto.randomUUID();
+    const eventId = `${crypto.randomUUID()}:${crypto.randomUUID()}`;
+    createdEventIds.push(['LIABILITY_RECOVERY', eventId]);
+
+    const result = await withTx((tx) => postLiabilityRecovery(tx, {
+      eventId, actorId: null, currency: 'TMN', sellerId, amount: '3000', receivableBacked: true,
+    }));
+    const seller = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'SELLER_WALLET', ownerId: sellerId, currency: 'TMN' } },
+    });
+    if (seller) createdAccountIds.push(seller.id);
+    createdAccountIds.push(...(await prisma.account.findMany({
+      where: { ownerType: 'PLATFORM_RECEIVABLE', ownerId: PLATFORM_LEDGER_OWNER_ID, currency: 'TMN' },
+    })).map((a) => a.id));
+
+    const entryRows = await prisma.ledgerEntry.findMany({
+      where: { journalId: result.journal.id },
+      include: { account: true },
+    });
+    expect(entryRows).toHaveLength(2);
+
+    const debitEntry = entryRows.find((e) => e.direction === 'DEBIT');
+    const creditEntry = entryRows.find((e) => e.direction === 'CREDIT');
+    expect(debitEntry.account.ownerType).toBe('SELLER_WALLET');
+    expect(creditEntry.account.ownerType).toBe('PLATFORM_RECEIVABLE'); // not PLATFORM_CASH
+    expect(creditEntry.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
     expect(new Prisma.Decimal(creditEntry.amount).equals(new Prisma.Decimal('3000'))).toBe(true);
   });
 

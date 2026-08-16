@@ -817,7 +817,7 @@ describe('P2.4 — Ledger integration', () => {
     expect(Number(revenueLeg.amount)).toBe(Number(settlement.commissionAmount));
   });
 
-  test('E) delivered WALLET refund with a shortfall: ledgerStatus is SHORTFALL_HELD, the liability links back to the refund, and no clean REFUND Journal is fabricated', async () => {
+  test('E) delivered WALLET refund with a shortfall: ledgerStatus is POSTED, the liability links to its exact PLATFORM_RECEIVABLE LedgerEntry, and the REFUND Journal balances (P2.9 — Model C)', async () => {
     // Dedicated seller/store/product fixture for this test only. `seller` is
     // shared across every other test in this describe block (A, B, C, D, F,
     // G, H) — forcing a shortfall on it here would leave a lingering
@@ -838,8 +838,9 @@ describe('P2.4 — Ledger integration', () => {
     await advanceToDelivered(order.id, admin.auth);
     const orderWithItems = await prisma.order.findUnique({ where: { id: order.id }, include: { items: true } });
     const item = orderWithItems.items[0];
+    const settlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item.id } });
 
-    await prisma.wallet.update({ where: { userId: sellerE.user.id }, data: { balance: 0 } }); // force a shortfall
+    await prisma.wallet.update({ where: { userId: sellerE.user.id }, data: { balance: 0 } }); // force a full shortfall
 
     const refundRes = await api.post(`${PREFIX}/orders/${order.id}/refund`).set('Authorization', admin.auth)
       .send({ items: [{ orderItemId: item.id, qty: 1 }] });
@@ -847,14 +848,42 @@ describe('P2.4 — Ledger integration', () => {
 
     const refund = await prisma.paymentRefund.findUnique({ where: { id: refundRes.body.data.refund.id } });
     expect(refund.origin).toBe('POST_DELIVERY_REFUND');
-    expect(refund.ledgerStatus).toBe('SHORTFALL_HELD');
+    // P2.9 — the anyShortfall gate is removed: a WALLET refund's REFUND
+    // Journal now posts unconditionally, including on a full shortfall.
+    expect(refund.ledgerStatus).toBe('POSTED');
 
     const liability = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: order.id, sellerId: sellerE.user.id, refundId: refund.id } });
     expect(liability).not.toBeNull();
     expect(liability.refundId).toBe(refund.id);
+    // originalAmount is immutable and set at creation; amount here is the
+    // still-outstanding remainder (no recovery has happened yet, so equal).
+    expect(Number(liability.originalAmount)).toBe(Number(settlement.sellerEarning));
+    expect(Number(liability.amount)).toBe(Number(settlement.sellerEarning));
+    expect(liability.ledgerReceivableEntryId).not.toBeNull();
 
     const journal = await findJournal('REFUND', refund.id);
-    expect(journal).toBeNull(); // no fabricated clean settlement reversal
+    expect(journal).not.toBeNull(); // P2.9 — no longer suppressed by the shortfall
+
+    const entries = await entriesFor(journal.id);
+    const customerLeg = entries.find((e) => e.account.ownerType === 'CUSTOMER_WALLET');
+    const sellerLeg = entries.find((e) => e.account.ownerType === 'SELLER_WALLET');
+    const revenueLeg = entries.find((e) => e.account.ownerType === 'PLATFORM_REVENUE');
+    const receivableLeg = entries.find((e) => e.account.ownerType === 'PLATFORM_RECEIVABLE');
+
+    expect(customerLeg.direction).toBe('CREDIT');
+    expect(Number(customerLeg.amount)).toBe(Number(settlement.grossAmount));
+    // Full shortfall (wallet balance forced to 0) — no SELLER_WALLET leg at all.
+    expect(sellerLeg).toBeUndefined();
+    expect(revenueLeg.direction).toBe('DEBIT');
+    expect(Number(revenueLeg.amount)).toBe(Number(settlement.commissionAmount));
+    expect(receivableLeg.direction).toBe('DEBIT');
+    expect(Number(receivableLeg.amount)).toBe(Number(settlement.sellerEarning));
+    expect(receivableLeg.id).toBe(liability.ledgerReceivableEntryId);
+
+    // Balanced: CREDIT total === DEBIT total.
+    const creditTotal = entries.filter((e) => e.direction === 'CREDIT').reduce((s, e) => s + Number(e.amount), 0);
+    const debitTotal = entries.filter((e) => e.direction === 'DEBIT').reduce((s, e) => s + Number(e.amount), 0);
+    expect(debitTotal).toBe(creditTotal);
   });
 
   test('F) delivered GATEWAY refund with no shortfall: the REFUND Journal is deferred until markGatewayRefundProcessed confirms it', async () => {
@@ -892,14 +921,15 @@ describe('P2.4 — Ledger integration', () => {
     expect(Number(sellerLeg.amount)).toBe(Number(settlement.sellerEarning));
   });
 
-  test('G) delivered GATEWAY refund with a shortfall: SHORTFALL_HELD persists through markGatewayRefundProcessed and no clean REFUND Journal is ever fabricated', async () => {
+  test('G) delivered GATEWAY refund with a shortfall: REFUND Journal is posted at markGatewayRefundProcessed confirmation, reconstructed from originalAmount, with a PLATFORM_RECEIVABLE leg (P2.9 — Model C)', async () => {
     const order = await addToCartAndCheckout(customer.auth, [{ storeProduct: product, qty: 1 }]);
     await payGatewayAndConfirm(customer.auth, order.id);
     await advanceToDelivered(order.id, admin.auth);
     const orderWithItems = await prisma.order.findUnique({ where: { id: order.id }, include: { items: true } });
     const item = orderWithItems.items[0];
+    const settlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item.id } });
 
-    await prisma.wallet.update({ where: { userId: seller.user.id }, data: { balance: 0 } }); // force a shortfall
+    await prisma.wallet.update({ where: { userId: seller.user.id }, data: { balance: 0 } }); // force a full shortfall
 
     const refundRes = await api.post(`${PREFIX}/orders/${order.id}/refund`).set('Authorization', admin.auth)
       .send({ items: [{ orderItemId: item.id, qty: 1 }] });
@@ -910,18 +940,36 @@ describe('P2.4 — Ledger integration', () => {
     expect(refundBefore.origin).toBe('POST_DELIVERY_REFUND');
     expect(refundBefore.ledgerStatus).toBe('SHORTFALL_HELD');
 
-    const liability = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: order.id, sellerId: seller.user.id, refundId } });
-    expect(liability).not.toBeNull();
+    const liabilityBefore = await prisma.sellerPayoutLiability.findFirst({ where: { orderId: order.id, sellerId: seller.user.id, refundId } });
+    expect(liabilityBefore).not.toBeNull();
+    expect(Number(liabilityBefore.originalAmount)).toBe(Number(settlement.sellerEarning));
+    expect(liabilityBefore.ledgerReceivableEntryId).toBeNull(); // not yet posted — GATEWAY defers Ledger posting
+
+    // Journal must not exist before gateway confirmation, GATEWAY posting is
+    // deferred either way (unchanged by P2.9 — see markGatewayRefundProcessed).
+    const journalBefore = await findJournal('REFUND', refundId);
+    expect(journalBefore).toBeNull();
 
     const confirmed = await api.patch(`${PREFIX}/admin/payment-refunds/${refundId}/mark-processed`).set('Authorization', admin.auth);
     expect(confirmed.status).toBe(200);
-    expect(confirmed.body.data.status).toBe('PROCESSED'); // money-movement claim still succeeds
-
-    const journal = await findJournal('REFUND', refundId);
-    expect(journal).toBeNull(); // still no fabricated Journal, even after gateway confirmation
+    expect(confirmed.body.data.status).toBe('PROCESSED');
 
     const refundAfter = await prisma.paymentRefund.findUnique({ where: { id: refundId } });
-    expect(refundAfter.ledgerStatus).toBe('SHORTFALL_HELD'); // unchanged — pending manual reconciliation
+    // P2.9 — Case A/B are merged: shortfall no longer blocks posting.
+    expect(refundAfter.ledgerStatus).toBe('POSTED');
+
+    const journal = await findJournal('REFUND', refundId);
+    expect(journal).not.toBeNull();
+
+    const entries = await entriesFor(journal.id);
+    const sellerLeg = entries.find((e) => e.account.ownerType === 'SELLER_WALLET');
+    const receivableLeg = entries.find((e) => e.account.ownerType === 'PLATFORM_RECEIVABLE');
+    expect(sellerLeg).toBeUndefined(); // full shortfall — nothing was collectible
+    expect(receivableLeg).not.toBeUndefined();
+    expect(Number(receivableLeg.amount)).toBe(Number(settlement.sellerEarning));
+
+    const liabilityAfter = await prisma.sellerPayoutLiability.findUnique({ where: { id: liabilityBefore.id } });
+    expect(liabilityAfter.ledgerReceivableEntryId).toBe(receivableLeg.id);
   });
 
   test('H) a legacy PaymentRefund (origin/ledgerStatus NULL) still processes money movement via markGatewayRefundProcessed without any inferred Ledger posting', async () => {

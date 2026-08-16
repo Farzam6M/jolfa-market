@@ -419,19 +419,27 @@ async function refundGateway(paymentId, amount, idempotencyKey, actor, origin, t
  *   - origin === 'PRE_DELIVERY_CANCELLATION': no settlement to reverse —
  *     posts PAYMENT_REVERSED (GATEWAY leg), eventId = Payment.id, then
  *     flips ledgerStatus -> 'POSTED'.
- *   - origin === 'POST_DELIVERY_REFUND' && ledgerStatus === 'POSTABLE':
- *     the seller-wallet clawback fully succeeded when this refund was
- *     created (refundDeliveredOrder's Pass 2) — reconstructs
- *     sellerRefunds/commissionAmount from the OrderItemSettlementReversal
- *     rows THIS refund created (never recomputed from current wallet
- *     state) and posts REFUND, eventId = PaymentRefund.id, then flips
- *     ledgerStatus -> 'POSTED'.
- *   - origin === 'POST_DELIVERY_REFUND' && ledgerStatus === 'SHORTFALL_HELD':
- *     the clawback was incomplete — money movement above still becomes
- *     PROCESSED, but NO Ledger journal is posted (fabricating a clean
- *     REFUND here would misstate a settlement reversal that never fully
- *     happened); left for manual reconciliation, ledgerStatus stays
- *     SHORTFALL_HELD.
+ *   - origin === 'POST_DELIVERY_REFUND' && (ledgerStatus === 'POSTABLE' ||
+ *     ledgerStatus === 'SHORTFALL_HELD'):
+ *     [P2.9 — Model C, P2.8 Finding A] Cases A and B are now ONE branch —
+ *     previously POSTABLE posted a clean REFUND and SHORTFALL_HELD posted
+ *     nothing at all (P2.8 Finding A: the entire journal, including the
+ *     clean legs, was lost). Reconstructs each STORE's requested clawback
+ *     (summed from the OrderItemSettlementReversal rows THIS refund
+ *     created, grouped by settlement.storeId — never recomputed from
+ *     current wallet state), looks up that exact (refund.id, storeId)'s
+ *     SellerPayoutLiability row if one exists, and uses its IMMUTABLE
+ *     `originalAmount` (never the mutable, possibly-already-partially-
+ *     recovered `amount`) to split requestedAmount into
+ *     collectedAmount/shortfallAmount per store — see F2/originalAmount's
+ *     own doc comments for why store-scoping (not seller-scoping) and
+ *     originalAmount (not amount) are both required for this to be
+ *     correct after arbitrary delay and arbitrary intervening partial
+ *     recovery. Posts REFUND with the resulting per-store legs (a store
+ *     with no liability row simply has shortfallAmount = 0, reproducing
+ *     the old Case A shape exactly), links every liability created by
+ *     this refund to its own PLATFORM_RECEIVABLE LedgerEntry, then flips
+ *     ledgerStatus -> 'POSTED' either way.
  *   - origin/ledgerStatus NULL (legacy row, created before P2.4): money
  *     movement above is NOT blocked by this — only the automated Ledger
  *     posting is skipped, logged for manual reconciliation rather than
@@ -469,46 +477,90 @@ async function markGatewayRefundProcessed(refundId, actor) {
         amount: refund.amount,
       });
       refund = await tx.paymentRefund.update({ where: { id: refund.id }, data: { ledgerStatus: 'POSTED' } });
-    } else if (refund.origin === 'POST_DELIVERY_REFUND' && refund.ledgerStatus === 'POSTABLE') {
-      // Case A — reconstruct seller/commission reversal amounts from the
-      // OrderItemSettlementReversal rows THIS refund created (persisted
-      // historical data — safe to use; never recomputed from current
-      // Wallet.balance or re-derived from settlement state). storeId ->
-      // sellerId is resolved via OrderItemSettlement.store, matching
-      // schema.prisma's actual relation names.
+    } else if (refund.origin === 'POST_DELIVERY_REFUND' && (refund.ledgerStatus === 'POSTABLE' || refund.ledgerStatus === 'SHORTFALL_HELD')) {
+      // Case A — [P2.9 — Model C, P2.8 Finding A] reconstruct seller/
+      // commission reversal amounts from the OrderItemSettlementReversal
+      // rows THIS refund created (persisted historical data — safe to
+      // use; never recomputed from current Wallet.balance or re-derived
+      // from settlement state), STORE-scoped (not seller-scoped — see F2:
+      // a single seller can own multiple stores refunded in this same
+      // call, and SellerPayoutLiability is keyed per store, so grouping
+      // by sellerId alone would conflate two stores' independent
+      // collected/shortfall splits). storeId -> sellerId is resolved via
+      // OrderItemSettlement.store, matching schema.prisma's actual
+      // relation names.
       const reversals = await tx.orderItemSettlementReversal.findMany({
         where: { refundId: refund.id },
         include: { settlement: { include: { store: { select: { sellerId: true } } } } },
       });
 
-      const sellerTotals = new Map(); // sellerId -> Prisma.Decimal
+      // storeId -> { sellerId, requestedAmount: Prisma.Decimal }
+      const storeTotals = new Map();
       let commissionTotal = new Prisma.Decimal(0);
       // eslint-disable-next-line no-restricted-syntax
       for (const reversal of reversals) {
+        const { storeId } = reversal.settlement;
         const { sellerId } = reversal.settlement.store;
-        const prevAmount = sellerTotals.get(sellerId) || new Prisma.Decimal(0);
-        sellerTotals.set(sellerId, prevAmount.plus(new Prisma.Decimal(reversal.refundedSellerEarning)));
+        const existing = storeTotals.get(storeId) || { sellerId, requestedAmount: new Prisma.Decimal(0) };
+        existing.requestedAmount = existing.requestedAmount.plus(new Prisma.Decimal(reversal.refundedSellerEarning));
+        storeTotals.set(storeId, existing);
         commissionTotal = commissionTotal.plus(new Prisma.Decimal(reversal.refundedCommissionAmount));
       }
 
+      // P2.9 — this refund's own shortfall liabilities, keyed by storeId
+      // (at most one per store per refund — @@unique([refundId, storeId])
+      // enforces this at the DB level). `originalAmount` — NEVER the
+      // mutable `amount` — is the shortfall AS IT WAS when Pass 2 first
+      // attempted this store's clawback, regardless of how much
+      // recoverSellerLiabilities may have already recovered against this
+      // exact row by the time this confirmation runs (arbitrarily later,
+      // possibly after several intervening settlements).
+      const liabilities = await tx.sellerPayoutLiability.findMany({ where: { refundId: refund.id } });
+      const liabilityByStoreId = new Map(liabilities.map((l) => [l.storeId, l]));
+
       const order = await tx.order.findUnique({ where: { id: refund.orderId } });
 
-      await postRefund(tx, {
+      const sellerRefunds = Array.from(storeTotals.entries()).map(([storeId, { sellerId, requestedAmount }]) => {
+        const liability = liabilityByStoreId.get(storeId);
+        const shortfallAmount = liability ? new Prisma.Decimal(liability.originalAmount ?? liability.amount) : new Prisma.Decimal(0);
+        const collectedAmount = requestedAmount.minus(shortfallAmount);
+        return {
+          storeId, sellerId, collectedAmount, shortfallAmount,
+        };
+      });
+
+      const { receivableEntryByStoreId } = await postRefund(tx, {
         eventId: refund.id,
         actorId: null,
         customerId: order.userId,
         customerAmount: refund.amount,
-        sellerRefunds: Array.from(sellerTotals.entries()).map(([sellerId, amount]) => ({ sellerId, amount })),
+        sellerRefunds,
         commissionAmount: commissionTotal,
       });
+
+      // P2.9 — link each liability this refund created to the exact
+      // LedgerEntry representing its own PLATFORM_RECEIVABLE DEBIT leg.
+      // Necessarily a SEPARATE transaction from the liability's own
+      // creation (refundDeliveredOrder's own $transaction, which ran
+      // earlier and already committed) — GATEWAY refunds intentionally
+      // defer all Ledger posting to this later confirmation, so the
+      // liability-creation and liability-linking steps can never be made
+      // atomic with each other for GATEWAY, only within each of their own
+      // transactions individually (see refundDeliveredOrder's own
+      // transactionality comment).
+      // eslint-disable-next-line no-restricted-syntax
+      for (const [storeId, liability] of liabilityByStoreId) {
+        const entry = receivableEntryByStoreId.get(storeId);
+        if (entry) {
+          // eslint-disable-next-line no-await-in-loop
+          await tx.sellerPayoutLiability.update({
+            where: { id: liability.id },
+            data: { ledgerReceivableEntryId: entry.id },
+          });
+        }
+      }
+
       refund = await tx.paymentRefund.update({ where: { id: refund.id }, data: { ledgerStatus: 'POSTED' } });
-    } else if (refund.origin === 'POST_DELIVERY_REFUND' && refund.ledgerStatus === 'SHORTFALL_HELD') {
-      // Case B — money movement above still completes (REQUESTED ->
-      // PROCESSED already claimed), but the Ledger must not fabricate a
-      // clean settlement reversal when the seller clawback was left
-      // incomplete at refund-creation time (see SellerPayoutLiability /
-      // refundDeliveredOrder). No postRefund call; ledgerStatus stays
-      // SHORTFALL_HELD, pending manual reconciliation.
     } else {
       // Case D — legacy row: origin and/or ledgerStatus is NULL, meaning
       // this PaymentRefund predates the P2.4 columns. Do NOT infer origin

@@ -698,7 +698,7 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
       const refundLines = [];
       const storeDebits = new Map(); // storeId -> { sellerId, amount }
       let totalCustomerRefund = 0;
-      let totalCommission = 0; // Ledger REFUND's PLATFORM_REVENUE debit — no-shortfall path only.
+      let totalCommission = 0; // Ledger REFUND's PLATFORM_REVENUE debit.
 
       // eslint-disable-next-line no-restricted-syntax
       for (const line of items) {
@@ -770,11 +770,22 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
       // as the wallet currently holds (fast-path: the full amount, exactly
       // as before) and tracks any uncollected remainder as an additive
       // liability rather than throwing and rolling back the whole refund.
-      // Tracks whether ANY affected store had a shortfall this call — the
-      // Ledger REFUND journal (no fake balancing leg possible for the
-      // shortfall path) is only posted when this stays false; see Pass 2
-      // below and the postRefund call after Pass 2 completes.
+      //
+      // [P2.9 — Model C, P2.8 Finding A] `anyShortfall` no longer gates
+      // Ledger posting for WALLET refunds — it is kept purely as an
+      // informational flag (used below only to choose GATEWAY's
+      // POSTABLE/SHORTFALL_HELD ledgerStatus, whose posting genuinely
+      // stays deferred to markGatewayRefundProcessed either way). For
+      // WALLET, the REFUND Journal is now posted unconditionally after
+      // this loop, representing whatever was actually collected per store
+      // plus whatever wasn't (as a DEBIT PLATFORM_RECEIVABLE leg) — see
+      // the postRefund call below. `storeResults` additionally records,
+      // per store, the collected/shortfall split (and the liability row's
+      // id, if one was created) so that call can build its
+      // `sellerRefunds` array and link each liability to its own
+      // PLATFORM_RECEIVABLE LedgerEntry afterward.
       let anyShortfall = false;
+      const storeResults = new Map(); // storeId -> { sellerId, collectedAmount, shortfallAmount, liabilityId }
 
       // eslint-disable-next-line no-restricted-syntax
       for (const [storeId, { sellerId, amount }] of storeDebits) {
@@ -836,7 +847,7 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
         if (shortfall > 0) {
           anyShortfall = true;
           // eslint-disable-next-line no-await-in-loop
-          await tx.sellerPayoutLiability.create({
+          const liability = await tx.sellerPayoutLiability.create({
             data: {
               sellerId,
               orderId: order.id,
@@ -847,40 +858,89 @@ async function refundDeliveredOrder(orderId, items, reason, actor) {
               // which would be ambiguous across multiple refunds/stores).
               refundId: refund.id,
               amount: shortfall,
+              // P2.9 — the shortfall amount AT CREATION TIME, immutable
+              // thereafter (unlike `amount` above, which recoverSellerLiabilities'
+              // FIFO recovery decrements in place) — see this column's own
+              // schema.prisma doc comment for why this is required (GATEWAY
+              // refunds reconstruct the shortfall from this, not from
+              // possibly-already-recovered `amount`, at confirmation time).
+              originalAmount: shortfall,
               reason: `کسری کیف پول هنگام استرداد سفارش ${order.orderNumber} — قابل واریز مجدد از تسویه‌ها/برداشت‌های بعدی`,
             },
+          });
+          storeResults.set(storeId, {
+            sellerId, collectedAmount: collected, shortfallAmount: shortfall, liabilityId: liability.id,
+          });
+        } else {
+          storeResults.set(storeId, {
+            sellerId, collectedAmount: collected, shortfallAmount: 0, liabilityId: null,
           });
         }
       }
 
-      // P2.4 — persist the real ledgerStatus outcome of THIS call now that
-      // Pass 2's seller-wallet clawback has actually run (never computed
-      // later, never inferred from current Wallet.balance — see
+      // P2.4/P2.9 — persist the real ledgerStatus outcome of THIS call now
+      // that Pass 2's seller-wallet clawback has actually run (never
+      // computed later, never inferred from current Wallet.balance — see
       // PaymentRefundLedgerStatus's schema.prisma doc comment).
       //
       // WALLET: money movement is immediate, so the Ledger REFUND event is
-      // still posted immediately too, exactly as before this change — only
-      // when there was no shortfall. On a shortfall, no REFUND is posted
-      // (fabricating a clean settlement reversal would misstate an
-      // incomplete clawback) and there is no later confirmation step for a
-      // WALLET refund (it is already PROCESSED) to post it from — the gap
-      // is left for manual reconciliation, same as the GATEWAY shortfall
-      // case below.
+      // still posted immediately too — [P2.9 — Model C, P2.8 Finding A]
+      // UNCONDITIONALLY now, including on a shortfall (previously: "only
+      // when there was no shortfall... on a shortfall, no REFUND is
+      // posted... the gap is left for manual reconciliation" — that gap is
+      // exactly P2.8 Finding A, and Model C's DEBIT PLATFORM_RECEIVABLE leg
+      // is what closes it). `sellerRefunds` is built from `storeResults`
+      // (the same per-store collected/shortfall split Pass 2 already
+      // computed), not from `storeDebits` directly, since postRefund now
+      // needs both numbers, not just the originally requested `amount`.
       //
-      // GATEWAY: postRefund is NEVER called here regardless of anyShortfall
-      // — deferred until markGatewayRefundProcessed's own claim succeeds
-      // (Case A posts it for POSTABLE, Case B deliberately skips it for
-      // SHORTFALL_HELD) — see that function's doc comment.
+      // GATEWAY: postRefund is still NEVER called here, regardless of
+      // anyShortfall — deferred until markGatewayRefundProcessed's own
+      // claim succeeds (Case A posts the no-shortfall shape, Case B now
+      // also posts the shortfall-aware shape — see that function's doc
+      // comment). This timing is unchanged by P2.9.
       let finalRefund;
-      if (payment.method === 'WALLET' && !anyShortfall) {
-        await postRefund(tx, {
+      if (payment.method === 'WALLET') {
+        const { receivableEntryByStoreId } = await postRefund(tx, {
           eventId: refund.id,
           actorId: null,
           customerId: order.userId,
           customerAmount: totalCustomerRefund,
-          sellerRefunds: Array.from(storeDebits.values()).map(({ sellerId, amount }) => ({ sellerId, amount })),
+          sellerRefunds: Array.from(storeResults.entries()).map(([storeId, r]) => ({
+            storeId,
+            sellerId: r.sellerId,
+            collectedAmount: r.collectedAmount,
+            shortfallAmount: r.shortfallAmount,
+          })),
           commissionAmount: totalCommission,
         });
+
+        // P2.9 — link each just-created liability to the exact
+        // LedgerEntry representing its own PLATFORM_RECEIVABLE DEBIT leg,
+        // in the SAME transaction as the liability's own creation and the
+        // Journal itself (all atomic together for WALLET — see this
+        // function's own transactionality contract; GATEWAY necessarily
+        // links in a later, separate transaction — see
+        // markGatewayRefundProcessed).
+        // eslint-disable-next-line no-restricted-syntax
+        for (const [storeId, r] of storeResults) {
+          if (r.liabilityId) {
+            const entry = receivableEntryByStoreId.get(storeId);
+            if (!entry) {
+              // Unreachable under correct construction (every liability
+              // created above has shortfallAmount > 0, which always
+              // produces a receivable leg in postRefund) — fail loudly
+              // rather than silently leave a liability unlinked.
+              throw ApiError.internal(`Missing PLATFORM_RECEIVABLE LedgerEntry for store ${storeId}`);
+            }
+            // eslint-disable-next-line no-await-in-loop
+            await tx.sellerPayoutLiability.update({
+              where: { id: r.liabilityId },
+              data: { ledgerReceivableEntryId: entry.id },
+            });
+          }
+        }
+
         finalRefund = await tx.paymentRefund.update({ where: { id: refund.id }, data: { ledgerStatus: 'POSTED' } });
       } else {
         finalRefund = await tx.paymentRefund.update({

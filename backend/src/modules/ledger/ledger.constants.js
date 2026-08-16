@@ -151,11 +151,22 @@ const LEDGER_CURRENCY = 'TMN';
 // PLATFORM_CASH-equivalent balance — the customer-side leg is a Wallet
 // credit (refundWallet) or a gateway-pending PaymentRefund row
 // (refundGateway) with no PAYMENT_GATEWAY_CLEARING-mirroring code path in
-// this phase, and this wrapper only implements the no-shortfall case (see
-// postRefund's own doc comment for why the shortfall/SellerPayoutLiability
-// path — which also touches no PLATFORM_CASH-equivalent balance — is out
-// of scope here too). Introducing a PLATFORM_CASH leg would require
-// inventing a mutation this repo's real refund code never performs.
+// this phase. Introducing a PLATFORM_CASH leg would require inventing a
+// mutation this repo's real refund code never performs.
+//
+// [P2.9 addendum — Model C, P2.8 Finding A] The paragraph above and
+// postRefund's pre-P2.9 doc comment both stated the shortfall/
+// SellerPayoutLiability path was out of scope for this wrapper — that is
+// no longer true. P2.8 closed with that gap carried forward as an
+// intentional, documented scope boundary (an aggregate `anyShortfall` gate
+// suppressed the ENTIRE REFUND Journal, including the clean legs, whenever
+// even one seller/store had a shortfall). P2.9 removes that gate and
+// extends this same REFUND mapping with a fourth leg
+// (debitReceivableOwnerType: PLATFORM_RECEIVABLE) rather than introducing
+// a new LedgerEventType — see that field's own inline comment below for
+// the accounting reasoning. PLATFORM_CASH still never appears here; the
+// shortfall's counterpart is PLATFORM_RECEIVABLE, a genuine platform
+// receivable claim against the seller, not platform cash.
 // ─────────────────────────────────────────────────────────────────────────
 const EVENT_ACCOUNT_MAP = {
   PAYMENT_CONFIRMED: {
@@ -179,14 +190,49 @@ const EVENT_ACCOUNT_MAP = {
     debitOwnerType: 'PAYOUT_CLEARING',
     creditOwnerType: 'PLATFORM_CASH',
   },
+  // P2.9 — REFUND gains a fourth leg type: debitReceivableOwnerType. Prior
+  // to P2.9 this wrapper only ever posted the no-shortfall path (see
+  // postRefund's own doc comment history); P2.9 (Model C — P2.8 Finding A)
+  // extends it to also post whatever shortfall a seller's wallet couldn't
+  // cover, as a DEBIT against the platform's singleton PLATFORM_RECEIVABLE
+  // account, so the journal balances even when a full/partial clawback was
+  // never collectible from SELLER_WALLET:
+  //   customerAmount == collected(SELLER_WALLET) + commissionAmount(PLATFORM_REVENUE) + shortfall(PLATFORM_RECEIVABLE)
+  // debitSellerOwnerType's own meaning is unchanged (still SELLER_WALLET),
+  // but the amount posted against it per seller/store is now whatever was
+  // actually collected, never the full requested clawback when a shortfall
+  // occurred — see postRefund's own doc comment.
   REFUND: {
     creditCustomerOwnerType: 'CUSTOMER_WALLET',
     debitSellerOwnerType: 'SELLER_WALLET',
     debitRevenueOwnerType: 'PLATFORM_REVENUE',
+    debitReceivableOwnerType: 'PLATFORM_RECEIVABLE',
   },
+  // P2.9 — LIABILITY_RECOVERY now has TWO mappings, selected per-liability
+  // by the caller (payout-liabilities.service.js#recoverSellerLiabilities)
+  // based on whether the liability being recovered is receivable-backed
+  // (liability.ledgerReceivableEntryId != null) or legacy (NULL, predates
+  // P2.9 or has no receivable-backed REFUND leg). The DEBIT SELLER_WALLET
+  // side is identical either way — only the CREDIT target differs:
+  //   RECEIVABLE_BACKED: recovering money the platform is already carrying
+  //     as an outstanding PLATFORM_RECEIVABLE claim against this seller
+  //     (posted at REFUND time — see the REFUND mapping above) reduces
+  //     that specific claim, so the credit lands back on
+  //     PLATFORM_RECEIVABLE, moving its (negative) balance toward zero.
+  //   LEGACY: unchanged from pre-P2.9 behavior — a liability with no
+  //     PLATFORM_RECEIVABLE leg to reduce still credits PLATFORM_CASH, per
+  //     the original P2.4 Phase 2 Step 9 design reconciliation (see
+  //     ledger.service.js#postLiabilityRecovery's own doc comment). This
+  //     branch is REQUIRED permanently, not just during a transition
+  //     window — historical liabilities never gain a receivable leg
+  //     retroactively (no backfill).
   LIABILITY_RECOVERY: {
     debitOwnerType: 'SELLER_WALLET',
     creditOwnerType: 'PLATFORM_CASH',
+  },
+  LIABILITY_RECOVERY_RECEIVABLE_BACKED: {
+    debitOwnerType: 'SELLER_WALLET',
+    creditOwnerType: 'PLATFORM_RECEIVABLE',
   },
   // P2.4 — PAYMENT_CONFIRMED for a WALLET payment. Deliberately a SEPARATE
   // mapping from PAYMENT_CONFIRMED above (which is GATEWAY-only, both legs

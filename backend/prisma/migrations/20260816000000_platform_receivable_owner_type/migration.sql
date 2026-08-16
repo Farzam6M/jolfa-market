@@ -1,0 +1,28 @@
+-- P2.9 Stage 1 — LedgerAccountOwnerType.PLATFORM_RECEIVABLE (Model C).
+--
+-- Purely additive: one new enum VALUE on the existing LedgerAccountOwnerType
+-- enum. No table, column, index, foreign key, or existing enum value is
+-- touched or removed.
+--
+-- Deliberately isolated into its own migration file/deploy stage, same
+-- precedent as the 20260814000000_ledger_opening_balance_event_type
+-- migration's own comment: Postgres requires a new enum value to be added
+-- with ALTER TYPE ... ADD VALUE rather than recreating the type, and a
+-- newly added enum value cannot be referenced (used to create/compare a
+-- row) in the same transaction that adds it. Prisma runs each migration
+-- file in its own transaction, so this file must be deployed and committed
+-- BEFORE any application code (getOrCreateAccount, postRefund,
+-- postLiabilityRecovery) ever creates or looks up an Account row with
+-- ownerType = 'PLATFORM_RECEIVABLE', and before the
+-- 20260816000100_seller_payout_liability_receivable migration (which adds
+-- the SellerPayoutLiability columns referencing this account, but does not
+-- itself need the enum value inside its own transaction).
+--
+-- PLATFORM_RECEIVABLE represents the platform's singleton receivable claim
+-- against sellers for delivered-order refund clawback shortfalls (P2.8
+-- Finding A / P2.9 Model C). ownerId = PLATFORM_LEDGER_OWNER_ID
+-- ("PLATFORM"), same convention as every other PLATFORM_* owner type. See
+-- schema.prisma's own LedgerAccountOwnerType.PLATFORM_RECEIVABLE doc
+-- comment for the full accounting rationale (expected negative balance,
+-- no DB CHECK constraint prevents it).
+ALTER TYPE "LedgerAccountOwnerType" ADD VALUE 'PLATFORM_RECEIVABLE';
