@@ -2501,14 +2501,6 @@
       <div id="admin-asettings" style="display:none;">
         <div class="dash-hd"><div><h1>تنظیمات سایت</h1><p>پارامترهای کلی جلفا مارکت که بر روی همه فروشگاه‌ها اعمال می‌شود</p></div></div>
         <div class="dash-card">
-          <div class="form-section-title"><svg viewBox="0 0 24 24"><use href="#i-percent"/></svg> کارمزد و اشتراک</div>
-          <div class="form-section-sub">این مقادیر روی صفحه «اشتراک فروشگاه» تمام فروشندگان به‌صورت زنده اعمال می‌شود</div>
-          <div class="form-row-2">
-            <div class="form-group"><label class="form-label">درصد کارمزد پس از پایان دوره رایگان</label><input class="form-input" id="setCommissionRate" type="text" inputmode="numeric" placeholder="7"></div>
-            <div class="form-group"><label class="form-label">مدت دوره رایگان (روز)</label><input class="form-input" id="setTrialDays" type="text" inputmode="numeric" placeholder="60"></div>
-          </div>
-        </div>
-        <div class="dash-card" style="margin-top:18px;">
           <div class="form-section-title"><svg viewBox="0 0 24 24"><use href="#i-shield"/></svg> حالت تعمیر و نگهداری</div>
           <div class="form-section-sub">در صورت فعال بودن، ثبت فروشگاه جدید برای کاربران موقتاً غیرفعال می‌شود</div>
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12.5px;">
@@ -3481,42 +3473,31 @@ function handleAvatarFileChange(input, role) {
 }
 
 /* ══════════════════ SITE-WIDE SETTINGS (Super Admin > تنظیمات سایت) ══════════════════
-   Previously the commission rate / trial length were hardcoded numbers in the markup
-   and the "تنظیمات سایت" sidebar link did nothing. Now these values live here and are
-   editable from the admin panel, persisted in localStorage, and actually drive the
-   commission/trial logic used across the seller subscription pages. */
+   NOTE: This panel previously exposed an editable "Commission Rate" / "Trial Days"
+   pair that was persisted to localStorage only. It had no connection to the real
+   backend CommissionRule engine (/commission-rules, Scope/Priority/Campaign rules),
+   so changing it here never affected actual commission or settlements — it only
+   changed cosmetic text on the seller subscription pages. That control has been
+   removed to avoid misleading admins into thinking it changes real commission.
+   SUB_COMMISSION_RATE / SUB_TRIAL_DAYS (declared further below) are back to being
+   fixed, informational display constants, same as before that fake control existed.
+   Maintenance mode is unrelated to commission and remains a real local admin toggle. */
 const SITE_SETTINGS_KEY = 'jm_site_settings';
 function getSiteSettings() {
   try { return JSON.parse(localStorage.getItem(SITE_SETTINGS_KEY)) || {}; } catch(e) { return {}; }
 }
-function loadSiteSettings() {
-  const s = getSiteSettings();
-  if (typeof s.commissionRate === 'number') SUB_COMMISSION_RATE = s.commissionRate;
-  if (typeof s.trialDays === 'number') SUB_TRIAL_DAYS = s.trialDays;
-}
 function isMaintenanceMode() { return !!getSiteSettings().maintenanceMode; }
 function saveSiteSettings() {
-  const rateInput = document.getElementById('setCommissionRate');
-  const daysInput = document.getElementById('setTrialDays');
   const maintInput = document.getElementById('setMaintenanceMode');
-  const rate = Math.min(50, Math.max(0, Number(rateInput.value) || 0));
-  const days = Math.min(365, Math.max(0, Number(daysInput.value) || 0));
-  const settings = { commissionRate: rate, trialDays: days, maintenanceMode: !!maintInput.checked };
+  const settings = { maintenanceMode: !!maintInput.checked };
   try { localStorage.setItem(SITE_SETTINGS_KEY, JSON.stringify(settings)); } catch(e) {}
-  loadSiteSettings();
   toast('تنظیمات سایت ذخیره شد');
 }
 function renderSiteSettingsForm() {
-  loadSiteSettings();
   const s = getSiteSettings();
-  const rateInput = document.getElementById('setCommissionRate');
-  const daysInput = document.getElementById('setTrialDays');
   const maintInput = document.getElementById('setMaintenanceMode');
-  if (rateInput) rateInput.value = SUB_COMMISSION_RATE;
-  if (daysInput) daysInput.value = SUB_TRIAL_DAYS;
   if (maintInput) maintInput.checked = !!s.maintenanceMode;
 }
-loadSiteSettings();
 
 function getCurrentUser() {
   try {
