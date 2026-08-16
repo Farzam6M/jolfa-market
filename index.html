@@ -1745,6 +1745,21 @@
           <div class="chart-month-labels" style="display:flex;justify-content:space-between;font-size:10px;color:var(--gray-400);margin-top:8px;"><span>فروردین</span><span>اردیبهشت</span><span>خرداد</span><span>تیر</span><span>مرداد</span><span>شهریور</span><span>مهر</span><span>آبان</span><span>آذر</span><span>دی</span><span>بهمن</span><span>اسفند</span></div>
           <div class="pending-note" id="sellerMonthlyChartEmpty" style="margin-top:10px;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> هنوز فروشی ثبت نشده تا روند ماهانه نمایش داده شود</div>
         </div>
+
+        <!-- Seller Settlements — PHASE 1B: GET /orders/settlements واقعی -->
+        <div class="dash-card" style="margin-top:16px;">
+          <h3>تسویه‌های فروشگاه</h3>
+          <table class="dash-table">
+            <thead><tr>
+              <th>کد سفارش</th><th>کالا</th><th>تعداد</th><th>مبلغ ناخالص</th><th>نرخ کمیسیون</th><th>مبلغ کمیسیون</th><th>سهم فروشنده</th><th>تاریخ تسویه</th>
+            </tr></thead>
+            <tbody id="sellerSettlementsBody"></tbody>
+          </table>
+        </div>
+        <div class="pending-note" id="sellerSettlementsEmpty" style="display:none;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> هنوز تسویه‌ای برای فروشگاه شما ثبت نشده است</div>
+        <div style="text-align:center;margin-top:12px;">
+          <button class="btn-verify" id="sellerSettlementsLoadMore" style="padding:8px 18px;display:none;" onclick="loadMoreSellerSettlements()">بارگذاری بیشتر</button>
+        </div>
       </div>
 
       <!-- Seller: Settings tab -->
@@ -7618,7 +7633,7 @@ async function savePriceRow(btn) {
 function filterSellerOrders(el, status) {
   document.querySelectorAll('#seller-sorders .cat-filter-item').forEach(x => x.classList.remove('act'));
   el.classList.add('act');
-  const items = document.querySelectorAll('#sellerOrdersList .order-item');
+  const items = document.querySelectorAll('#sellerOrdersList [data-ord-status]');
   let visibleCount = 0;
   items.forEach(item => {
     const show = (status === 'all') || (item.getAttribute('data-ord-status') === status);
@@ -7955,18 +7970,126 @@ async function renderSellerDashboard() {
   if (ordersEmpty) ordersEmpty.style.display = 'flex';
 }
 
-/* Orders tab: this demo has no real order-placement pipeline feeding seller accounts, so a
-   store starts with an honest empty list instead of unrelated hardcoded sample orders. */
-function renderSellerOrdersTab() {
+/* ═══════════ Seller panel: Orders tab — PHASE 1A: GET /orders/store + PATCH /orders/:id/status واقعی ═══════════
+   طبق orders.service.js#listForStore، این endpoint فقط سفارش‌هایی را برمی‌گرداند که حداقل یک قلم از
+   فروشگاه همین فروشنده دارند، و items هر سفارش هم به همان اقلام همین فروشگاه فیلتر شده — پس نیازی به
+   فیلتر یا محاسبهٔ اضافه در فرانت نیست.
+   نکتهٔ Multi-vendor: order.total ممکن است شامل سایر فروشندگان هم باشد (چون یک Order می‌تواند چند
+   Seller داشته باشد ولی status یک مقدار واحد برای کل Order است) — به همین دلیل عمداً در این تب نمایش
+   داده نمی‌شود تا به اشتباه «مبلغ فروشنده» تلقی نشود؛ فقط قیمت واحد هر قلم (priceSnapshot) که مستقیماً
+   مال خودِ فروشگاه همین فروشنده است نمایش داده می‌شود و هیچ جمعی (qty × price) در فرانت محاسبه نمی‌شود. */
+const SELLER_ORDER_LOCAL_STATUS = {
+  PENDING: 'pend', CONFIRMED: 'pend', PREPARING: 'pend', SENT: 'ship', DELIVERED: 'done', CANCELLED: 'cancel',
+};
+const SELLER_ORDER_STATUS_LABEL_FA = {
+  PENDING: 'در انتظار تایید ادمین', CONFIRMED: 'تایید شده', PREPARING: 'در حال آماده‌سازی', SENT: 'ارسال شده', DELIVERED: 'تحویل داده شده', CANCELLED: 'لغو شده',
+};
+const SELLER_ORDER_STATUS_CLASS = {
+  PENDING: 'st-pend', CONFIRMED: 'st-pend', PREPARING: 'st-process', SENT: 'st-ship', DELIVERED: 'st-done', CANCELLED: 'st-cancel',
+};
+/* دقیقاً همان دو Transition که فروشنده در orders.service.js (SELLER_ALLOWED_STATUS_TARGETS +
+   ORDER_TRANSITIONS) اجازهٔ انجامش را دارد — این نگاشت فقط برای تصمیم UI (کدام دکمه نمایش داده شود)
+   است؛ اعتبارسنجی واقعی و نهایی همیشه در بک‌اند انجام می‌شود، پس حتی اگر این نگاشت با بک‌اند ناهماهنگ
+   شود، چیزی ناامن اجرا نمی‌شود — فقط خطای بک‌اند toast می‌شود. */
+const SELLER_ORDER_NEXT_STATUS = { CONFIRMED: 'PREPARING', PREPARING: 'SENT' };
+const SELLER_ORDER_NEXT_STATUS_LABEL = { PREPARING: 'شروع آماده‌سازی', SENT: 'ثبت ارسال سفارش' };
+
+let _sellerOrdersCache = [];
+let _sellerOrdersTabLoading = false;
+async function fetchSellerOrdersFromApi() {
+  const data = await authApiFetch('/orders/store?pageSize=100', { method: 'GET' });
+  return (data && data.items) || [];
+}
+
+function sellerOrderItemsHtml(items) {
+  if (!items || !items.length) return '';
+  return '<div style="flex-basis:100%;display:flex;flex-direction:column;gap:4px;margin-top:8px;padding-top:8px;border-top:1px solid var(--gray-100);">'
+    + items.map((it) => {
+      const name = (it.product && it.product.name) || it.nameSnapshot || 'کالا';
+      return `<div style="display:flex;justify-content:space-between;gap:8px;font-size:11.5px;color:var(--gray-500);">
+        <span>${escapeHtml(name)} × ${fa(it.qty)}</span>
+        <span>${fmtPriceFa(it.priceSnapshot)} تومان</span>
+      </div>`;
+    }).join('')
+    + '</div>';
+}
+
+function sellerOrderItemHtml(o) {
+  const localStatus = SELLER_ORDER_LOCAL_STATUS[o.status] || 'pend';
+  const statusLabel = SELLER_ORDER_STATUS_LABEL_FA[o.status] || o.status;
+  const statusCls = SELLER_ORDER_STATUS_CLASS[o.status] || 'st-pend';
+  const thumb = `<svg viewBox="0 0 24 24" width="20" height="20" style="stroke:var(--gray-500);"><use href="#i-box"/></svg>`;
+  const nextStatus = SELLER_ORDER_NEXT_STATUS[o.status];
+  const actionBtn = nextStatus
+    ? `<div style="flex-basis:100%;margin-top:8px;"><button class="btn-verify" style="padding:7px 14px;" data-order-action-id="${escapeHtml(o.id)}" onclick="updateSellerOrderStatus('${escJsAttr(o.id)}','${nextStatus}')">${SELLER_ORDER_NEXT_STATUS_LABEL[nextStatus]}</button></div>`
+    : '';
+  return `<div class="approve-card" data-order-id="${escapeHtml(o.id)}" data-ord-status="${localStatus}" style="flex-wrap:wrap;">
+    <div class="approve-thumb">${thumb}</div>
+    <div class="approve-info">
+      <div class="an">کد سفارش: #${escapeHtml(o.orderNumber || o.id)}</div>
+      <div class="as">${orderTimeAgoFa(o.createdAt)}</div>
+    </div>
+    <div class="order-status ${statusCls}">${escapeHtml(statusLabel)}</div>
+    ${sellerOrderItemsHtml(o.items)}
+    ${actionBtn}
+  </div>`;
+}
+
+/* از ارسال دوباره (Duplicate Submission) هنگام تغییر وضعیت جلوگیری می‌کند — دقیقاً همان الگوی
+   _productRowBusy برای ردیف‌های محصول. */
+const _sellerOrderRowBusy = new Set();
+function setSellerOrderRowBusy(id, busy) {
+  const row = document.querySelector('.approve-card[data-order-id="' + id + '"]');
+  if (!row) return;
+  row.querySelectorAll('button').forEach((b) => { b.disabled = busy; b.style.opacity = busy ? '0.55' : ''; b.style.pointerEvents = busy ? 'none' : ''; });
+}
+async function updateSellerOrderStatus(orderId, nextStatus) {
+  if (_sellerOrderRowBusy.has(orderId)) return;
+  _sellerOrderRowBusy.add(orderId);
+  setSellerOrderRowBusy(orderId, true);
+  try {
+    await authApiFetch('/orders/' + encodeURIComponent(orderId) + '/status', { method: 'PATCH', body: { status: nextStatus } });
+    toast('وضعیت سفارش به‌روزرسانی شد');
+    await renderSellerOrdersTab();
+  } catch (err) {
+    toast((err && err.message) || 'به‌روزرسانی وضعیت سفارش ناموفق بود');
+  } finally {
+    _sellerOrderRowBusy.delete(orderId);
+  }
+}
+
+async function renderSellerOrdersTab() {
   const list = document.getElementById('sellerOrdersList');
   const empty = document.getElementById('sellerOrdersEmpty');
   if (!list) return;
-  list.innerHTML = '';
-  if (empty) empty.style.display = 'flex';
+  if (_sellerOrdersTabLoading) return;
+  _sellerOrdersTabLoading = true;
+  if (empty) empty.style.display = 'none';
+  list.innerHTML = '<div class="pending-note" style="margin-top:0;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> در حال دریافت سفارش‌ها از سرور...</div>';
+  try {
+    const orders = await fetchSellerOrdersFromApi();
+    _sellerOrdersCache = orders;
+    if (!orders.length) {
+      list.innerHTML = '';
+      if (empty) empty.style.display = 'flex';
+    } else {
+      if (empty) empty.style.display = 'none';
+      list.innerHTML = orders.map(sellerOrderItemHtml).join('');
+    }
+  } catch (err) {
+    list.innerHTML = '<div class="pending-note" style="margin-top:0;background:#FEE2E2;border-color:#FCA5A5;color:#B91C1C;"><svg viewBox="0 0 24 24" style="stroke:#B91C1C;"><use href="#i-info"/></svg> ' + escapeHtml((err && err.message) || 'دریافت سفارش‌ها از سرور ممکن نشد.') + '</div>';
+    if (empty) empty.style.display = 'none';
+  } finally {
+    _sellerOrdersTabLoading = false;
+  }
 }
 
-/* Reports tab: same real-data principle as the dashboard — zero/empty state instead of a
-   fixed "۲,۴۵۰,۰۰۰ تومان فروش این ماه" that had nothing to do with the actual store. */
+/* Reports tab: stat cards for sales-this-month/orders/views/rating have no backing endpoint
+   that returns an aggregate (GET /orders/settlements only returns per-item rows, and per the
+   Phase 1B financial rule the frontend must not sum/derive financial totals itself), so they
+   stay as an honest "not available" placeholder — unchanged from before. Views/rating likewise
+   have no backend source. What IS now real is the per-item settlement table below (Phase 1B —
+   GET /orders/settlements), which replaces the previous fully-hardcoded/empty state. */
 function renderSellerReportsTab() {
   const salesEl = document.getElementById('srepSales');
   if (salesEl) salesEl.textContent = '۰ تومان';
@@ -7978,6 +8101,96 @@ function renderSellerReportsTab() {
   if (ratingEl) ratingEl.textContent = '—';
   const monthlyEmpty = document.getElementById('sellerMonthlyChartEmpty');
   if (monthlyEmpty) monthlyEmpty.style.display = 'flex';
+  renderSellerSettlementsSection(true);
+}
+
+/* ═══════════ Seller panel: Settlements (Reports tab) — PHASE 1B: GET /orders/settlements واقعی ═══════════
+   طبق orders.service.js#listSettlementsForStore، هر ردیف واقعاً یک OrderItemSettlement snapshot شده
+   است (per-item، نه per-order) و شامل commissionRate/grossAmount/commissionAmount/sellerEarning/
+   settledAt مستقیماً از بک‌اند است.
+   قانون مالی: هیچ‌کدام از این مقادیر در فرانت محاسبه یا از هم مشتق نمی‌شوند (نه
+   commissionAmount = grossAmount * rate، نه sellerEarning = grossAmount - commissionAmount) —
+   فقط همان مقادیری که سرور برگردانده، Format (تبدیل رقم فارسی/جداکنندهٔ هزارگان) و نمایش داده
+   می‌شوند. */
+let _sellerSettlementsPage = 1;
+let _sellerSettlementsTotal = 0;
+let _sellerSettlementsCache = [];
+let _sellerSettlementsLoading = false;
+const SELLER_SETTLEMENTS_PAGE_SIZE = 20;
+
+/* درصد کمیسیون هم صرفاً Format می‌شود (تبدیل به رقم فارسی) — خودِ عدد commissionRate
+   دقیقاً همان چیزی است که سرور برگردانده، هیچ ضرب/تقسیمی روی آن انجام نمی‌شود. */
+function fmtRateFa(rate) {
+  return Number(rate || 0).toLocaleString('fa-IR-u-nu-latn') + '٪';
+}
+
+function sellerSettlementRowHtml(s) {
+  const orderNumber = (s.order && (s.order.orderNumber || s.order.id)) || s.orderId || '';
+  const itemName = (s.orderItem && s.orderItem.nameSnapshot) || '';
+  const qty = (s.orderItem && s.orderItem.qty) || 0;
+  return `<tr>
+    <td>#${escapeHtml(orderNumber)}</td>
+    <td>${escapeHtml(itemName)}</td>
+    <td>${fa(qty)}</td>
+    <td>${fmtPriceFa(s.grossAmount)} تومان</td>
+    <td>${fmtRateFa(s.commissionRate)}</td>
+    <td>${fmtPriceFa(s.commissionAmount)} تومان</td>
+    <td style="font-weight:700;color:var(--primary);">${fmtPriceFa(s.sellerEarning)} تومان</td>
+    <td>${orderTimeAgoFa(s.settledAt)}</td>
+  </tr>`;
+}
+
+/* reset=true یعنی بارگذاری اول (صفحه ۱، پاک کردن کش)؛ reset=false یعنی «بارگذاری بیشتر»
+   (صفحهٔ فعلی که loadMoreSellerSettlements قبلش +۱ کرده، به کش قبلی append می‌شود). */
+async function renderSellerSettlementsSection(reset) {
+  const tbody = document.getElementById('sellerSettlementsBody');
+  const empty = document.getElementById('sellerSettlementsEmpty');
+  const loadMoreBtn = document.getElementById('sellerSettlementsLoadMore');
+  if (!tbody) return;
+  if (_sellerSettlementsLoading) return;
+  _sellerSettlementsLoading = true;
+  if (reset) {
+    _sellerSettlementsPage = 1;
+    _sellerSettlementsCache = [];
+    tbody.innerHTML = '<tr><td colspan="8"><div class="pending-note" style="margin-top:0;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> در حال دریافت تسویه‌ها از سرور...</div></td></tr>';
+    if (empty) empty.style.display = 'none';
+    if (loadMoreBtn) loadMoreBtn.style.display = 'none';
+  } else if (loadMoreBtn) {
+    loadMoreBtn.disabled = true; loadMoreBtn.style.opacity = '0.6';
+  }
+  try {
+    const data = await authApiFetch('/orders/settlements?page=' + _sellerSettlementsPage + '&pageSize=' + SELLER_SETTLEMENTS_PAGE_SIZE, { method: 'GET' });
+    const items = (data && data.items) || [];
+    _sellerSettlementsTotal = (data && typeof data.total === 'number') ? data.total : _sellerSettlementsCache.length + items.length;
+    _sellerSettlementsCache = _sellerSettlementsCache.concat(items);
+    if (!_sellerSettlementsCache.length) {
+      tbody.innerHTML = '';
+      if (empty) empty.style.display = 'flex';
+      if (loadMoreBtn) loadMoreBtn.style.display = 'none';
+    } else {
+      if (empty) empty.style.display = 'none';
+      tbody.innerHTML = _sellerSettlementsCache.map(sellerSettlementRowHtml).join('');
+      if (loadMoreBtn) loadMoreBtn.style.display = (_sellerSettlementsCache.length < _sellerSettlementsTotal) ? 'inline-block' : 'none';
+    }
+  } catch (err) {
+    if (reset) {
+      tbody.innerHTML = '<tr><td colspan="8"><div class="pending-note" style="margin-top:0;background:#FEE2E2;border-color:#FCA5A5;color:#B91C1C;"><svg viewBox="0 0 24 24" style="stroke:#B91C1C;"><use href="#i-info"/></svg> ' + escapeHtml((err && err.message) || 'دریافت تسویه‌ها از سرور ممکن نشد.') + '</div></td></tr>';
+      if (empty) empty.style.display = 'none';
+    } else {
+      toast((err && err.message) || 'دریافت تسویه‌های بیشتر ناموفق بود');
+      _sellerSettlementsPage -= 1; // برگرداندن شمارهٔ صفحه چون این تلاش موفق نبود
+    }
+    if (loadMoreBtn) loadMoreBtn.style.display = (_sellerSettlementsCache.length < _sellerSettlementsTotal) ? 'inline-block' : 'none';
+  } finally {
+    _sellerSettlementsLoading = false;
+    if (loadMoreBtn) { loadMoreBtn.disabled = false; loadMoreBtn.style.opacity = ''; }
+  }
+}
+
+function loadMoreSellerSettlements() {
+  if (_sellerSettlementsLoading) return;
+  _sellerSettlementsPage += 1;
+  renderSellerSettlementsSection(false);
 }
 
 function escapeHtml(str) {
