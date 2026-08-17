@@ -835,8 +835,10 @@ async function postRefund(tx, {
  * SellerPayoutLiability model and its recovery logic
  * (payout-liabilities.service.js#recoverSellerLiabilities) are unchanged
  * by this wrapper — this step adds no new Ledger account type such as a
- * SELLER_PAYOUT_LIABILITY owner type, and this wrapper is not called from
- * that business logic yet (deferred to a future wiring phase).
+ * SELLER_PAYOUT_LIABILITY owner type. This wrapper IS already called from
+ * that business logic: payout-liabilities.service.js#recoverSellerLiabilities
+ * invokes postLiabilityRecovery inside the same transaction used by
+ * settlement.
  *
  * Posts:
  *   DEBIT  SELLER_WALLET (sellerId)                                amount

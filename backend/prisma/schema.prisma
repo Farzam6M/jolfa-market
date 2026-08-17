@@ -1045,14 +1045,15 @@ model SellerPayoutLiability {
 
 // ──────────────────────── Ledger — Double-Entry Foundation (P2.4 Phase 1) ────────────────────────
 //
-// Foundation-only models per the P2.2/P2.3 design decision document
-// ("Ledger + Wallet Owner Architecture + Platform Account"). This block adds
-// the Account/Journal/LedgerEntry tables and their enums ONLY — nothing here
-// is wired into payments.service.js / orders.service.js / payouts.service.js /
-// payout-liabilities.service.js / commission-rules yet. Wallet.balance and
-// WalletTransaction remain the live, unchanged source of truth until a later
-// phase actually posts to these tables. No existing model, column, enum
-// value, or row is touched by this block.
+// Models per the P2.2/P2.3 design decision document ("Ledger + Wallet Owner
+// Architecture + Platform Account"). This block adds the Account/Journal/
+// LedgerEntry tables and their enums. Per the P2.6 Runtime Ledger
+// Integration Audit (8/8 flows verified PASS), Ledger runtime integration
+// is already wired into payments.service.js / orders.service.js /
+// payouts.service.js / payout-liabilities.service.js for the relevant
+// financial flows (PAYMENT, WALLET PAYMENT, SETTLEMENT, REFUND, PAYOUT
+// RESERVE, PAYOUT RELEASE, PAYOUT PROCESSED, LIABILITY RECOVERY). No
+// existing model, column, enum value, or row is touched by this block.
 //
 // Ownership model (design doc §3): an Account is keyed by
 // (ownerType, ownerId, currency), NOT by a User foreign key. This is

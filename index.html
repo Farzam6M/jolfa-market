@@ -2267,6 +2267,7 @@
       <div class="dash-mi" onclick="adminTab(this,'asellers')"><svg viewBox="0 0 24 24"><use href="#i-store"/></svg>مدیریت فروشندگان</div>
       <div class="dash-mi" onclick="adminTab(this,'apayouts')"><svg viewBox="0 0 24 24"><use href="#i-wallet"/></svg>درخواست‌های برداشت وجه</div>
       <div class="dash-mi" onclick="adminTab(this,'apliabilities')"><svg viewBox="0 0 24 24"><use href="#i-wallet"/></svg>بدهی‌های معلق فروشندگان</div>
+      <div class="dash-mi" onclick="adminTab(this,'acommission')"><svg viewBox="0 0 24 24"><use href="#i-percent"/></svg>قوانین کمیسیون</div>
       <div class="dash-mi" onclick="adminTab(this,'ausers')"><svg viewBox="0 0 24 24"><use href="#i-users"/></svg>مدیریت کاربران</div>
       <div class="dash-mi" onclick="adminTab(this,'asupport')"><svg viewBox="0 0 24 24"><use href="#i-headset"/></svg>پیام‌های پشتیبانی <span class="badge-mini" id="asupportBadge">0</span></div>
       <div class="dash-mi" onclick="adminTab(this,'ahero')"><svg viewBox="0 0 24 24"><use href="#i-photo"/></svg>مدیریت اسلایدر صفحه اصلی</div>
@@ -2568,6 +2569,44 @@
           <div style="text-align:center;margin-top:14px;">
             <button class="btn-verify" id="apLiabilitiesLoadMore" style="padding:8px 18px;display:none;" onclick="loadMoreAdminLiabilities()">بارگذاری بیشتر</button>
           </div>
+        </div>
+      </div>
+
+      <!-- Admin: Commission Rules ("قوانین کمیسیون") — real backend surface:
+           GET/POST/PATCH/DELETE /api/v1/admin/commission-rules (Permission
+           COMMISSION_MANAGE — see backend/src/modules/commission-rules/*).
+           List has no pagination in the backend contract (findMany, no
+           page/pageSize), so the whole list is rendered at once — no
+           "load more" button, unlike apPayouts/apLiabilities above. Financial
+           isolation: rate/priority/scope/sellerId/categoryId/campaign window/
+           isActive are only ever sent/shown exactly as entered or as the
+           server returned them — nothing is computed here. -->
+      <div id="admin-acommission" style="display:none;">
+        <div class="dash-hd"><div><h1>قوانین کمیسیون</h1><p>مدیریت نرخ کمیسیون سراسری، مخصوص فروشگاه، دسته‌بندی یا کمپین — اولویت اعمال: کمپین › فروشگاه › دسته‌بندی › سراسری</p></div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <div class="filter-bar" style="margin:0;">
+              <div class="filter-field">
+                <svg viewBox="0 0 24 24"><use href="#i-info"/></svg>
+                <select class="filter-select" id="crScopeFilter" aria-label="فیلتر بر اساس Scope" onchange="onCrFilterChange()">
+                  <option value="all">همه Scopeها</option>
+                  <option value="GLOBAL">سراسری (GLOBAL)</option>
+                  <option value="SELLER">فروشگاه (SELLER)</option>
+                  <option value="CATEGORY">دسته‌بندی (CATEGORY)</option>
+                  <option value="CAMPAIGN">کمپین (CAMPAIGN)</option>
+                </select>
+              </div>
+            </div>
+            <button class="btn-primary" onclick="openCrModal()"><svg viewBox="0 0 24 24" width="14" height="14"><use href="#i-plus"/></svg> افزودن قانون کمیسیون</button>
+          </div>
+        </div>
+        <div class="dash-card">
+          <table class="dash-table">
+            <thead><tr><th>Scope</th><th>فروشگاه</th><th>دسته‌بندی</th><th>بازه کمپین</th><th>نرخ</th><th>اولویت</th><th>وضعیت</th><th>تاریخ ایجاد</th><th>عملیات</th></tr></thead>
+            <tbody id="crTbody">
+              <tr><td colspan="9"><div class="pending-note" style="margin-top:0;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> در حال دریافت قوانین کمیسیون از سرور...</div></td></tr>
+            </tbody>
+          </table>
+          <div class="pending-note" id="crEmpty" style="display:none;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> هیچ قانون کمیسیونی یافت نشد</div>
         </div>
       </div>
 
@@ -2961,6 +3000,53 @@
         </div>
       </div>
       <button class="btn-primary" style="margin-top:6px;width:100%;justify-content:center;" id="heroFSubmitBtn" onclick="submitHeroForm()"><svg viewBox="0 0 24 24" width="14" height="14"><use href="#i-check"/></svg> ذخیره اسلاید</button>
+    </div>
+  </div>
+</div>
+
+<!-- Admin: Commission Rules modal (add/edit) — reuses the exact same
+     .map-modal-overlay/.map-modal-box markup+CSS as #heroModalOverlay above,
+     no new CSS. Fields shown depend on the selected Scope (see
+     crApplyScopeVisibility) since GLOBAL/SELLER/CATEGORY/CAMPAIGN each
+     accept a different real subset of fields per the backend contract
+     (commission-rules.validation.js). -->
+<div id="commissionRuleModalOverlay" class="map-modal-overlay" style="display:none;" onclick="if(event.target===this) closeCrModal()">
+  <div class="map-modal-box" style="max-width:560px;">
+    <div class="map-modal-hd">
+      <h3 id="crModalTitleEl">افزودن قانون کمیسیون</h3>
+      <div class="map-modal-close" onclick="closeCrModal()"><svg viewBox="0 0 24 24" width="18" height="18"><use href="#i-x"/></svg></div>
+    </div>
+    <div style="padding:18px;max-height:70vh;overflow-y:auto;">
+      <div class="form-group">
+        <label class="form-label">Scope <span class="req-star">*</span></label>
+        <select class="form-input" id="crFScope" onchange="crApplyScopeVisibility()">
+          <option value="GLOBAL">سراسری (GLOBAL)</option>
+          <option value="SELLER">فروشگاه (SELLER)</option>
+          <option value="CATEGORY">دسته‌بندی (CATEGORY)</option>
+          <option value="CAMPAIGN">کمپین (CAMPAIGN)</option>
+        </select>
+      </div>
+      <div class="form-group" id="crFSellerGroup" style="display:none;">
+        <label class="form-label">فروشگاه <span class="req-star" id="crSellerReqStar">*</span></label>
+        <select class="form-input" id="crFSeller"><option value="">در حال دریافت فروشگاه‌ها...</option></select>
+      </div>
+      <div class="form-group" id="crFCategoryGroup" style="display:none;">
+        <label class="form-label">دسته‌بندی <span class="req-star" id="crCategoryReqStar">*</span></label>
+        <select class="form-input" id="crFCategory"><option value="">در حال دریافت دسته‌بندی‌ها...</option></select>
+      </div>
+      <div class="form-row-2" id="crFCampaignGroup" style="display:none;">
+        <div class="form-group"><label class="form-label">شروع کمپین <span class="req-star">*</span></label><input class="form-input" id="crFCampaignStart" type="datetime-local"></div>
+        <div class="form-group"><label class="form-label">پایان کمپین <span class="req-star">*</span></label><input class="form-input" id="crFCampaignEnd" type="datetime-local"></div>
+      </div>
+      <div class="form-row-2">
+        <div class="form-group"><label class="form-label">نرخ کمیسیون (٪) <span class="req-star">*</span></label><input class="form-input" id="crFRate" type="number" min="0" max="100" step="0.01" placeholder="مثال: 12.5"></div>
+        <div class="form-group"><label class="form-label">اولویت</label><input class="form-input" id="crFPriority" type="number" step="1" placeholder="0"></div>
+      </div>
+      <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+        <input type="checkbox" id="crFIsActive" style="width:16px;height:16px;">
+        <label class="form-label" style="margin:0;" for="crFIsActive">قانون فعال باشد</label>
+      </div>
+      <button class="btn-primary" style="margin-top:6px;width:100%;justify-content:center;" id="crFSubmitBtn" onclick="submitCrForm()"><svg viewBox="0 0 24 24" width="14" height="14"><use href="#i-check"/></svg> ذخیره قانون کمیسیون</button>
     </div>
   </div>
 </div>
@@ -9189,6 +9275,273 @@ function apLiabilityOpenDetail(id) {
   overlay.style.display = 'flex';
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+   ADMIN: COMMISSION RULES ("قوانین کمیسیون") — real backend surface only:
+   GET/POST/PATCH/DELETE /admin/commission-rules (Permission COMMISSION_MANAGE,
+   see backend/src/modules/commission-rules/*). Same conventions as the Hero
+   Slider admin tab above (#admin-ahero/#heroModalOverlay): one cached array
+   as the single source of truth, a shared add/edit modal, and every mutation
+   re-fetches the list from the server afterward rather than trusting an
+   optimistic local patch.
+
+   Financial isolation (per task rule #6): rate/priority/scope/sellerId/
+   categoryId/campaignStartAt/campaignEndAt/isActive are only ever read from
+   what the user typed or from what the server returned — nothing here sums,
+   multiplies, or derives a commission/money value. fmtRateFa (already
+   defined above, used by the seller settlements table) is reused purely for
+   Persian-digit formatting of the existing `rate` number, not for computing it.
+
+   No pagination: GET /admin/commission-rules has no page/pageSize in its
+   contract (commission-rules.validation.js#listQuerySchema — findMany with
+   no skip/take), so unlike apPayouts/apLiabilities above there is no
+   "load more" button — the full (real, unpaginated) list is rendered at once.
+   Only the `scope` filter is exposed as a UI dropdown (the same single-filter
+   filter-bar convention as apPayoutsStatusFilter/apLiabilitiesStatusFilter);
+   sellerId/categoryId — also real, supported query params — are not exposed
+   as separate list filters since the seller/category picker in the add/edit
+   modal already covers the admin workflow this task scoped in, but the
+   backend does support both if a future filter UI is added. */
+let crRulesCache = [];
+let crLoading = false;
+let crScopeFilter = 'all';
+let crEditingId = null;
+let crSellerOptionsLoaded = false;
+let crCategoryOptionsLoaded = false;
+
+function crErrorMessage(err) {
+  if (err && err.status === 401) return 'نشست شما منقضی شده — لطفاً دوباره وارد حساب کاربری خود شوید';
+  if (err && err.status === 403) return 'شما اجازه مدیریت قوانین کمیسیون را ندارید';
+  return (err && err.message) || 'خطای غیرمنتظره‌ای رخ داد';
+}
+
+const CR_SCOPE_LABELS_FA = { GLOBAL: 'سراسری', SELLER: 'فروشگاه', CATEGORY: 'دسته‌بندی', CAMPAIGN: 'کمپین' };
+
+function crFindLocal(id) {
+  return crRulesCache.find(r => r.id === id) || null;
+}
+
+function crRuleRowHtml(r) {
+  const scopeLabel = CR_SCOPE_LABELS_FA[r.scope] || r.scope;
+  const sellerLabel = r.seller ? escapeHtml(r.seller.name || r.sellerId || '') : (r.sellerId ? escapeHtml(r.sellerId) : '—');
+  const categoryLabel = r.category ? escapeHtml(r.category.name || r.categoryId || '') : (r.categoryId ? escapeHtml(r.categoryId) : '—');
+  const campaignWindow = (r.campaignStartAt && r.campaignEndAt)
+    ? new Date(r.campaignStartAt).toLocaleDateString('fa-IR-u-nu-latn') + ' تا ' + new Date(r.campaignEndAt).toLocaleDateString('fa-IR-u-nu-latn')
+    : '—';
+  const createdDate = r.createdAt ? new Date(r.createdAt).toLocaleDateString('fa-IR-u-nu-latn') : '—';
+  const isActive = !!r.isActive;
+  return `<tr data-cr-id="${escapeHtml(r.id)}">
+    <td><span class="tag-status" style="background:#EEF2FF;color:#4338CA;">${escapeHtml(scopeLabel)}</span></td>
+    <td>${sellerLabel}</td>
+    <td>${categoryLabel}</td>
+    <td>${campaignWindow}</td>
+    <td style="font-weight:700;">${fmtRateFa(r.rate)}</td>
+    <td>${fa(r.priority || 0)}</td>
+    <td><span class="tag-status" style="background:${isActive ? '#DCFCE7' : '#FEE2E2'};color:${isActive ? '#15803D' : '#B91C1C'};">${isActive ? 'فعال' : 'غیرفعال'}</span></td>
+    <td>${createdDate}</td>
+    <td>
+      <svg class="row-action-ic" viewBox="0 0 24 24" width="16" height="16" style="stroke:var(--gray-400);margin-left:10px;" onclick="toggleCrActive('${escJsAttr(r.id)}')" title="فعال/غیرفعال کردن"><use href="#i-cog"/></svg>
+      <svg class="row-action-ic" viewBox="0 0 24 24" width="16" height="16" style="stroke:var(--gray-400);margin-left:10px;" onclick="openCrModal('${escJsAttr(r.id)}')" title="ویرایش"><use href="#i-tool"/></svg>
+      <svg class="row-action-ic" viewBox="0 0 24 24" width="16" height="16" style="stroke:#B91C1C;" onclick="deleteCrRule('${escJsAttr(r.id)}')" title="حذف"><use href="#i-trash"/></svg>
+    </td>
+  </tr>`;
+}
+
+function onCrFilterChange() {
+  const sel = document.getElementById('crScopeFilter');
+  crScopeFilter = sel ? sel.value : 'all';
+  renderAdminCommissionRulesTab();
+}
+
+async function renderAdminCommissionRulesTab() {
+  const tbody = document.getElementById('crTbody');
+  const empty = document.getElementById('crEmpty');
+  if (!tbody) return;
+  if (crLoading) return;
+  crLoading = true;
+  tbody.innerHTML = '<tr><td colspan="9"><div class="pending-note" style="margin-top:0;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> در حال دریافت قوانین کمیسیون از سرور...</div></td></tr>';
+  if (empty) empty.style.display = 'none';
+  try {
+    let path = '/admin/commission-rules';
+    if (crScopeFilter && crScopeFilter !== 'all') path += '?scope=' + encodeURIComponent(crScopeFilter);
+    const data = await authApiFetch(path, { method: 'GET' });
+    crRulesCache = Array.isArray(data) ? data : ((data && data.items) || []);
+    if (!crRulesCache.length) {
+      tbody.innerHTML = '';
+      if (empty) empty.style.display = 'flex';
+    } else {
+      if (empty) empty.style.display = 'none';
+      tbody.innerHTML = crRulesCache.map(crRuleRowHtml).join('');
+    }
+  } catch (err) {
+    const msg = crErrorMessage(err);
+    tbody.innerHTML = '<tr><td colspan="9"><div class="pending-note" style="margin-top:0;background:#FEE2E2;border-color:#FCA5A5;color:#B91C1C;"><svg viewBox="0 0 24 24" style="stroke:#B91C1C;"><use href="#i-info"/></svg> ' + escapeHtml(msg) + '</div></td></tr>';
+    if (empty) empty.style.display = 'none';
+  } finally {
+    crLoading = false;
+  }
+}
+
+/* ---------- Seller/Category pickers for the CAMPAIGN/SELLER/CATEGORY scope
+   fields — real endpoints only (GET /stores?status=APPROVED, GET /categories,
+   both already used elsewhere in this file), no invented endpoint. Loaded
+   once per page-load and cached (force=true bypasses cache, mirrors
+   populateProductCategorySelect above). ---------- */
+async function populateCrSellerSelect(force) {
+  const select = document.getElementById('crFSeller');
+  if (!select) return;
+  if (crSellerOptionsLoaded && !force) return;
+  try {
+    const data = await authApiFetch('/stores?status=APPROVED&pageSize=100', { method: 'GET' });
+    const items = (data && data.items) || [];
+    setSelectOptions(select, items.map(s => ({ value: s.id, label: s.name })), 'انتخاب فروشگاه');
+    crSellerOptionsLoaded = true;
+  } catch (err) {
+    toast(err.message || 'دریافت لیست فروشگاه‌ها از سرور ممکن نشد');
+  }
+}
+async function populateCrCategorySelect(force) {
+  const select = document.getElementById('crFCategory');
+  if (!select) return;
+  if (crCategoryOptionsLoaded && !force) return;
+  try {
+    const categories = await fetchApiCategories(force);
+    const flat = [];
+    (categories || []).forEach(c => {
+      if (c.isActive) flat.push({ value: c.id, label: c.name });
+      (c.children || []).forEach(ch => { if (ch.isActive) flat.push({ value: ch.id, label: '— ' + ch.name }); });
+    });
+    setSelectOptions(select, flat, 'انتخاب دسته‌بندی');
+    crCategoryOptionsLoaded = true;
+  } catch (err) {
+    toast(err.message || 'دریافت دسته‌بندی‌ها از سرور ممکن نشد');
+  }
+}
+
+/* Shows/hides + toggles required-mark on sellerId/categoryId/campaign fields
+   based on the selected Scope — mirrors exactly the backend's real
+   per-scope field rules in commission-rules.validation.js (refineScopeCombo/
+   createSchema's superRefine): GLOBAL → neither seller nor category nor
+   campaign window; SELLER → sellerId required, no category, no campaign;
+   CATEGORY → categoryId required, no seller, no campaign; CAMPAIGN → seller
+   and category both optional (an unscoped campaign applies to everyone —
+   see commission-rules.service.js#resolveCommissionRate), campaign window required. */
+function crApplyScopeVisibility() {
+  const scope = document.getElementById('crFScope').value;
+  const sellerGroup = document.getElementById('crFSellerGroup');
+  const categoryGroup = document.getElementById('crFCategoryGroup');
+  const campaignGroup = document.getElementById('crFCampaignGroup');
+  const sellerReq = document.getElementById('crSellerReqStar');
+  const categoryReq = document.getElementById('crCategoryReqStar');
+  sellerGroup.style.display = (scope === 'SELLER' || scope === 'CAMPAIGN') ? 'block' : 'none';
+  categoryGroup.style.display = (scope === 'CATEGORY' || scope === 'CAMPAIGN') ? 'block' : 'none';
+  campaignGroup.style.display = (scope === 'CAMPAIGN') ? 'grid' : 'none';
+  if (sellerReq) sellerReq.style.display = (scope === 'SELLER') ? 'inline' : 'none';
+  if (categoryReq) categoryReq.style.display = (scope === 'CATEGORY') ? 'inline' : 'none';
+  if (scope === 'SELLER' || scope === 'CAMPAIGN') populateCrSellerSelect();
+  if (scope === 'CATEGORY' || scope === 'CAMPAIGN') populateCrCategorySelect();
+}
+
+/* بدون id → افزودن قانون جدید؛ با id → ویرایش (از همان کش لیست، بدون نیاز
+   به یک GET جداگانه — دقیقاً مثل openHeroModal). */
+function openCrModal(id) {
+  crEditingId = id || null;
+  const r = id ? crFindLocal(id) : null;
+  document.getElementById('crModalTitleEl').textContent = r ? 'ویرایش قانون کمیسیون' : 'افزودن قانون کمیسیون';
+  document.getElementById('crFScope').value = r ? r.scope : 'GLOBAL';
+  document.getElementById('crFRate').value = r ? r.rate : '';
+  document.getElementById('crFPriority').value = r ? (r.priority || 0) : 0;
+  document.getElementById('crFIsActive').checked = r ? !!r.isActive : true;
+  document.getElementById('crFCampaignStart').value = (r && r.campaignStartAt) ? toDatetimeLocalValue(r.campaignStartAt) : '';
+  document.getElementById('crFCampaignEnd').value = (r && r.campaignEndAt) ? toDatetimeLocalValue(r.campaignEndAt) : '';
+  crApplyScopeVisibility();
+  (async () => {
+    if (r && r.sellerId) { await populateCrSellerSelect(); document.getElementById('crFSeller').value = r.sellerId; }
+    if (r && r.categoryId) { await populateCrCategorySelect(); document.getElementById('crFCategory').value = r.categoryId; }
+  })();
+  document.getElementById('commissionRuleModalOverlay').style.display = 'flex';
+}
+function closeCrModal() {
+  document.getElementById('commissionRuleModalOverlay').style.display = 'none';
+}
+/** input[type=datetime-local] needs "YYYY-MM-DDTHH:mm" in LOCAL time — server sends an ISO string. */
+function toDatetimeLocalValue(isoStr) {
+  const d = new Date(isoStr);
+  const pad = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+async function submitCrForm() {
+  const scope = document.getElementById('crFScope').value;
+  const rateStr = document.getElementById('crFRate').value;
+  const rate = rateStr === '' ? undefined : Number(rateStr);
+  if (rate === undefined || Number.isNaN(rate)) { toast('نرخ کمیسیون الزامی است'); return; }
+  const priorityStr = document.getElementById('crFPriority').value;
+  const priority = priorityStr === '' ? 0 : Number(priorityStr);
+  const isActive = document.getElementById('crFIsActive').checked;
+
+  const body = { scope, rate, priority, isActive };
+  if (scope === 'SELLER' || scope === 'CAMPAIGN') {
+    const sellerId = document.getElementById('crFSeller').value;
+    if (scope === 'SELLER' && !sellerId) { toast('انتخاب فروشگاه برای قانون SELLER الزامی است'); return; }
+    if (sellerId) body.sellerId = sellerId;
+  }
+  if (scope === 'CATEGORY' || scope === 'CAMPAIGN') {
+    const categoryId = document.getElementById('crFCategory').value;
+    if (scope === 'CATEGORY' && !categoryId) { toast('انتخاب دسته‌بندی برای قانون CATEGORY الزامی است'); return; }
+    if (categoryId) body.categoryId = categoryId;
+  }
+  if (scope === 'CAMPAIGN') {
+    const startVal = document.getElementById('crFCampaignStart').value;
+    const endVal = document.getElementById('crFCampaignEnd').value;
+    if (!startVal || !endVal) { toast('زمان شروع و پایان کمپین برای قانون CAMPAIGN الزامی است'); return; }
+    body.campaignStartAt = new Date(startVal).toISOString();
+    body.campaignEndAt = new Date(endVal).toISOString();
+  }
+
+  const isEdit = !!crEditingId;
+  const submitBtn = document.getElementById('crFSubmitBtn');
+  const prevText = submitBtn ? submitBtn.textContent : '';
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.style.opacity = '0.6'; submitBtn.style.pointerEvents = 'none'; submitBtn.textContent = 'در حال ذخیره...'; }
+  try {
+    if (isEdit) {
+      await authApiFetch('/admin/commission-rules/' + encodeURIComponent(crEditingId), { method: 'PATCH', body });
+      toast('قانون کمیسیون به‌روزرسانی شد');
+    } else {
+      await authApiFetch('/admin/commission-rules', { method: 'POST', body });
+      toast('قانون کمیسیون ایجاد شد');
+    }
+    closeCrModal();
+    await renderAdminCommissionRulesTab();
+  } catch (err) {
+    toast(crErrorMessage(err));
+  } finally {
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.style.opacity = ''; submitBtn.style.pointerEvents = ''; submitBtn.textContent = prevText; }
+  }
+}
+
+async function toggleCrActive(id) {
+  const r = crFindLocal(id);
+  if (!r) return;
+  try {
+    await authApiFetch('/admin/commission-rules/' + encodeURIComponent(id), { method: 'PATCH', body: { isActive: !r.isActive } });
+    toast(!r.isActive ? 'قانون کمیسیون فعال شد' : 'قانون کمیسیون غیرفعال شد');
+    await renderAdminCommissionRulesTab();
+  } catch (err) {
+    toast(crErrorMessage(err));
+  }
+}
+
+async function deleteCrRule(id) {
+  if (!confirm('این قانون کمیسیون حذف شود؟ این عملیات قابل بازگشت نیست.')) return;
+  try {
+    await authApiFetch('/admin/commission-rules/' + encodeURIComponent(id), { method: 'DELETE' });
+    toast('قانون کمیسیون حذف شد');
+    await renderAdminCommissionRulesTab();
+  } catch (err) {
+    toast(crErrorMessage(err));
+  }
+}
+
 function escapeHtml(str) {
   return String(str == null ? '' : str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -9216,7 +9569,7 @@ function adminTab(el, tab, opts) {
   closeDashSidebarMobile();
   document.querySelectorAll('#page-admin .dash-mi').forEach(x=>x.classList.remove('act'));
   el.classList.add('act');
-  ['aoverview','aproducts','aapplications','aaddstore','asellers','apayouts','apliabilities','ausers','asupport','ahero','aadmins','areports','asettings'].forEach(t => {
+  ['aoverview','aproducts','aapplications','aaddstore','asellers','apayouts','apliabilities','acommission','ausers','asupport','ahero','aadmins','areports','asettings'].forEach(t => {
     const d = document.getElementById('admin-'+t);
     if (d) d.style.display = (t===tab) ? 'block' : 'none';
   });
@@ -9226,6 +9579,7 @@ function adminTab(el, tab, opts) {
   if (tab === 'asellers') renderAdminSellersFromApi();
   if (tab === 'apayouts') renderAdminPayoutsSection(true);
   if (tab === 'apliabilities') renderAdminLiabilitiesSection(true);
+  if (tab === 'acommission') renderAdminCommissionRulesTab();
   if (tab === 'ausers') renderAdminUsersTab();
   if (tab === 'asupport') renderAdminSupportList();
   if (tab === 'ahero') renderHeroAdminPanel();
