@@ -2265,6 +2265,7 @@
       <div class="dash-mi" onclick="adminTab(this,'aapplications')"><svg viewBox="0 0 24 24"><use href="#i-store"/></svg>درخواست‌های ثبت فروشگاه <span class="badge-mini" id="appBadge" style="display:none;">0</span></div>
       <div class="dash-mi" onclick="adminTab(this,'aaddstore')"><svg viewBox="0 0 24 24"><use href="#i-plus"/></svg>افزودن فروشگاه (بدون تایید)</div>
       <div class="dash-mi" onclick="adminTab(this,'asellers')"><svg viewBox="0 0 24 24"><use href="#i-store"/></svg>مدیریت فروشندگان</div>
+      <div class="dash-mi" onclick="adminTab(this,'apayouts')"><svg viewBox="0 0 24 24"><use href="#i-wallet"/></svg>درخواست‌های برداشت وجه</div>
       <div class="dash-mi" onclick="adminTab(this,'ausers')"><svg viewBox="0 0 24 24"><use href="#i-users"/></svg>مدیریت کاربران</div>
       <div class="dash-mi" onclick="adminTab(this,'asupport')"><svg viewBox="0 0 24 24"><use href="#i-headset"/></svg>پیام‌های پشتیبانی <span class="badge-mini" id="asupportBadge">0</span></div>
       <div class="dash-mi" onclick="adminTab(this,'ahero')"><svg viewBox="0 0 24 24"><use href="#i-photo"/></svg>مدیریت اسلایدر صفحه اصلی</div>
@@ -2497,6 +2498,41 @@
               <tr><td><span class="table-avatar">ست</span>فروشگاه ستاره</td><td>پوشاک</td><td>31</td><td>402</td><td><span class="tag-status" style="background:#FEE2E2;color:#B91C1C;">مسدود</span></td><td><svg class="row-action-ic" viewBox="0 0 24 24" width="16" height="16" style="stroke:var(--gray-400);" onclick="toggleRowStoreStatus(this)" title="مسدود / فعال‌سازی فروشگاه"><use href="#i-cog"/></svg></td></tr>
             </tbody>
           </table>
+        </div>
+      </div>
+
+      <!-- Admin: Seller Payout Requests ("درخواست‌های برداشت وجه") — Phase 2G.
+           Real backend surface: GET/PATCH /admin/payouts/*. Independent of the
+           seller's own payout UI above (#sellerPayoutsBody / renderSellerPayoutsSection
+           / submitSellerPayout) — separate ids, separate JS state, neither is
+           touched by this section. -->
+      <div id="admin-apayouts" style="display:none;">
+        <div class="dash-hd"><div><h1>درخواست‌های برداشت وجه</h1><p>بررسی و تایید/رد درخواست‌های برداشت وجه فروشندگان</p></div>
+          <div class="filter-bar">
+            <div class="filter-field">
+              <svg viewBox="0 0 24 24"><use href="#i-info"/></svg>
+              <select class="filter-select" id="apPayoutsStatusFilter" aria-label="فیلتر بر اساس وضعیت" onchange="onApPayoutsFilterChange()">
+                <option value="all">همه وضعیت‌ها</option>
+                <option value="REQUESTED">در انتظار بررسی</option>
+                <option value="APPROVED">تایید شده</option>
+                <option value="PROCESSED">پرداخت شده</option>
+                <option value="REJECTED">رد شده</option>
+                <option value="FAILED">ناموفق</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="dash-card">
+          <table class="dash-table">
+            <thead><tr><th>کد درخواست</th><th>فروشنده</th><th>موبایل فروشنده</th><th>مبلغ</th><th>وضعیت</th><th>تاریخ ثبت</th><th>تاریخ پردازش</th><th>عملیات</th></tr></thead>
+            <tbody id="apPayoutsTbody">
+              <tr><td colspan="8"><div class="pending-note" style="margin-top:0;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> در حال دریافت درخواست‌های برداشت از سرور...</div></td></tr>
+            </tbody>
+          </table>
+          <div class="pending-note" id="apPayoutsEmpty" style="display:none;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> درخواست برداشتی یافت نشد</div>
+          <div style="text-align:center;margin-top:14px;">
+            <button class="btn-verify" id="apPayoutsLoadMore" style="padding:8px 18px;display:none;" onclick="loadMoreAdminPayouts()">بارگذاری بیشتر</button>
+          </div>
         </div>
       </div>
 
@@ -8633,6 +8669,309 @@ function loadMoreSellerPayouts() {
   renderSellerPayoutsSection(false);
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+   ADMIN: SELLER PAYOUT REQUESTS ("درخواست‌های برداشت وجه") — Phase 2G.
+   Real backend admin surface end-to-end (see backend/src/modules/payouts/
+   payouts.admin.routes.js — no endpoint here is invented):
+     GET   /admin/payouts                 (status?, sellerId?, page, pageSize)
+     PATCH /admin/payouts/:id/approve
+     PATCH /admin/payouts/:id/reject          body: { reason? }
+     PATCH /admin/payouts/:id/mark-processed
+     PATCH /admin/payouts/:id/mark-failed     body: { failureReason }
+   Completely independent of the seller's own payout section above
+   (_sellerPayoutsCache/renderSellerPayoutsSection/submitSellerPayout) — own
+   state, own element ids, neither is modified by this block.
+   There is no GET /admin/payouts/:id — the detail modal reuses the row
+   object already sitting in apPayoutsCache from the list call (same idea as
+   apOpenView reusing apProductsState.all for products), never inventing a
+   detail endpoint. Pagination mirrors the exact "load more" pattern already
+   used by renderSellerPayoutsSection above (real page/pageSize/total from
+   the backend, nothing computed client-side). Detail/list modal reuses the
+   one shared #apModalOverlay/#apModalBody/#apModalTitle already used by the
+   Products/Sellers admin tabs — no new modal markup. Every amount shown
+   here is exactly what the backend returned, formatted only via fmtPriceFa
+   — no commission/fee/balance/total is ever computed on the frontend. */
+const AP_PAYOUTS_PAGE_SIZE = 20;
+let apPayoutsPage = 1;
+let apPayoutsTotal = 0;
+let apPayoutsCache = [];
+let apPayoutsLoading = false;
+let apPayoutsStatusFilter = 'all';
+const _apPayoutsRowBusy = new Set();
+
+function apPayoutFindLocal(id) {
+  return apPayoutsCache.find(p => p.id === id) || null;
+}
+function apPayoutSellerName(p) { return (p.seller && p.seller.name) || '—'; }
+function apPayoutSellerMobile(p) { return (p.seller && p.seller.mobile) || '—'; }
+
+function apPayoutsErrorMessage(err) {
+  if (err && err.status === 401) return 'نشست شما منقضی شده — لطفاً دوباره وارد حساب کاربری خود شوید';
+  if (err && err.status === 403) return 'شما اجازه دسترسی به درخواست‌های برداشت وجه را ندارید';
+  return (err && err.message) || 'خطای غیرمنتظره‌ای رخ داد';
+}
+
+/* عملیات مجاز دقیقاً طبق state machine بک‌اند: REQUESTED -> تایید/رد،
+   APPROVED -> ثبت واریز موفق/ثبت شکست واریز، و برای PROCESSED/REJECTED/
+   FAILED هیچ اکشنی نمایش داده نمی‌شود (فقط آیکن مشاهده جزئیات). */
+function apPayoutRowHtml(p) {
+  const status = p.status || '';
+  const label = PAYOUT_STATUS_LABELS_FA[status] || status;
+  const cls = PAYOUT_STATUS_CLASS[status] || 'st-return';
+  const code = '#' + String(p.id || '').slice(0, 8).toUpperCase();
+  const createdDate = p.createdAt ? new Date(p.createdAt).toLocaleDateString('fa-IR-u-nu-latn') : '—';
+  const processedDate = p.processedAt ? new Date(p.processedAt).toLocaleDateString('fa-IR-u-nu-latn') : '—';
+
+  let actionsHtml = `<svg class="row-action-ic" viewBox="0 0 24 24" width="16" height="16" style="stroke:var(--gray-400);" onclick="apPayoutOpenDetail('${escJsAttr(p.id)}')" title="مشاهده جزئیات"><use href="#i-eye"/></svg>`;
+  if (status === 'REQUESTED') {
+    actionsHtml += `<svg class="row-action-ic" viewBox="0 0 24 24" width="16" height="16" style="stroke:#15803D;margin-right:10px;" onclick="apPayoutApprove('${escJsAttr(p.id)}')" title="تایید درخواست"><use href="#i-check"/></svg>`;
+    actionsHtml += `<svg class="row-action-ic" viewBox="0 0 24 24" width="16" height="16" style="stroke:#B91C1C;margin-right:10px;" onclick="apPayoutOpenReject('${escJsAttr(p.id)}')" title="رد درخواست"><use href="#i-x"/></svg>`;
+  } else if (status === 'APPROVED') {
+    actionsHtml += `<svg class="row-action-ic" viewBox="0 0 24 24" width="16" height="16" style="stroke:#15803D;margin-right:10px;" onclick="apPayoutMarkProcessed('${escJsAttr(p.id)}')" title="ثبت واریز موفق"><use href="#i-check"/></svg>`;
+    actionsHtml += `<svg class="row-action-ic" viewBox="0 0 24 24" width="16" height="16" style="stroke:#B91C1C;margin-right:10px;" onclick="apPayoutOpenMarkFailed('${escJsAttr(p.id)}')" title="ثبت شکست واریز"><use href="#i-x"/></svg>`;
+  }
+
+  return `<tr data-payout-id="${escapeHtml(p.id)}">
+    <td title="${escapeHtml(p.id || '')}">${escapeHtml(code)}</td>
+    <td>${escapeHtml(apPayoutSellerName(p))}</td>
+    <td>${escapeHtml(apPayoutSellerMobile(p))}</td>
+    <td style="font-weight:700;">${fmtPriceFa(p.amount)} تومان</td>
+    <td><div class="order-status ${cls}">${escapeHtml(label)}</div></td>
+    <td>${createdDate}</td>
+    <td>${processedDate}</td>
+    <td>${actionsHtml}</td>
+  </tr>`;
+}
+
+function onApPayoutsFilterChange() {
+  const sel = document.getElementById('apPayoutsStatusFilter');
+  apPayoutsStatusFilter = sel ? sel.value : 'all';
+  renderAdminPayoutsSection(true);
+}
+
+/* reset=true → صفحه ۱ و پاک کردن کش (بارگذاری اول یا بعد از هر Action/تغییر
+   فیلتر)؛ reset=false → «بارگذاری بیشتر». دقیقاً همان الگوی
+   renderSellerPayoutsSection بالا (از جمله رول‌بک شمارهٔ صفحه در صورت خطا). */
+async function renderAdminPayoutsSection(reset) {
+  const tbody = document.getElementById('apPayoutsTbody');
+  const empty = document.getElementById('apPayoutsEmpty');
+  const loadMoreBtn = document.getElementById('apPayoutsLoadMore');
+  if (!tbody) return;
+  if (apPayoutsLoading) return;
+  apPayoutsLoading = true;
+  if (reset) {
+    apPayoutsPage = 1;
+    apPayoutsCache = [];
+    tbody.innerHTML = '<tr><td colspan="8"><div class="pending-note" style="margin-top:0;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> در حال دریافت درخواست‌های برداشت از سرور...</div></td></tr>';
+    if (empty) empty.style.display = 'none';
+    if (loadMoreBtn) loadMoreBtn.style.display = 'none';
+  } else if (loadMoreBtn) {
+    loadMoreBtn.disabled = true; loadMoreBtn.style.opacity = '0.6';
+  }
+  try {
+    let path = '/admin/payouts?page=' + apPayoutsPage + '&pageSize=' + AP_PAYOUTS_PAGE_SIZE;
+    if (apPayoutsStatusFilter && apPayoutsStatusFilter !== 'all') path += '&status=' + encodeURIComponent(apPayoutsStatusFilter);
+    const data = await authApiFetch(path, { method: 'GET' });
+    const items = (data && data.items) || [];
+    apPayoutsTotal = (data && typeof data.total === 'number') ? data.total : apPayoutsCache.length + items.length;
+    apPayoutsCache = apPayoutsCache.concat(items);
+    if (!apPayoutsCache.length) {
+      tbody.innerHTML = '';
+      if (empty) empty.style.display = 'flex';
+      if (loadMoreBtn) loadMoreBtn.style.display = 'none';
+    } else {
+      if (empty) empty.style.display = 'none';
+      tbody.innerHTML = apPayoutsCache.map(apPayoutRowHtml).join('');
+      if (loadMoreBtn) loadMoreBtn.style.display = (apPayoutsCache.length < apPayoutsTotal) ? 'inline-block' : 'none';
+    }
+  } catch (err) {
+    const msg = apPayoutsErrorMessage(err);
+    if (reset) {
+      tbody.innerHTML = '<tr><td colspan="8"><div class="pending-note" style="margin-top:0;background:#FEE2E2;border-color:#FCA5A5;color:#B91C1C;"><svg viewBox="0 0 24 24" style="stroke:#B91C1C;"><use href="#i-info"/></svg> ' + escapeHtml(msg) + '</div></td></tr>';
+      if (empty) empty.style.display = 'none';
+    } else {
+      toast(msg);
+      apPayoutsPage -= 1; // برگرداندن شمارهٔ صفحه چون این تلاش موفق نبود
+    }
+    if (loadMoreBtn) loadMoreBtn.style.display = (apPayoutsCache.length < apPayoutsTotal) ? 'inline-block' : 'none';
+  } finally {
+    apPayoutsLoading = false;
+    if (loadMoreBtn) { loadMoreBtn.disabled = false; loadMoreBtn.style.opacity = ''; }
+  }
+}
+
+function loadMoreAdminPayouts() {
+  if (apPayoutsLoading) return;
+  apPayoutsPage += 1;
+  renderAdminPayoutsSection(false);
+}
+
+/* Action busy state: dim + disable this row's action icons while a
+   PATCH is in flight — same visual pattern as setApRowBusy (Products tab).
+   No optimistic data mutation happens here; on success the whole section is
+   refetched/re-rendered (see each action below), so this is purely a
+   short-lived "please wait" affordance. */
+function apPayoutSetRowBusy(id, busy) {
+  if (busy) _apPayoutsRowBusy.add(id); else _apPayoutsRowBusy.delete(id);
+  const row = document.querySelector('#apPayoutsTbody tr[data-payout-id="' + id + '"]');
+  if (row) row.querySelectorAll('.row-action-ic').forEach(ic => { ic.style.opacity = busy ? '0.4' : ''; ic.style.pointerEvents = busy ? 'none' : ''; });
+}
+
+/* ---------- DETAIL (مشاهده جزئیات) — no GET /:id on the backend; reuses
+   the row object already cached from the list fetch above. ---------- */
+function apPayoutOpenDetail(id) {
+  const p = apPayoutFindLocal(id);
+  const overlay = document.getElementById('apModalOverlay');
+  const body = document.getElementById('apModalBody');
+  const title = document.getElementById('apModalTitle');
+  if (!overlay || !body || !title) return;
+  apModalEditId = null;
+  title.textContent = 'جزئیات درخواست برداشت وجه';
+  if (!p) { body.innerHTML = '<div class="pending-note" style="margin-top:0;">درخواست یافت نشد</div>'; overlay.style.display = 'flex'; return; }
+  const status = p.status || '';
+  const label = PAYOUT_STATUS_LABELS_FA[status] || status;
+  const cls = PAYOUT_STATUS_CLASS[status] || 'st-return';
+  const createdDate = p.createdAt ? new Date(p.createdAt).toLocaleDateString('fa-IR-u-nu-latn') : '—';
+  const processedDate = p.processedAt ? new Date(p.processedAt).toLocaleDateString('fa-IR-u-nu-latn') : '—';
+  body.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+      <div style="font-weight:700;font-size:15px;">${fmtPriceFa(p.amount)} تومان</div>
+      <div class="order-status ${cls}">${escapeHtml(label)}</div>
+    </div>
+    <div style="font-size:12px;color:var(--gray-500);margin-bottom:10px;">شناسه: ${escapeHtml(p.id || '—')}</div>
+    <div class="form-row-2">
+      <div><div style="font-size:12px;color:var(--gray-500);">فروشنده</div><div>${escapeHtml(apPayoutSellerName(p))}</div></div>
+      <div><div style="font-size:12px;color:var(--gray-500);">موبایل فروشنده</div><div>${escapeHtml(apPayoutSellerMobile(p))}</div></div>
+    </div>
+    <div style="margin-top:10px;"><div style="font-size:12px;color:var(--gray-500);">صاحب حساب</div><div>${escapeHtml(p.bankAccountHolder || '—')}</div></div>
+    <div style="margin-top:10px;"><div style="font-size:12px;color:var(--gray-500);">شماره شبا</div><div>${escapeHtml(p.bankIban || '—')}</div></div>
+    ${p.bankCardNumber ? `<div style="margin-top:10px;"><div style="font-size:12px;color:var(--gray-500);">شماره کارت</div><div>${escapeHtml(p.bankCardNumber)}</div></div>` : ''}
+    ${p.bankName ? `<div style="margin-top:10px;"><div style="font-size:12px;color:var(--gray-500);">نام بانک</div><div>${escapeHtml(p.bankName)}</div></div>` : ''}
+    <div class="form-row-2" style="margin-top:10px;">
+      <div><div style="font-size:12px;color:var(--gray-500);">تاریخ ثبت</div><div>${createdDate}</div></div>
+      <div><div style="font-size:12px;color:var(--gray-500);">تاریخ پردازش</div><div>${processedDate}</div></div>
+    </div>
+    ${p.failureReason ? `<div style="margin-top:10px;"><div style="font-size:12px;color:#B91C1C;">دلیل شکست</div><div>${escapeHtml(p.failureReason)}</div></div>` : ''}
+  `;
+  overlay.style.display = 'flex';
+}
+
+/* ---------- APPROVE (REQUESTED -> APPROVED) ---------- */
+async function apPayoutApprove(id) {
+  if (_apPayoutsRowBusy.has(id)) return;
+  const p = apPayoutFindLocal(id);
+  if (!p) return;
+  if (!confirm('درخواست برداشت به مبلغ ' + fmtPriceFa(p.amount) + ' تومان تایید شود؟')) return;
+  apPayoutSetRowBusy(id, true);
+  try {
+    await authApiFetch('/admin/payouts/' + encodeURIComponent(id) + '/approve', { method: 'PATCH' });
+    toast('درخواست برداشت تایید شد');
+    await renderAdminPayoutsSection(true);
+  } catch (err) {
+    toast(apPayoutsErrorMessage(err));
+    apPayoutSetRowBusy(id, false);
+  }
+}
+
+/* ---------- REJECT (REQUESTED -> REJECTED) — reason اختیاری است ---------- */
+function apPayoutOpenReject(id) {
+  const p = apPayoutFindLocal(id);
+  if (!p) return;
+  const overlay = document.getElementById('apModalOverlay');
+  const body = document.getElementById('apModalBody');
+  const title = document.getElementById('apModalTitle');
+  if (!overlay || !body || !title) return;
+  apModalEditId = id;
+  title.textContent = 'رد درخواست برداشت وجه';
+  body.innerHTML = `
+    <div class="form-group"><label class="form-label">دلیل رد (اختیاری)</label><textarea class="form-textarea" id="apPayoutRejectReason" placeholder="در صورت تمایل، دلیل رد را برای فروشنده بنویسید..."></textarea></div>
+    <button class="btn-primary" style="margin-top:6px;width:100%;justify-content:center;background:#B91C1C;" id="apPayoutRejectSubmitBtn" onclick="apPayoutSubmitReject()"><svg viewBox="0 0 24 24" width="14" height="14"><use href="#i-x"/></svg> رد درخواست</button>
+  `;
+  overlay.style.display = 'flex';
+}
+async function apPayoutSubmitReject() {
+  if (!apModalEditId) return;
+  const id = apModalEditId;
+  if (_apPayoutsRowBusy.has(id)) return;
+  const reasonEl = document.getElementById('apPayoutRejectReason');
+  const reason = reasonEl ? reasonEl.value.trim() : '';
+  const btn = document.getElementById('apPayoutRejectSubmitBtn');
+  if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; }
+  apPayoutSetRowBusy(id, true);
+  try {
+    const body = {};
+    if (reason) body.reason = reason;
+    await authApiFetch('/admin/payouts/' + encodeURIComponent(id) + '/reject', { method: 'PATCH', body });
+    toast('درخواست برداشت رد شد');
+    apCloseModal();
+    await renderAdminPayoutsSection(true);
+  } catch (err) {
+    toast(apPayoutsErrorMessage(err));
+    apPayoutSetRowBusy(id, false);
+  } finally {
+    if (btn) { btn.disabled = false; btn.style.opacity = ''; }
+  }
+}
+
+/* ---------- MARK PROCESSED (APPROVED -> PROCESSED) — «ثبت واریز موفق» ---------- */
+async function apPayoutMarkProcessed(id) {
+  if (_apPayoutsRowBusy.has(id)) return;
+  const p = apPayoutFindLocal(id);
+  if (!p) return;
+  if (!confirm('واریز درخواست برداشت به مبلغ ' + fmtPriceFa(p.amount) + ' تومان با موفقیت ثبت شود؟')) return;
+  apPayoutSetRowBusy(id, true);
+  try {
+    await authApiFetch('/admin/payouts/' + encodeURIComponent(id) + '/mark-processed', { method: 'PATCH' });
+    toast('واریز درخواست برداشت ثبت شد');
+    await renderAdminPayoutsSection(true);
+  } catch (err) {
+    toast(apPayoutsErrorMessage(err));
+    apPayoutSetRowBusy(id, false);
+  }
+}
+
+/* ---------- MARK FAILED (APPROVED -> FAILED) — «ثبت شکست واریز».
+   failureReason پیش از ارسال نباید خالی باشد؛ این فقط اعتبارسنجی UX است،
+   بک‌اند همچنان مرجع نهایی صحت/الزامی بودن آن است (ر.ک. payouts.validation.js
+   و payouts.service.js#markFailed). ---------- */
+function apPayoutOpenMarkFailed(id) {
+  const p = apPayoutFindLocal(id);
+  if (!p) return;
+  const overlay = document.getElementById('apModalOverlay');
+  const body = document.getElementById('apModalBody');
+  const title = document.getElementById('apModalTitle');
+  if (!overlay || !body || !title) return;
+  apModalEditId = id;
+  title.textContent = 'ثبت شکست واریز';
+  body.innerHTML = `
+    <div class="form-group"><label class="form-label">دلیل شکست واریز <span class="req-star">*</span></label><textarea class="form-textarea" id="apPayoutFailureReason" placeholder="دلیل ناموفق بودن واریز را بنویسید..."></textarea></div>
+    <button class="btn-primary" style="margin-top:6px;width:100%;justify-content:center;background:#B91C1C;" id="apPayoutFailedSubmitBtn" onclick="apPayoutSubmitMarkFailed()"><svg viewBox="0 0 24 24" width="14" height="14"><use href="#i-x"/></svg> ثبت شکست واریز</button>
+  `;
+  overlay.style.display = 'flex';
+}
+async function apPayoutSubmitMarkFailed() {
+  if (!apModalEditId) return;
+  const id = apModalEditId;
+  if (_apPayoutsRowBusy.has(id)) return;
+  const reasonEl = document.getElementById('apPayoutFailureReason');
+  const failureReason = reasonEl ? reasonEl.value.trim() : '';
+  if (!failureReason) { toast('لطفا دلیل شکست واریز را بنویسید'); if (reasonEl) reasonEl.focus(); return; }
+  const btn = document.getElementById('apPayoutFailedSubmitBtn');
+  if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; }
+  apPayoutSetRowBusy(id, true);
+  try {
+    await authApiFetch('/admin/payouts/' + encodeURIComponent(id) + '/mark-failed', { method: 'PATCH', body: { failureReason } });
+    toast('شکست واریز ثبت شد');
+    apCloseModal();
+    await renderAdminPayoutsSection(true);
+  } catch (err) {
+    toast(apPayoutsErrorMessage(err));
+    apPayoutSetRowBusy(id, false);
+  } finally {
+    if (btn) { btn.disabled = false; btn.style.opacity = ''; }
+  }
+}
+
 function escapeHtml(str) {
   return String(str == null ? '' : str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -8660,7 +8999,7 @@ function adminTab(el, tab, opts) {
   closeDashSidebarMobile();
   document.querySelectorAll('#page-admin .dash-mi').forEach(x=>x.classList.remove('act'));
   el.classList.add('act');
-  ['aoverview','aproducts','aapplications','aaddstore','asellers','ausers','asupport','ahero','aadmins','areports','asettings'].forEach(t => {
+  ['aoverview','aproducts','aapplications','aaddstore','asellers','apayouts','ausers','asupport','ahero','aadmins','areports','asettings'].forEach(t => {
     const d = document.getElementById('admin-'+t);
     if (d) d.style.display = (t===tab) ? 'block' : 'none';
   });
@@ -8668,6 +9007,7 @@ function adminTab(el, tab, opts) {
   if (tab === 'aproducts') { renderAdminProductsManagement(); }
   if (tab === 'aapplications') renderSellerApplications();
   if (tab === 'asellers') renderAdminSellersFromApi();
+  if (tab === 'apayouts') renderAdminPayoutsSection(true);
   if (tab === 'ausers') renderAdminUsersTab();
   if (tab === 'asupport') renderAdminSupportList();
   if (tab === 'ahero') renderHeroAdminPanel();
