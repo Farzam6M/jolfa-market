@@ -1827,6 +1827,43 @@
         <div style="text-align:center;margin-top:12px;">
           <button class="btn-verify" id="sellerSettlementsLoadMore" style="padding:8px 18px;display:none;" onclick="loadMoreSellerSettlements()">بارگذاری بیشتر</button>
         </div>
+
+        <!-- Seller Payout / Withdrawal — PHASE 2F: POST /payouts، GET /payouts، GET /payments/wallet.
+             فرم و تابع ارسال این بخش عمداً مستقل از withdrawFromWallet()/فرم صفحهٔ کیف پول مشتری
+             (page-wallet) پیاده شده تا آن صفحه و رفتار خارج از این فاز (شارژ کیف پول، id های موجود
+             withdrawAmountInput/withdrawSheba) دست‌نخورده بماند. -->
+        <div class="dash-card" style="margin-top:16px;">
+          <h3><svg viewBox="0 0 24 24" width="16" height="16" style="vertical-align:-3px;"><use href="#i-wallet"/></svg> برداشت از کیف پول</h3>
+          <div class="wallet-balance-card" style="margin-top:12px;margin-bottom:0;padding:22px 24px;">
+            <div class="wbc-label" style="margin-top:0;">موجودی کیف پول شما</div>
+            <div class="wbc-amount" id="sellerPayoutWalletBalance">۰ تومان</div>
+          </div>
+          <p style="font-size:12.5px;color:var(--gray-500);margin-top:14px;">مبلغ درخواستی از موجودی کیف پول شما رزرو می‌شود و پس از بررسی و تأیید به شماره شبای وارد شده واریز خواهد شد. سقف مبلغ قابل برداشت توسط سرور بررسی و در صورت نیاز رد می‌شود.</p>
+          <div class="form-row-2" style="margin-top:14px;">
+            <div class="form-group"><label class="form-label">مبلغ برداشت (تومان)</label><input class="form-input" id="sellerPayoutAmount" type="text" inputmode="numeric" placeholder="مثال: 200,000"></div>
+            <div class="form-group"><label class="form-label">نام صاحب حساب</label><input class="form-input" id="sellerPayoutHolder" type="text" placeholder="نام و نام خانوادگی صاحب حساب" maxlength="80"></div>
+          </div>
+          <div class="form-row-2">
+            <div class="form-group"><label class="form-label">شماره شبا مقصد</label><input class="form-input" id="sellerPayoutIban" type="text" maxlength="26" placeholder="IR062960000000100324200001"></div>
+            <div class="form-group"><label class="form-label">نام بانک (اختیاری)</label><input class="form-input" id="sellerPayoutBankName" type="text" placeholder="مثال: بانک ملت" maxlength="60"></div>
+          </div>
+          <div class="form-group"><label class="form-label">شماره کارت (اختیاری، ۱۶ رقم)</label><input class="form-input" id="sellerPayoutCard" type="text" maxlength="16" inputmode="numeric" placeholder="6037XXXXXXXXXXXX"></div>
+          <button class="btn-cart" id="sellerPayoutSubmitBtn" onclick="submitSellerPayout()"><svg viewBox="0 0 24 24"><use href="#i-send"/></svg> ثبت درخواست برداشت</button>
+        </div>
+
+        <div class="dash-card" style="margin-top:16px;">
+          <h3>تاریخچه درخواست‌های برداشت</h3>
+          <table class="dash-table">
+            <thead><tr>
+              <th>مبلغ</th><th>وضعیت</th><th>شبای مقصد</th><th>صاحب حساب</th><th>تاریخ ثبت</th><th>توضیح</th>
+            </tr></thead>
+            <tbody id="sellerPayoutsBody"></tbody>
+          </table>
+        </div>
+        <div class="pending-note" id="sellerPayoutsEmpty" style="display:none;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> هنوز درخواست برداشتی ثبت نکرده‌اید</div>
+        <div style="text-align:center;margin-top:12px;">
+          <button class="btn-verify" id="sellerPayoutsLoadMore" style="padding:8px 18px;display:none;" onclick="loadMoreSellerPayouts()">بارگذاری بیشتر</button>
+        </div>
       </div>
 
       <!-- Seller: Settings tab -->
@@ -8330,6 +8367,8 @@ function renderSellerReportsTab() {
   const monthlyEmpty = document.getElementById('sellerMonthlyChartEmpty');
   if (monthlyEmpty) monthlyEmpty.style.display = 'flex';
   renderSellerSettlementsSection(true);
+  renderSellerPayoutWalletBalance();
+  renderSellerPayoutsSection(true);
 }
 
 /* ═══════════ Seller panel: Settlements (Reports tab) — PHASE 1B: GET /orders/settlements واقعی ═══════════
@@ -8419,6 +8458,179 @@ function loadMoreSellerSettlements() {
   if (_sellerSettlementsLoading) return;
   _sellerSettlementsPage += 1;
   renderSellerSettlementsSection(false);
+}
+
+/* ═══════════ Seller panel: Payout / Withdrawal (Reports tab) — PHASE 2F ═══════════
+   Real backend contracts: GET /payments/wallet (via the existing fetchMyWalletApi()/
+   _walletCache — reused as-is, not reimplemented), POST /payouts, GET /payouts.
+   قانون مالی: هیچ مبلغی (موجودی، مبلغ قابل‌برداشت، مانده) در فرانت محاسبه نمی‌شود —
+   فقط همان مقادیری که سرور برگردانده Format (fa/fmtPriceFa) و نمایش داده می‌شوند؛
+   بررسی کفایت موجودی/بدهی معلق کاملاً روی سرور انجام و پیام خطای واقعی آن به کاربر
+   نشان داده می‌شود.
+   عمداً یک تابع/فرم مستقل از withdrawFromWallet() و فیلدهای صفحهٔ کیف پول مشتری
+   (page-wallet: withdrawAmountInput/withdrawSheba) است — آن صفحه و رفتار مشتری خارج
+   از این فاز است و دست‌نخورده می‌ماند؛ به‌علاوه چون هر دو صفحه هم‌زمان در DOM هستند،
+   استفاده از id های تکراری بین آن‌ها ممکن نبود. */
+let _payoutSubmitBusy = false;
+let _sellerPayoutsPage = 1;
+let _sellerPayoutsTotal = 0;
+let _sellerPayoutsCache = [];
+let _sellerPayoutsLoading = false;
+const SELLER_PAYOUTS_PAGE_SIZE = 20;
+
+const PAYOUT_STATUS_LABELS_FA = {
+  REQUESTED: 'در انتظار بررسی',
+  APPROVED: 'تایید شده',
+  PROCESSED: 'پرداخت شده',
+  REJECTED: 'رد شده',
+  FAILED: 'ناموفق',
+};
+/* مطابق سیستم بصری موجود order-status/.st-* — بدون کلاس جدید. */
+const PAYOUT_STATUS_CLASS = {
+  REQUESTED: 'st-pend',
+  APPROVED: 'st-process',
+  PROCESSED: 'st-done',
+  REJECTED: 'st-rej',
+  FAILED: 'st-rej',
+};
+
+async function renderSellerPayoutWalletBalance() {
+  const el = document.getElementById('sellerPayoutWalletBalance');
+  if (!el) return;
+  const w = await fetchMyWalletApi();
+  el.textContent = fa(w ? w.balance : 0) + ' تومان';
+}
+
+function setSellerPayoutSubmitBusy(busy) {
+  const btn = document.getElementById('sellerPayoutSubmitBtn');
+  if (!btn) return;
+  btn.disabled = busy;
+  btn.style.opacity = busy ? '0.6' : '';
+  btn.innerHTML = busy
+    ? '<svg viewBox="0 0 24 24"><use href="#i-send"/></svg> در حال ثبت...'
+    : '<svg viewBox="0 0 24 24"><use href="#i-send"/></svg> ثبت درخواست برداشت';
+}
+
+/* اعتبارسنجی سمت فرانت فقط برای UX است — بک‌اند همچنان مرجع نهایی صحت مبلغ/موجودی/
+   فرمت شباست (payouts.validation.js). هیچ مبلغ نهایی/قابل‌برداشتی اینجا محاسبه نمی‌شود. */
+async function submitSellerPayout() {
+  if (_payoutSubmitBusy) return;
+
+  const amountInput = document.getElementById('sellerPayoutAmount');
+  const holderInput = document.getElementById('sellerPayoutHolder');
+  const ibanInput = document.getElementById('sellerPayoutIban');
+  const bankNameInput = document.getElementById('sellerPayoutBankName');
+  const cardInput = document.getElementById('sellerPayoutCard');
+
+  const amount = parseInt(String((amountInput && amountInput.value) || '').replace(/[^\d]/g, ''), 10);
+  const holder = String((holderInput && holderInput.value) || '').trim();
+  const iban = String((ibanInput && ibanInput.value) || '').trim();
+  const bankName = String((bankNameInput && bankNameInput.value) || '').trim();
+  const card = String((cardInput && cardInput.value) || '').trim();
+
+  if (!amount || amount <= 0) { toast('لطفاً مبلغ برداشت را به‌درستی وارد کنید'); return; }
+  if (!holder || holder.length < 2) { toast('نام صاحب حساب الزامی است'); return; }
+  if (!/^IR\d{24}$/.test(iban)) { toast('شماره شبا نامعتبر است (فرمت صحیح: IR به همراه ۲۴ رقم)'); return; }
+  if (card && !/^\d{16}$/.test(card)) { toast('شماره کارت باید ۱۶ رقم باشد'); return; }
+
+  if (!confirm('آیا از ثبت درخواست برداشت وجه اطمینان دارید؟')) return;
+
+  // یک idempotencyKey برای کل این تلاش منطقیِ ثبت — دوباره ساخته نمی‌شود، حتی اگر
+  // خودِ authApiFetch به‌خاطر 401 یک‌بار retry داخلی انجام دهد (همان body ارسال می‌شود).
+  const idempotencyKey = (window.crypto && typeof crypto.randomUUID === 'function') ? crypto.randomUUID() : undefined;
+
+  _payoutSubmitBusy = true;
+  setSellerPayoutSubmitBusy(true);
+  try {
+    const body = { amount: amount, bankAccountHolder: holder, bankIban: iban };
+    if (card) body.bankCardNumber = card;
+    if (bankName) body.bankName = bankName;
+    if (idempotencyKey) body.idempotencyKey = idempotencyKey;
+
+    await authApiFetch('/payouts', { method: 'POST', body: body });
+
+    toast('درخواست برداشت وجه ثبت شد');
+    [amountInput, holderInput, ibanInput, bankNameInput, cardInput].forEach(el => { if (el) el.value = ''; });
+
+    _walletCache = null;
+    await renderSellerPayoutWalletBalance();
+    updateNavWalletChip();
+    renderSellerPayoutsSection(true);
+  } catch (err) {
+    toast((err && err.message) || 'ثبت درخواست برداشت ناموفق بود');
+  } finally {
+    _payoutSubmitBusy = false;
+    setSellerPayoutSubmitBusy(false);
+  }
+}
+
+function sellerPayoutRowHtml(p) {
+  const status = p.status || '';
+  const label = PAYOUT_STATUS_LABELS_FA[status] || status;
+  const cls = PAYOUT_STATUS_CLASS[status] || 'st-return';
+  const note = p.failureReason ? escapeHtml(p.failureReason) : '—';
+  return `<tr>
+    <td style="font-weight:700;">${fmtPriceFa(p.amount)} تومان</td>
+    <td><div class="order-status ${cls}">${escapeHtml(label)}</div></td>
+    <td>${escapeHtml(p.bankIban || '')}</td>
+    <td>${escapeHtml(p.bankAccountHolder || '')}</td>
+    <td>${orderTimeAgoFa(p.createdAt)}</td>
+    <td>${note}</td>
+  </tr>`;
+}
+
+/* reset=true یعنی بارگذاری اول (صفحه ۱، پاک کردن کش)؛ reset=false یعنی «بارگذاری
+   بیشتر» — دقیقاً همان الگوی renderSellerSettlementsSection (از جمله رول‌بک شمارهٔ
+   صفحه در صورت خطا)، اما پیاده‌سازی مستقل و بدون تغییر در آن تابع. */
+async function renderSellerPayoutsSection(reset) {
+  const tbody = document.getElementById('sellerPayoutsBody');
+  const empty = document.getElementById('sellerPayoutsEmpty');
+  const loadMoreBtn = document.getElementById('sellerPayoutsLoadMore');
+  if (!tbody) return;
+  if (_sellerPayoutsLoading) return;
+  _sellerPayoutsLoading = true;
+  if (reset) {
+    _sellerPayoutsPage = 1;
+    _sellerPayoutsCache = [];
+    tbody.innerHTML = '<tr><td colspan="6"><div class="pending-note" style="margin-top:0;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> در حال دریافت درخواست‌های برداشت از سرور...</div></td></tr>';
+    if (empty) empty.style.display = 'none';
+    if (loadMoreBtn) loadMoreBtn.style.display = 'none';
+  } else if (loadMoreBtn) {
+    loadMoreBtn.disabled = true; loadMoreBtn.style.opacity = '0.6';
+  }
+  try {
+    const data = await authApiFetch('/payouts?page=' + _sellerPayoutsPage + '&pageSize=' + SELLER_PAYOUTS_PAGE_SIZE, { method: 'GET' });
+    const items = (data && data.items) || [];
+    _sellerPayoutsTotal = (data && typeof data.total === 'number') ? data.total : _sellerPayoutsCache.length + items.length;
+    _sellerPayoutsCache = _sellerPayoutsCache.concat(items);
+    if (!_sellerPayoutsCache.length) {
+      tbody.innerHTML = '';
+      if (empty) empty.style.display = 'flex';
+      if (loadMoreBtn) loadMoreBtn.style.display = 'none';
+    } else {
+      if (empty) empty.style.display = 'none';
+      tbody.innerHTML = _sellerPayoutsCache.map(sellerPayoutRowHtml).join('');
+      if (loadMoreBtn) loadMoreBtn.style.display = (_sellerPayoutsCache.length < _sellerPayoutsTotal) ? 'inline-block' : 'none';
+    }
+  } catch (err) {
+    if (reset) {
+      tbody.innerHTML = '<tr><td colspan="6"><div class="pending-note" style="margin-top:0;background:#FEE2E2;border-color:#FCA5A5;color:#B91C1C;"><svg viewBox="0 0 24 24" style="stroke:#B91C1C;"><use href="#i-info"/></svg> ' + escapeHtml((err && err.message) || 'دریافت درخواست‌های برداشت از سرور ممکن نشد.') + '</div></td></tr>';
+      if (empty) empty.style.display = 'none';
+    } else {
+      toast((err && err.message) || 'دریافت موارد بیشتر ناموفق بود');
+      _sellerPayoutsPage -= 1; // برگرداندن شمارهٔ صفحه چون این تلاش موفق نبود
+    }
+    if (loadMoreBtn) loadMoreBtn.style.display = (_sellerPayoutsCache.length < _sellerPayoutsTotal) ? 'inline-block' : 'none';
+  } finally {
+    _sellerPayoutsLoading = false;
+    if (loadMoreBtn) { loadMoreBtn.disabled = false; loadMoreBtn.style.opacity = ''; }
+  }
+}
+
+function loadMoreSellerPayouts() {
+  if (_sellerPayoutsLoading) return;
+  _sellerPayoutsPage += 1;
+  renderSellerPayoutsSection(false);
 }
 
 function escapeHtml(str) {
