@@ -2266,6 +2266,7 @@
       <div class="dash-mi" onclick="adminTab(this,'aaddstore')"><svg viewBox="0 0 24 24"><use href="#i-plus"/></svg>افزودن فروشگاه (بدون تایید)</div>
       <div class="dash-mi" onclick="adminTab(this,'asellers')"><svg viewBox="0 0 24 24"><use href="#i-store"/></svg>مدیریت فروشندگان</div>
       <div class="dash-mi" onclick="adminTab(this,'apayouts')"><svg viewBox="0 0 24 24"><use href="#i-wallet"/></svg>درخواست‌های برداشت وجه</div>
+      <div class="dash-mi" onclick="adminTab(this,'apliabilities')"><svg viewBox="0 0 24 24"><use href="#i-wallet"/></svg>بدهی‌های معلق فروشندگان</div>
       <div class="dash-mi" onclick="adminTab(this,'ausers')"><svg viewBox="0 0 24 24"><use href="#i-users"/></svg>مدیریت کاربران</div>
       <div class="dash-mi" onclick="adminTab(this,'asupport')"><svg viewBox="0 0 24 24"><use href="#i-headset"/></svg>پیام‌های پشتیبانی <span class="badge-mini" id="asupportBadge">0</span></div>
       <div class="dash-mi" onclick="adminTab(this,'ahero')"><svg viewBox="0 0 24 24"><use href="#i-photo"/></svg>مدیریت اسلایدر صفحه اصلی</div>
@@ -2532,6 +2533,40 @@
           <div class="pending-note" id="apPayoutsEmpty" style="display:none;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> درخواست برداشتی یافت نشد</div>
           <div style="text-align:center;margin-top:14px;">
             <button class="btn-verify" id="apPayoutsLoadMore" style="padding:8px 18px;display:none;" onclick="loadMoreAdminPayouts()">بارگذاری بیشتر</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Admin: Seller Payout Liabilities ("بدهی‌های معلق فروشندگان") — Phase 6 (Next phase after 2G).
+           Real backend surface: GET /admin/payout-liabilities (read-only — see
+           backend/src/modules/payout-liabilities/*). No manual recovery endpoint
+           exists anywhere in the backend (recovery is automatic-only, on future
+           settlements), so this tab is deliberately view-only: no approve/reject/
+           recovery actions, unlike the payout requests tab above. Independent of
+           #admin-apayouts / apPayoutsCache — separate ids, separate JS state. -->
+      <div id="admin-apliabilities" style="display:none;">
+        <div class="dash-hd"><div><h1>بدهی‌های معلق فروشندگان</h1><p>بدهی‌های ناشی از استرداد وجه که از موجودی کیف پول فروشنده قابل کسر نبوده و در تسویه‌های آینده به‌صورت خودکار بازیابی می‌شوند</p></div>
+          <div class="filter-bar">
+            <div class="filter-field">
+              <svg viewBox="0 0 24 24"><use href="#i-info"/></svg>
+              <select class="filter-select" id="apLiabilitiesStatusFilter" aria-label="فیلتر بر اساس وضعیت" onchange="onApLiabilitiesFilterChange()">
+                <option value="all">همه وضعیت‌ها</option>
+                <option value="OUTSTANDING">معلق</option>
+                <option value="RECOVERED">بازیابی‌شده</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="dash-card">
+          <table class="dash-table">
+            <thead><tr><th>کد بدهی</th><th>فروشنده</th><th>موبایل فروشنده</th><th>فروشگاه</th><th>سفارش</th><th>مبلغ باقیمانده</th><th>وضعیت</th><th>تاریخ ایجاد</th><th>تاریخ بازیابی کامل</th><th>عملیات</th></tr></thead>
+            <tbody id="apLiabilitiesTbody">
+              <tr><td colspan="10"><div class="pending-note" style="margin-top:0;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> در حال دریافت بدهی‌های معلق از سرور...</div></td></tr>
+            </tbody>
+          </table>
+          <div class="pending-note" id="apLiabilitiesEmpty" style="display:none;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> بدهی معلقی یافت نشد</div>
+          <div style="text-align:center;margin-top:14px;">
+            <button class="btn-verify" id="apLiabilitiesLoadMore" style="padding:8px 18px;display:none;" onclick="loadMoreAdminLiabilities()">بارگذاری بیشتر</button>
           </div>
         </div>
       </div>
@@ -8972,6 +9007,188 @@ async function apPayoutSubmitMarkFailed() {
   }
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+   ADMIN: SELLER PAYOUT LIABILITIES ("بدهی‌های معلق فروشندگان") — Phase 6,
+   the next frontend feature after 2G's admin payout requests tab above.
+   Real backend surface end-to-end (see backend/src/modules/
+   payout-liabilities/* — no endpoint here is invented):
+     GET /admin/payout-liabilities   (status?, sellerId?, page, pageSize)
+   Read-only by design: the backend has no manual-recovery endpoint
+   anywhere (see payout-liabilities.service.js's own top comment — recovery
+   only happens automatically, inside a seller's future order settlements),
+   so unlike the payout requests tab this section shows no approve/reject/
+   action icons at all, only a "مشاهده جزئیات" (view detail) icon. There is
+   also no GET /admin/payout-liabilities/:id, so the detail modal reuses
+   the row object already sitting in apLiabilitiesCache from the list call
+   — same convention as apPayoutOpenDetail above, never inventing a detail
+   endpoint. Pagination mirrors the exact "load more" pattern already used
+   by renderAdminPayoutsSection (real page/pageSize/total from the backend,
+   nothing computed client-side). Completely independent of the payout
+   requests tab above (apPayoutsCache/renderAdminPayoutsSection) — own
+   state, own element ids, neither is modified by this block. Every amount
+   shown here is exactly what the backend returned, formatted only via
+   fmtPriceFa — no commission/fee/balance/recovery total is ever computed
+   on the frontend. */
+const AP_LIABILITIES_PAGE_SIZE = 20;
+let apLiabilitiesPage = 1;
+let apLiabilitiesTotal = 0;
+let apLiabilitiesCache = [];
+let apLiabilitiesLoading = false;
+let apLiabilitiesStatusFilter = 'all';
+
+/* مطابق سیستم بصری موجود order-status/.st-* — بدون کلاس جدید (همان الگوی
+   PAYOUT_STATUS_CLASS بالا). */
+const LIABILITY_STATUS_LABELS_FA = {
+  OUTSTANDING: 'معلق',
+  RECOVERED: 'بازیابی‌شده',
+};
+const LIABILITY_STATUS_CLASS = {
+  OUTSTANDING: 'st-pend',
+  RECOVERED: 'st-done',
+};
+
+function apLiabilityFindLocal(id) {
+  return apLiabilitiesCache.find(l => l.id === id) || null;
+}
+function apLiabilitySellerName(l) { return (l.seller && l.seller.name) || '—'; }
+function apLiabilitySellerMobile(l) { return (l.seller && l.seller.mobile) || '—'; }
+function apLiabilityStoreName(l) { return (l.store && l.store.name) || '—'; }
+function apLiabilityOrderLabel(l) { return (l.order && (l.order.orderNumber || l.order.id)) || '—'; }
+
+function apLiabilitiesErrorMessage(err) {
+  if (err && err.status === 401) return 'نشست شما منقضی شده — لطفاً دوباره وارد حساب کاربری خود شوید';
+  if (err && err.status === 403) return 'شما اجازه دسترسی به بدهی‌های معلق فروشندگان را ندارید';
+  return (err && err.message) || 'خطای غیرمنتظره‌ای رخ داد';
+}
+
+function apLiabilityRowHtml(l) {
+  const status = l.status || '';
+  const label = LIABILITY_STATUS_LABELS_FA[status] || status;
+  const cls = LIABILITY_STATUS_CLASS[status] || 'st-return';
+  const code = '#' + String(l.id || '').slice(0, 8).toUpperCase();
+  const createdDate = l.createdAt ? new Date(l.createdAt).toLocaleDateString('fa-IR-u-nu-latn') : '—';
+  const recoveredDate = l.recoveredAt ? new Date(l.recoveredAt).toLocaleDateString('fa-IR-u-nu-latn') : '—';
+  const actionsHtml = `<svg class="row-action-ic" viewBox="0 0 24 24" width="16" height="16" style="stroke:var(--gray-400);" onclick="apLiabilityOpenDetail('${escJsAttr(l.id)}')" title="مشاهده جزئیات"><use href="#i-eye"/></svg>`;
+  return `<tr data-liability-id="${escapeHtml(l.id)}">
+    <td title="${escapeHtml(l.id || '')}">${escapeHtml(code)}</td>
+    <td>${escapeHtml(apLiabilitySellerName(l))}</td>
+    <td>${escapeHtml(apLiabilitySellerMobile(l))}</td>
+    <td>${escapeHtml(apLiabilityStoreName(l))}</td>
+    <td>${escapeHtml(apLiabilityOrderLabel(l))}</td>
+    <td style="font-weight:700;">${fmtPriceFa(l.amount)} تومان</td>
+    <td><div class="order-status ${cls}">${escapeHtml(label)}</div></td>
+    <td>${createdDate}</td>
+    <td>${recoveredDate}</td>
+    <td>${actionsHtml}</td>
+  </tr>`;
+}
+
+function onApLiabilitiesFilterChange() {
+  const sel = document.getElementById('apLiabilitiesStatusFilter');
+  apLiabilitiesStatusFilter = sel ? sel.value : 'all';
+  renderAdminLiabilitiesSection(true);
+}
+
+/* reset=true → صفحه ۱ و پاک کردن کش (بارگذاری اول یا بعد از تغییر فیلتر)؛
+   reset=false → «بارگذاری بیشتر». دقیقاً همان الگوی renderAdminPayoutsSection
+   بالا (از جمله رول‌بک شمارهٔ صفحه در صورت خطا). */
+async function renderAdminLiabilitiesSection(reset) {
+  const tbody = document.getElementById('apLiabilitiesTbody');
+  const empty = document.getElementById('apLiabilitiesEmpty');
+  const loadMoreBtn = document.getElementById('apLiabilitiesLoadMore');
+  if (!tbody) return;
+  if (apLiabilitiesLoading) return;
+  apLiabilitiesLoading = true;
+  if (reset) {
+    apLiabilitiesPage = 1;
+    apLiabilitiesCache = [];
+    tbody.innerHTML = '<tr><td colspan="10"><div class="pending-note" style="margin-top:0;"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg> در حال دریافت بدهی‌های معلق از سرور...</div></td></tr>';
+    if (empty) empty.style.display = 'none';
+    if (loadMoreBtn) loadMoreBtn.style.display = 'none';
+  } else if (loadMoreBtn) {
+    loadMoreBtn.disabled = true; loadMoreBtn.style.opacity = '0.6';
+  }
+  try {
+    let path = '/admin/payout-liabilities?page=' + apLiabilitiesPage + '&pageSize=' + AP_LIABILITIES_PAGE_SIZE;
+    if (apLiabilitiesStatusFilter && apLiabilitiesStatusFilter !== 'all') path += '&status=' + encodeURIComponent(apLiabilitiesStatusFilter);
+    const data = await authApiFetch(path, { method: 'GET' });
+    const items = (data && data.items) || [];
+    apLiabilitiesTotal = (data && typeof data.total === 'number') ? data.total : apLiabilitiesCache.length + items.length;
+    apLiabilitiesCache = apLiabilitiesCache.concat(items);
+    if (!apLiabilitiesCache.length) {
+      tbody.innerHTML = '';
+      if (empty) empty.style.display = 'flex';
+      if (loadMoreBtn) loadMoreBtn.style.display = 'none';
+    } else {
+      if (empty) empty.style.display = 'none';
+      tbody.innerHTML = apLiabilitiesCache.map(apLiabilityRowHtml).join('');
+      if (loadMoreBtn) loadMoreBtn.style.display = (apLiabilitiesCache.length < apLiabilitiesTotal) ? 'inline-block' : 'none';
+    }
+  } catch (err) {
+    const msg = apLiabilitiesErrorMessage(err);
+    if (reset) {
+      tbody.innerHTML = '<tr><td colspan="10"><div class="pending-note" style="margin-top:0;background:#FEE2E2;border-color:#FCA5A5;color:#B91C1C;"><svg viewBox="0 0 24 24" style="stroke:#B91C1C;"><use href="#i-info"/></svg> ' + escapeHtml(msg) + '</div></td></tr>';
+      if (empty) empty.style.display = 'none';
+    } else {
+      toast(msg);
+      apLiabilitiesPage -= 1; // برگرداندن شمارهٔ صفحه چون این تلاش موفق نبود
+    }
+    if (loadMoreBtn) loadMoreBtn.style.display = (apLiabilitiesCache.length < apLiabilitiesTotal) ? 'inline-block' : 'none';
+  } finally {
+    apLiabilitiesLoading = false;
+    if (loadMoreBtn) { loadMoreBtn.disabled = false; loadMoreBtn.style.opacity = ''; }
+  }
+}
+
+function loadMoreAdminLiabilities() {
+  if (apLiabilitiesLoading) return;
+  apLiabilitiesPage += 1;
+  renderAdminLiabilitiesSection(false);
+}
+
+/* ---------- DETAIL (مشاهده جزئیات) — no GET /:id on the backend; reuses
+   the row object already cached from the list fetch above, same convention
+   as apPayoutOpenDetail. Reuses the shared #apModalOverlay/#apModalBody/
+   #apModalTitle modal — no new modal markup, view-only (no submit button,
+   since this tab has no mutating action at all). ---------- */
+function apLiabilityOpenDetail(id) {
+  const l = apLiabilityFindLocal(id);
+  const overlay = document.getElementById('apModalOverlay');
+  const body = document.getElementById('apModalBody');
+  const title = document.getElementById('apModalTitle');
+  if (!overlay || !body || !title) return;
+  apModalEditId = null;
+  title.textContent = 'جزئیات بدهی معلق فروشنده';
+  if (!l) { body.innerHTML = '<div class="pending-note" style="margin-top:0;">بدهی یافت نشد</div>'; overlay.style.display = 'flex'; return; }
+  const status = l.status || '';
+  const label = LIABILITY_STATUS_LABELS_FA[status] || status;
+  const cls = LIABILITY_STATUS_CLASS[status] || 'st-return';
+  const createdDate = l.createdAt ? new Date(l.createdAt).toLocaleDateString('fa-IR-u-nu-latn') : '—';
+  const recoveredDate = l.recoveredAt ? new Date(l.recoveredAt).toLocaleDateString('fa-IR-u-nu-latn') : '—';
+  body.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+      <div style="font-weight:700;font-size:15px;">${fmtPriceFa(l.amount)} تومان</div>
+      <div class="order-status ${cls}">${escapeHtml(label)}</div>
+    </div>
+    <div style="font-size:12px;color:var(--gray-500);margin-bottom:10px;">شناسه: ${escapeHtml(l.id || '—')}</div>
+    <div class="form-row-2">
+      <div><div style="font-size:12px;color:var(--gray-500);">فروشنده</div><div>${escapeHtml(apLiabilitySellerName(l))}</div></div>
+      <div><div style="font-size:12px;color:var(--gray-500);">موبایل فروشنده</div><div>${escapeHtml(apLiabilitySellerMobile(l))}</div></div>
+    </div>
+    <div class="form-row-2" style="margin-top:10px;">
+      <div><div style="font-size:12px;color:var(--gray-500);">فروشگاه</div><div>${escapeHtml(apLiabilityStoreName(l))}</div></div>
+      <div><div style="font-size:12px;color:var(--gray-500);">سفارش</div><div>${escapeHtml(apLiabilityOrderLabel(l))}</div></div>
+    </div>
+    ${l.originalAmount != null ? `<div style="margin-top:10px;"><div style="font-size:12px;color:var(--gray-500);">مبلغ اولیهٔ کسری</div><div>${fmtPriceFa(l.originalAmount)} تومان</div></div>` : ''}
+    ${l.reason ? `<div style="margin-top:10px;"><div style="font-size:12px;color:var(--gray-500);">دلیل</div><div>${escapeHtml(l.reason)}</div></div>` : ''}
+    <div class="form-row-2" style="margin-top:10px;">
+      <div><div style="font-size:12px;color:var(--gray-500);">تاریخ ایجاد</div><div>${createdDate}</div></div>
+      <div><div style="font-size:12px;color:var(--gray-500);">تاریخ بازیابی کامل</div><div>${recoveredDate}</div></div>
+    </div>
+  `;
+  overlay.style.display = 'flex';
+}
+
 function escapeHtml(str) {
   return String(str == null ? '' : str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -8999,7 +9216,7 @@ function adminTab(el, tab, opts) {
   closeDashSidebarMobile();
   document.querySelectorAll('#page-admin .dash-mi').forEach(x=>x.classList.remove('act'));
   el.classList.add('act');
-  ['aoverview','aproducts','aapplications','aaddstore','asellers','apayouts','ausers','asupport','ahero','aadmins','areports','asettings'].forEach(t => {
+  ['aoverview','aproducts','aapplications','aaddstore','asellers','apayouts','apliabilities','ausers','asupport','ahero','aadmins','areports','asettings'].forEach(t => {
     const d = document.getElementById('admin-'+t);
     if (d) d.style.display = (t===tab) ? 'block' : 'none';
   });
@@ -9008,6 +9225,7 @@ function adminTab(el, tab, opts) {
   if (tab === 'aapplications') renderSellerApplications();
   if (tab === 'asellers') renderAdminSellersFromApi();
   if (tab === 'apayouts') renderAdminPayoutsSection(true);
+  if (tab === 'apliabilities') renderAdminLiabilitiesSection(true);
   if (tab === 'ausers') renderAdminUsersTab();
   if (tab === 'asupport') renderAdminSupportList();
   if (tab === 'ahero') renderHeroAdminPanel();
