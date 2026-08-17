@@ -1179,6 +1179,12 @@
     <div class="reviews-section" style="padding:0;max-width:none;margin:0 0 40px;">
       <div class="dash-card">
         <h3>نظرات کاربران <span class="badge-mini" id="pdReviewsCount" style="background:var(--primary);">0</span></h3>
+        <div id="pdReviewsLoading" class="pending-note" style="display:none;">
+          <svg viewBox="0 0 24 24"><use href="#i-info"/></svg> در حال دریافت نظرات...
+        </div>
+        <div id="pdReviewsError" class="pending-note" style="display:none;background:#FEE2E2;border-color:#FCA5A5;color:#B91C1C;">
+          <svg viewBox="0 0 24 24" style="stroke:#B91C1C;"><use href="#i-info"/></svg> <span id="pdReviewsErrorMsg">دریافت نظرات ممکن نشد.</span>
+        </div>
         <div id="pdReviewsList"></div>
         <div id="pdReviewsEmpty" class="pending-note" style="display:none;">
           <svg viewBox="0 0 24 24"><use href="#i-info"/></svg> هنوز نظری برای این محصول ثبت نشده — اولین نفری باشید که نظر می‌دهید
@@ -1187,7 +1193,10 @@
           <label class="form-label" style="margin-bottom:8px;display:block;">امتیاز شما</label>
           <div id="pdRatingInput" style="display:flex;gap:5px;margin-bottom:12px;"></div>
           <div class="form-group"><textarea class="form-textarea" id="pdCommentText" placeholder="نظر خود را درباره این محصول بنویسید..."></textarea></div>
-          <button class="btn-cart" style="margin-top:0;max-width:220px;" onclick="submitProductComment()">ثبت نظر</button>
+          <div class="pending-note" id="pdReviewEditNote" style="display:none;margin-bottom:12px;">
+            <svg viewBox="0 0 24 24"><use href="#i-info"/></svg> شما قبلاً برای این محصول نظر ثبت کرده‌اید — ثبت مجدد، همان نظر را ویرایش می‌کند.
+          </div>
+          <button class="btn-cart" style="margin-top:0;max-width:220px;" id="pdSubmitReviewBtn" onclick="submitProductComment()">ثبت نظر</button>
         </div>
       </div>
     </div>
@@ -9518,27 +9527,35 @@ function slugify(str) {
    می‌شود؛ کارت‌های نمایشی/دمو معادل واقعی در دیتابیس ندارند، پس بخش نظرات
    برای آن‌ها خالی می‌ماند (دقیقاً هم‌راستا با تصمیم قبلی پروژه برای سبد
    خرید و علاقه‌مندی‌ها). */
+/* قبلاً خطای GET را همین‌جا می‌بلعید و [] برمی‌گرداند، پس یک قطعی واقعی
+   شبکه/سرور دقیقاً همان ظاهر «هنوز نظری ثبت نشده» را داشت. حالا خطا به
+   بالا پرتاب می‌شود تا renderProductDetailReviews بتواند حالت خطا را از
+   حالت خالیِ واقعی تشخیص دهد و جدا نمایش دهد. */
 async function fetchProductReviews(productId) {
   if (!productId) return [];
-  try {
-    const data = await authApiFetch('/reviews/product/' + encodeURIComponent(productId), { method: 'GET', skipAuth: true });
-    return (data && data.items) || (Array.isArray(data) ? data : []) || [];
-  } catch (err) {
-    return [];
-  }
+  const data = await authApiFetch('/reviews/product/' + encodeURIComponent(productId), { method: 'GET', skipAuth: true });
+  return (data && data.items) || (Array.isArray(data) ? data : []) || [];
 }
-/* هیچ دکمه/UI حذف نظر در صفحه جزئیات محصول از قبل وجود نداشت (طبق قانون
-   «UI فعلی حفظ شود» چیزی به آن اضافه نشد)؛ این تابع فقط پوشش برنامه‌نویسیِ
-   DELETE /reviews/:id است — هر وقت چنین دکمه‌ای اضافه شد، همین‌جا صدا زده
-   می‌شود. */
+/* دکمهٔ حذف نظر (فقط روی نظر خودِ کاربر لاگین‌شده، تشخیص‌داده‌شده از طریق
+   getCurrentUser().id — صرفاً برای نمایش/عدم‌نمایش دکمه؛ مرجع نهایی مجاز
+   بودن حذف همیشه بک‌اند است) در renderProductDetailReviews رندر می‌شود و
+   همین تابع موجود را صدا می‌زند. */
+let _pdReviewDeleteBusy = null;
 async function deleteProductReview(id) {
-  if (!id) return;
+  if (!id || _pdReviewDeleteBusy === id) return;
+  if (!confirm('این نظر برای همیشه حذف شود؟')) return;
+  _pdReviewDeleteBusy = id;
+  const btn = document.getElementById('pdRevDelBtn-' + id);
+  if (btn) { btn.disabled = true; }
   try {
     await authApiFetch('/reviews/' + encodeURIComponent(id), { method: 'DELETE' });
-    renderProductDetailReviews();
     toast('نظر حذف شد');
+    await renderProductDetailReviews();
   } catch (err) {
     toast((err && err.message) || 'حذف نظر ممکن نشد');
+    if (btn) { btn.disabled = false; }
+  } finally {
+    _pdReviewDeleteBusy = null;
   }
 }
 
@@ -9899,26 +9916,67 @@ function renderRatingInput(selected) {
   }).join('');
 }
 
+/* شمارندهٔ درخواست فعلی نظرات — دقیقاً همان الگوی _orderDetailReqToken در
+   Phase 2A: اگر کاربر سریع بین دو محصول جابه‌جا شود، فقط آخرین درخواست اجازهٔ
+   Render دارد و پاسخ دیرهنگام محصول قبلی هرگز روی محصول جدید نمی‌نشیند. */
+let _pdReviewsReqToken = 0;
+/* هر بار رندر می‌شود تا submitProductComment/deleteProductReview بدانند آیا
+   کاربر لاگین‌شدهٔ فعلی از قبل برای همین محصول نظر ثبت کرده — فقط برای UX
+   (متن دکمه/یادداشت)، نه برای مجوز؛ بک‌اند همیشه مرجع نهایی مالکیت است. */
+let _pdCurrentUserReview = null;
+
 async function renderProductDetailReviews() {
   if (!CURRENT_PRODUCT_DETAIL) return;
+  const myToken = ++_pdReviewsReqToken;
   const list = document.getElementById('pdReviewsList');
   const empty = document.getElementById('pdReviewsEmpty');
+  const loadingEl = document.getElementById('pdReviewsLoading');
+  const errorEl = document.getElementById('pdReviewsError');
   const countEl = document.getElementById('pdReviewsCount');
   const productId = CURRENT_PRODUCT_DETAIL.productId;
+  _pdCurrentUserReview = null;
   if (!productId) {
     /* نمونهٔ نمایشی/دمو — معادل واقعی در سرور ندارد، پس نظر واقعی هم ندارد. */
+    if (loadingEl) loadingEl.style.display = 'none';
+    if (errorEl) errorEl.style.display = 'none';
     if (countEl) countEl.textContent = '۰';
     if (list) list.innerHTML = '';
     if (empty) empty.style.display = 'flex';
+    updateReviewSubmitUi();
     return;
   }
-  const comments = await fetchProductReviews(productId);
-  if (!CURRENT_PRODUCT_DETAIL || CURRENT_PRODUCT_DETAIL.productId !== productId) return; // کاربر قبل از رسیدن پاسخ صفحه را عوض کرده
+  if (list) list.innerHTML = '';
+  if (empty) empty.style.display = 'none';
+  if (errorEl) errorEl.style.display = 'none';
+  if (loadingEl) loadingEl.style.display = 'flex';
+  let comments;
+  try {
+    comments = await fetchProductReviews(productId);
+  } catch (err) {
+    if (myToken !== _pdReviewsReqToken) return; // پاسخ/خطای دیرهنگام یک محصول قبلی — نادیده گرفته می‌شود
+    if (loadingEl) loadingEl.style.display = 'none';
+    if (empty) empty.style.display = 'none';
+    if (countEl) countEl.textContent = '۰';
+    if (errorEl) {
+      const msgEl = document.getElementById('pdReviewsErrorMsg');
+      // پیام واقعی بک‌اند (فارسی) همان‌طور که هست نمایش داده می‌شود، بدون جزئیات فنی داخلی.
+      if (msgEl) msgEl.textContent = (err && err.message) || 'دریافت نظرات ممکن نشد.';
+      errorEl.style.display = 'flex';
+    }
+    updateReviewSubmitUi();
+    return;
+  }
+  if (myToken !== _pdReviewsReqToken) return; // کاربر قبل از رسیدن پاسخ صفحه را عوض کرده
+  if (loadingEl) loadingEl.style.display = 'none';
+  if (errorEl) errorEl.style.display = 'none';
   if (countEl) countEl.textContent = comments.length.toLocaleString('fa-IR-u-nu-latn');
-  if (!list) return;
+  const me = getCurrentUser();
+  if (me) _pdCurrentUserReview = comments.find(c => c.user && c.user.id === me.id) || null;
+  if (!list) { updateReviewSubmitUi(); return; }
   if (!comments.length) {
     list.innerHTML = '';
     if (empty) empty.style.display = 'flex';
+    updateReviewSubmitUi();
     return;
   }
   if (empty) empty.style.display = 'none';
@@ -9927,18 +9985,37 @@ async function renderProductDetailReviews() {
     const rating = c.rating || 0;
     const text = c.text || c.comment || c.body || '';
     const date = c.createdAt || c.date;
+    const isMine = !!(me && c.user && c.user.id === me.id);
+    const delBtn = isMine
+      ? `<button class="btn-ghost" id="pdRevDelBtn-${escJsAttr(c.id)}" style="margin-right:auto;" onclick="deleteProductReview('${escJsAttr(c.id)}')">حذف نظر</button>`
+      : '';
     return `
     <div class="review-card">
       <div class="review-head">
         <div class="review-av">${escapeHtml(authorName.slice(0, 1))}</div>
         <div><div class="review-name">${escapeHtml(authorName)}</div><div class="review-date">${timeAgoFa(date)}</div></div>
-        <div style="margin-right:auto;">${starsHtml(rating)}</div>
+        <div style="margin-right:${isMine ? '10px' : 'auto'};">${starsHtml(rating)}</div>
+        ${delBtn}
       </div>
       <div class="review-text">${escapeHtml(text)}</div>
     </div>`;
   }).join('');
+  updateReviewSubmitUi();
 }
 
+/* متن/یادداشت دکمهٔ ثبت نظر را بر اساس اینکه کاربر لاگین‌شدهٔ فعلی از قبل
+   نظری برای همین محصول دارد یا نه به‌روزرسانی می‌کند — چون POST /reviews
+   یک upsert است، ثبت دوباره همان نظر موجود را ویرایش می‌کند، نه یک نظر تازه. */
+function updateReviewSubmitUi() {
+  const btn = document.getElementById('pdSubmitReviewBtn');
+  const note = document.getElementById('pdReviewEditNote');
+  const hasOwn = !!_pdCurrentUserReview;
+  if (btn && !btn.disabled) btn.textContent = hasOwn ? 'ویرایش نظر' : 'ثبت نظر';
+  if (note) note.style.display = hasOwn ? 'flex' : 'none';
+  if (hasOwn) renderRatingInput(_pdCurrentUserReview.rating || 5);
+}
+
+let _pdReviewSubmitBusy = false;
 async function submitProductComment() {
   if (!CURRENT_PRODUCT_DETAIL) return;
   if (!CURRENT_PRODUCT_DETAIL.productId) {
@@ -9946,19 +10023,26 @@ async function submitProductComment() {
     return;
   }
   if (!getCurrentUser()) { toast('برای ثبت نظر ابتدا وارد حساب کاربری خود شوید'); goPath('/login'); return; }
+  if (_pdReviewSubmitBusy) return;
   const textEl = document.getElementById('pdCommentText');
   const text = textEl ? textEl.value.trim() : '';
   if (!text) { toast('لطفا متن نظر خود را بنویسید'); return; }
+  const btn = document.getElementById('pdSubmitReviewBtn');
+  const isEdit = !!_pdCurrentUserReview;
+  _pdReviewSubmitBusy = true;
+  if (btn) { btn.disabled = true; btn.textContent = 'در حال ارسال...'; }
   try {
     await authApiFetch('/reviews', { method: 'POST', body: { productId: CURRENT_PRODUCT_DETAIL.productId, rating: pdSelectedRating, comment: text } });
   } catch (err) {
     toast((err && err.message) || 'ثبت نظر ممکن نشد');
     return;
+  } finally {
+    _pdReviewSubmitBusy = false;
+    if (btn) { btn.disabled = false; btn.textContent = isEdit ? 'ویرایش نظر' : 'ثبت نظر'; } // موفقیت: متن نهایی توسط updateReviewSubmitUi() داخل renderProductDetailReviews دوباره تنظیم می‌شود
   }
   textEl.value = '';
-  renderRatingInput(5);
-  renderProductDetailReviews();
-  toast('نظر شما با موفقیت ثبت شد');
+  await renderProductDetailReviews();
+  toast(isEdit ? 'نظر شما بروزرسانی شد' : 'نظر شما با موفقیت ثبت شد');
   pushNotification('i-chat', 'نظر جدید برای «' + CURRENT_PRODUCT_DETAIL.name + '» ثبت شد', notifTargetRoles('admin', 'super_admin'));
 }
 
