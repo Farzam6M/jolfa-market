@@ -21,6 +21,7 @@ const crypto = require('crypto');
 const app = require('../src/app');
 const { prisma } = require('../src/config/database');
 const { signAccessToken } = require('../src/utils/tokens');
+const { PLATFORM_LEDGER_OWNER_ID } = require('../src/modules/ledger/ledger.constants');
 
 const api = request(app);
 const PREFIX = process.env.API_PREFIX || '/api/v1';
@@ -82,6 +83,24 @@ async function makeApprovedProduct(sellerAuth, adminAuth, categoryId, overrides 
   const id = created.body.data.id;
   await api.patch(`${PREFIX}/products/${id}/moderate`).set('Authorization', adminAuth).send({ status: 'APPROVED' });
   return prisma.storeProduct.findUnique({ where: { id } });
+}
+
+/** Pays a PENDING order via WALLET — same call as order-refund.test.js's payWallet helper. Flips the order PENDING -> CONFIRMED as a side effect (see payments.service.js#payWithWallet). */
+async function payWallet(customerAuth, orderId) {
+  const res = await api.post(`${PREFIX}/payments`).set('Authorization', customerAuth).send({ orderId, method: 'WALLET' });
+  return res.body.data;
+}
+
+/** Checks out `qty` of `storeProduct`, pays via WALLET, and drives the order all the way to DELIVERED (triggers settlement). Unlike `fullyDeliverOrder` below, this leaves a real SUCCESS WALLET Payment behind, which the P2.8-A test needs in order to drive a real POST /orders/:id/refund afterward. */
+async function payAndDeliverOrder(customerAuth, adminAuth, storeProduct, qty) {
+  await api.post(`${PREFIX}/cart/items`).set('Authorization', customerAuth).send({ productId: storeProduct.id, qty });
+  const created = await api.post(`${PREFIX}/orders/checkout`).set('Authorization', customerAuth).send({});
+  const orderId = created.body.data.id;
+  await payWallet(customerAuth, orderId);
+  await api.patch(`${PREFIX}/orders/${orderId}/status`).set('Authorization', adminAuth).send({ status: 'PREPARING' });
+  await api.patch(`${PREFIX}/orders/${orderId}/status`).set('Authorization', adminAuth).send({ status: 'SENT' });
+  const res = await api.patch(`${PREFIX}/orders/${orderId}/status`).set('Authorization', adminAuth).send({ status: 'DELIVERED' });
+  return { res, order: await prisma.order.findUnique({ where: { id: orderId }, include: { items: true } }) };
 }
 
 /** Checks out `qty` of `storeProduct` and drives the order all the way to DELIVERED (triggers settlement) — same pattern as order-settlement.test.js's checkoutToSent, extended one step further. No payment step: admin status transitions don't require one (see ORDER_TRANSITIONS). */
@@ -496,5 +515,131 @@ describe('Phase 6 — Admin liability visibility', () => {
 
     const res = await api.patch(`${PREFIX}/admin/payout-liabilities/${liability.id}/recover`).set('Authorization', admin.auth);
     expect([404, 403]).toContain(res.status); // no such route wired anywhere
+  });
+});
+
+/**
+ * P2.8-A — Receivable-backed liability recovery, end to end.
+ *
+ * Every recovery scenario above uses `makeLiability()`, which inserts a
+ * SellerPayoutLiability directly and therefore never has a
+ * `ledgerReceivableEntryId` — it always exercises
+ * recoverSellerLiabilities' legacy `receivableBacked: false` branch
+ * (CREDIT PLATFORM_CASH). order-refund.test.js's test E already proves a
+ * REAL delivered-WALLET-refund-with-shortfall creates the liability with
+ * its PLATFORM_RECEIVABLE leg correctly; ledger.service.test.js's own
+ * P2.9 test already proves postLiabilityRecovery's receivableBacked:
+ * true branch credits PLATFORM_RECEIVABLE in isolation. Neither proves
+ * the two are wired together end to end. This test is the missing link:
+ * a real refund-created, receivable-backed liability, recovered by a
+ * real later settlement, posting a real LIABILITY_RECOVERY Journal with
+ * a PLATFORM_RECEIVABLE credit leg — see
+ * payout-liabilities.service.js#recoverSellerLiabilities' own comment on
+ * `receivableBacked: liability.ledgerReceivableEntryId != null`.
+ */
+describe('P2.8-A — Receivable-backed liability recovery (real refund -> real settlement)', () => {
+  async function findJournal(eventType, eventId) {
+    return prisma.journal.findUnique({ where: { eventType_eventId: { eventType, eventId } } });
+  }
+
+  async function entriesFor(journalId) {
+    return prisma.ledgerEntry.findMany({ where: { journalId }, include: { account: true } });
+  }
+
+  test('a real refund-created receivable-backed liability recovers into PLATFORM_RECEIVABLE on a real future settlement', async () => {
+    // Dedicated seller/store/product/customer — isolates this liability
+    // (and the receivable it claims) from every other test in this file,
+    // same rationale as the FIFO / multi-settlement / concurrent-settlement
+    // tests above (and as sellerE in order-refund.test.js's test E).
+    const customerR = await makeUser('CUSTOMER', uniqueMobileSuffix('19'));
+    await prisma.wallet.create({ data: { userId: customerR.user.id, balance: 100000000 } });
+    const sellerR = await makeUser('SELLER', uniqueMobileSuffix('20'));
+    await prisma.wallet.create({ data: { userId: sellerR.user.id, balance: 0 } });
+    const adminR = await makeUser('ADMIN', uniqueMobileSuffix('21'));
+    await makeApprovedStore(sellerR.user.id, 'فروشگاه بازیابی مطالبات');
+    const categoryR = await api.post(`${PREFIX}/categories`).set('Authorization', adminR.auth)
+      .send({ name: 'دسته بازیابی مطالبات', slug: `receivable-recovery-cat-${Date.now()}` });
+    const existingGlobal = await prisma.commissionRule.findFirst({ where: { scope: 'GLOBAL', isActive: true } });
+    if (!existingGlobal) {
+      await api.post(`${PREFIX}/admin/commission-rules`).set('Authorization', adminR.auth).send({ scope: 'GLOBAL', rate: 10 });
+    }
+    const productR = await makeApprovedProduct(sellerR.auth, adminR.auth, categoryR.body.data.id, { price: 100000, stock: 999 });
+
+    // Step 1 — REAL delivered WALLET order, forced to a full shortfall so
+    // the refund clawback creates a liability (mirrors order-refund
+    // test E exactly, just with this file's own fixtures/helpers).
+    const { order: refundedOrder } = await payAndDeliverOrder(customerR.auth, adminR.auth, productR, 1);
+    const item = refundedOrder.items[0];
+    const settlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: item.id } });
+    await prisma.wallet.update({ where: { userId: sellerR.user.id }, data: { balance: 0 } }); // force full shortfall
+
+    // Step 2 — REAL refund. Produces the SellerPayoutLiability with its
+    // ledgerReceivableEntryId set (P2.9 — Model C), not `makeLiability()`.
+    const refundRes = await api.post(`${PREFIX}/orders/${refundedOrder.id}/refund`).set('Authorization', adminR.auth)
+      .send({ items: [{ orderItemId: item.id, qty: 1 }] });
+    expect(refundRes.status).toBe(200);
+
+    const refund = await prisma.paymentRefund.findUnique({ where: { id: refundRes.body.data.refund.id } });
+    const liability = await prisma.sellerPayoutLiability.findFirst({
+      where: { orderId: refundedOrder.id, sellerId: sellerR.user.id, refundId: refund.id },
+    });
+    expect(liability).not.toBeNull();
+    expect(liability.status).toBe('OUTSTANDING');
+    expect(liability.ledgerReceivableEntryId).not.toBeNull(); // the precondition recoverSellerLiabilities checks
+    expect(Number(liability.amount)).toBe(Number(settlement.sellerEarning)); // full shortfall, nothing collected yet
+
+    // Step 3 — REAL future settlement for the same seller. gross=100000,
+    // commission 10% -> sellerEarning=90000, which fully covers the
+    // liability (also 90000, since the refunded order was the seller's
+    // only prior settlement) with nothing left over for the wallet.
+    const walletBefore = await prisma.wallet.findUnique({ where: { userId: sellerR.user.id } });
+    const { order: settledOrder } = await fullyDeliverOrder(customerR.auth, adminR.auth, productR, 1);
+    const recoverySettlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: settledOrder.items[0].id } });
+
+    // Step 4 — the liability lifecycle closed correctly.
+    const liabilityAfter = await prisma.sellerPayoutLiability.findUnique({ where: { id: liability.id } });
+    expect(liabilityAfter.status).toBe('RECOVERED');
+    expect(Number(liabilityAfter.amount)).toBe(0);
+    expect(liabilityAfter.recoveredAt).not.toBeNull();
+
+    const walletAfter = await prisma.wallet.findUnique({ where: { userId: sellerR.user.id } });
+    expect(Number(walletAfter.balance)).toBe(Number(walletBefore.balance)); // fully absorbed by the liability, nothing credited
+
+    const recoveryDebitTx = await prisma.walletTransaction.findFirst({ where: { refId: liability.id, type: 'DEBIT' } });
+    expect(recoveryDebitTx).not.toBeNull();
+    expect(Number(recoveryDebitTx.amount)).toBe(Number(settlement.sellerEarning));
+
+    // Step 5 — the actual assertion this test exists for: the
+    // LIABILITY_RECOVERY Journal posted PLATFORM_RECEIVABLE, not
+    // PLATFORM_CASH, because this liability's ledgerReceivableEntryId
+    // was set. eventId is the deterministic composite this recovery
+    // pass used — see recoverSellerLiabilities' own comment.
+    const recoveryJournal = await findJournal('LIABILITY_RECOVERY', `${recoverySettlement.id}:${liability.id}`);
+    expect(recoveryJournal).not.toBeNull();
+
+    const recoveryEntries = await entriesFor(recoveryJournal.id);
+    expect(recoveryEntries).toHaveLength(2);
+    const debitLeg = recoveryEntries.find((e) => e.direction === 'DEBIT');
+    const creditLeg = recoveryEntries.find((e) => e.direction === 'CREDIT');
+
+    expect(debitLeg.account.ownerType).toBe('SELLER_WALLET');
+    expect(debitLeg.account.ownerId).toBe(sellerR.user.id);
+    expect(Number(debitLeg.amount)).toBe(Number(settlement.sellerEarning));
+
+    expect(creditLeg.account.ownerType).toBe('PLATFORM_RECEIVABLE'); // not PLATFORM_CASH — the whole point of P2.8-A
+    expect(creditLeg.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(Number(creditLeg.amount)).toBe(Number(settlement.sellerEarning));
+
+    // Balanced: CREDIT total === DEBIT total.
+    const creditTotal = recoveryEntries.filter((e) => e.direction === 'CREDIT').reduce((s, e) => s + Number(e.amount), 0);
+    const debitTotal = recoveryEntries.filter((e) => e.direction === 'DEBIT').reduce((s, e) => s + Number(e.amount), 0);
+    expect(debitTotal).toBe(creditTotal);
+
+    // Sanity check against the REFUND journal's own PLATFORM_RECEIVABLE
+    // leg (the claim this recovery is paying down): same account.
+    const refundJournal = await findJournal('REFUND', refund.id);
+    const refundEntries = await entriesFor(refundJournal.id);
+    const refundReceivableLeg = refundEntries.find((e) => e.account.ownerType === 'PLATFORM_RECEIVABLE');
+    expect(refundReceivableLeg.account.id).toBe(creditLeg.account.id);
   });
 });
