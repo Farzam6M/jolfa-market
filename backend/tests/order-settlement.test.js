@@ -38,9 +38,21 @@ const bcrypt = require('bcryptjs');
 const app = require('../src/app');
 const { prisma } = require('../src/config/database');
 const { signAccessToken } = require('../src/utils/tokens');
+const { PLATFORM_LEDGER_OWNER_ID } = require('../src/modules/ledger/ledger.constants');
 
 const api = request(app);
 const PREFIX = process.env.API_PREFIX || '/api/v1';
+
+// P2.8-B — small Ledger lookup helpers, same shape as
+// payout-liabilities.test.js's own findJournal/entriesFor helpers (kept
+// local rather than shared/exported, matching that file's own approach).
+async function findJournal(eventType, eventId) {
+  return prisma.journal.findUnique({ where: { eventType_eventId: { eventType, eventId } } });
+}
+
+async function entriesFor(journalId) {
+  return prisma.ledgerEntry.findMany({ where: { journalId }, include: { account: true } });
+}
 
 let roles;
 
@@ -161,6 +173,74 @@ describe('Order settlement on DELIVERED', () => {
     expect(walletTx).not.toBeNull();
     expect(walletTx.type).toBe('CREDIT');
     expect(Number(walletTx.amount)).toBe(72000);
+
+    // P2.8-B — the real SETTLEMENT Journal this same request posted.
+    // eventId = OrderItemSettlement.id (settleDeliveredOrder's own
+    // postSettlement call — see orders.service.js), not guessed: read
+    // straight off the settlement row already fetched above. This
+    // seller/order has no outstanding liability, so this is the plain
+    // no-liability path (remainingSellerEarning === sellerEarning) —
+    // postSettlement itself is always posted with the FULL sellerEarning
+    // regardless of liability recovery (see that function's own doc
+    // comment), so no special-casing is needed here either way.
+    const settlementJournal = await findJournal('SETTLEMENT', settlement.id);
+    expect(settlementJournal).not.toBeNull();
+
+    const settlementEntries = await entriesFor(settlementJournal.id);
+    // Three legs: DEBIT PLATFORM_CASH (gross), CREDIT PLATFORM_REVENUE
+    // (commission), CREDIT SELLER_WALLET (sellerEarning) — per
+    // postSettlement/ledger.constants.js's SETTLEMENT mapping. Both
+    // commission and sellerEarning are > 0 here, so all three legs exist.
+    expect(settlementEntries).toHaveLength(3);
+
+    const cashLeg = settlementEntries.find((e) => e.account.ownerType === 'PLATFORM_CASH');
+    expect(cashLeg).toBeDefined();
+    expect(cashLeg.direction).toBe('DEBIT');
+    expect(cashLeg.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(Number(cashLeg.amount)).toBe(Number(settlement.grossAmount));
+
+    const revenueLeg = settlementEntries.find((e) => e.account.ownerType === 'PLATFORM_REVENUE');
+    expect(revenueLeg).toBeDefined();
+    expect(revenueLeg.direction).toBe('CREDIT');
+    expect(revenueLeg.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(Number(revenueLeg.amount)).toBe(Number(settlement.commissionAmount));
+
+    const sellerLeg = settlementEntries.find((e) => e.account.ownerType === 'SELLER_WALLET');
+    expect(sellerLeg).toBeDefined();
+    expect(sellerLeg.direction).toBe('CREDIT');
+    expect(sellerLeg.account.ownerId).toBe(seller.user.id);
+    // Posted with the FULL sellerEarning, not remainingSellerEarning —
+    // this test has no outstanding liability so the two are equal anyway,
+    // but the assertion is against settlement.sellerEarning specifically
+    // (the field postSettlement is actually called with) rather than the
+    // wallet delta, keeping this assertion honest about what SETTLEMENT
+    // itself posts.
+    expect(Number(sellerLeg.amount)).toBe(Number(settlement.sellerEarning));
+
+    // Balanced: SUM(DEBIT) === SUM(CREDIT), Decimal-safe (Number is exact
+    // here since these are whole-unit Decimal(12,0) TMN amounts, same
+    // comparison style as payout-liabilities.test.js's own balance check).
+    const debitTotal = settlementEntries.filter((e) => e.direction === 'DEBIT')
+      .reduce((sum, e) => sum + Number(e.amount), 0);
+    const creditTotal = settlementEntries.filter((e) => e.direction === 'CREDIT')
+      .reduce((sum, e) => sum + Number(e.amount), 0);
+    expect(debitTotal).toBe(creditTotal);
+
+    // Wallet <-> Ledger reconciliation: the real Wallet.balance increase
+    // from this settlement equals both the SELLER_WALLET Ledger CREDIT
+    // leg and the seller's Ledger Account.balance movement.
+    const sellerLedgerAccount = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'SELLER_WALLET', ownerId: seller.user.id, currency: 'TMN' } },
+    });
+    expect(sellerLedgerAccount).not.toBeNull();
+    const walletIncrease = Number(walletAfter.balance) - Number(walletBefore.balance);
+    expect(walletIncrease).toBe(Number(sellerLeg.amount)); // Ledger SELLER_WALLET CREDIT == actual Wallet.balance increase
+    // This is this seller's very first settlement (fixture-created Wallet
+    // starts at 0, beforeAll creates no prior settlement for them), so the
+    // Ledger Account's cumulative balance equals this single leg exactly,
+    // not just "at least" — a stronger reconciliation than the general case.
+    expect(Number(sellerLedgerAccount.balance)).toBe(Number(sellerLeg.amount));
+    expect(Number(sellerLedgerAccount.balance)).toBe(Number(walletAfter.balance));
   });
 
   test('commission rounds half-up when gross * rate / 100 is not an integer', async () => {
@@ -260,6 +340,18 @@ describe('Order settlement on DELIVERED', () => {
 
     const walletAfter = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
     expect(Number(walletAfter.balance)).toBe(Number(walletBefore.balance) + Number(settlements[0].sellerEarning)); // credited exactly once
+
+    // P2.8-B — the replay-safe side of the same guarantee on the Ledger:
+    // postJournal is idempotent on (eventType, eventId) (see
+    // ledger.service.js#postJournal's own doc comment), and eventId here
+    // is settlements[0].id — the single OrderItemSettlement row the DB's
+    // orderItemId-unique constraint guaranteed above. Only one SETTLEMENT
+    // Journal (and its 3 legs) should exist for it, never two, even though
+    // two concurrent DELIVERED requests raced to settle this order.
+    const settlementJournal = await findJournal('SETTLEMENT', settlements[0].id);
+    expect(settlementJournal).not.toBeNull();
+    const settlementEntries = await entriesFor(settlementJournal.id);
+    expect(settlementEntries).toHaveLength(3); // never duplicated by the losing request
   });
 
   test('if settlement cannot resolve a commission rate, the whole transaction rolls back: order stays SENT and can be retried', async () => {
