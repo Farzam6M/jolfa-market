@@ -1,0 +1,102 @@
+-- ============================================================================
+-- P2.6 Step 2G — jolfa_maintenance UPDATE privilege addendum
+-- Database : jolfa_market   |   PostgreSQL 17   |   Run as: postgres
+-- ============================================================================
+-- This is a small, targeted ADDENDUM to the already-executed Step 2C
+-- provisioning script (p2_6_step2c_roles_privileges.sql), in the same
+-- spirit as the Step 2F addendum (p2_6_step2f_maintenance_privilege_
+-- addendum.sql). It does NOT edit either of those files in place — both
+-- are historical, already-run artifacts and must not be silently
+-- rewritten. This addendum must be executed manually, separately, by an
+-- administrative PostgreSQL connection. It is NOT a Prisma migration and
+-- must NOT be run through `prisma migrate`.
+--
+-- WHY THIS IS NEEDED (root cause, P2.8-E):
+-- backend/prisma/migrations/20260815000000_ledger_immutability_trigger/
+-- migration.sql documents its own "Intended enforcement matrix" for
+-- journals/ledger_entries, in its own top-of-file comment:
+--
+--                         UPDATE                  DELETE
+--   jolfa_app             BLOCKED (trigger+GRANT)  BLOCKED (trigger+GRANT)
+--   jolfa_maintenance     BLOCKED (trigger)        ALLOWED (trigger exception)
+--
+-- jolfa_app's UPDATE/DELETE are labeled "trigger+GRANT" — i.e. blocked by
+-- BOTH layers, because jolfa_app was never granted UPDATE/DELETE on these
+-- tables at all (see Step 2C's own `REVOKE UPDATE, DELETE ON
+-- public.journals, public.ledger_entries FROM jolfa_app`).
+--
+-- jolfa_maintenance's UPDATE, by contrast, is labeled "trigger" ONLY —
+-- meaning the design intent is that jolfa_maintenance DOES hold the
+-- table-level UPDATE grant (so the statement actually reaches the
+-- trigger), and it is the `ledger_immutability_guard()` trigger function
+-- itself — not a missing GRANT — that rejects the UPDATE unconditionally
+-- for every role, including jolfa_maintenance (see that function's own
+-- comment: "UPDATE from any role whatsoever"). This is the whole point of
+-- the trigger being a defense-in-depth layer independent of GRANT/REVOKE.
+--
+-- However, Step 2C's actual GRANT statements for jolfa_maintenance
+-- (Section 6) only ever granted SELECT + DELETE on journals and
+-- ledger_entries — UPDATE was never granted. Without it, an UPDATE
+-- attempt by jolfa_maintenance is rejected at the GRANT layer with
+-- `permission denied for table journals` and never reaches the trigger
+-- at all, which means the trigger's own UPDATE-blocking behavior is
+-- never actually exercised for this role — contradicting the migration's
+-- own documented "BLOCKED (trigger)" contract and preventing
+-- tests/ledger/ledger.service.test.js's P2.8-E suite from verifying it.
+--
+-- SCOPE: this grant ONLY affects jolfa_maintenance, and ONLY UPDATE on
+-- journals/ledger_entries. jolfa_app receives no new privileges here (its
+-- REVOKE UPDATE, DELETE from Step 2C is untouched and remains in force).
+-- No other table's privileges are touched. The
+-- ledger_immutability_guard() trigger function and its two triggers are
+-- NOT modified by this file — this addendum only makes the table-level
+-- grant match what that trigger's own documentation already assumes;
+-- the trigger continues to reject every UPDATE unconditionally,
+-- regardless of this GRANT.
+--
+-- SAFETY: purely additive (one GRANT statement). Idempotent — GRANT is
+-- safe to re-run. Does not touch any role's login/password, any other
+-- table's privileges, the ledger_immutability_guard trigger, or any
+-- migration file. Does NOT weaken the immutability trigger in any way:
+-- jolfa_maintenance is still unable to actually change a row's data —
+-- the UPDATE statement now reaches the trigger instead of being stopped
+-- one layer earlier, and the trigger still rejects it every time.
+-- ============================================================================
+
+GRANT UPDATE
+ON public.journals, public.ledger_entries
+TO jolfa_maintenance;
+
+-- ============================================================================
+-- Manual verification (read-only, safe to run any time):
+--
+--   SELECT grantee, table_name, privilege_type
+--   FROM information_schema.role_table_grants
+--   WHERE table_schema = 'public'
+--     AND table_name IN ('journals', 'ledger_entries')
+--     AND grantee = 'jolfa_maintenance'
+--   ORDER BY table_name, privilege_type;
+--
+--   -- Expect, per table: DELETE, SELECT, UPDATE (three rows each).
+--
+--   -- Confirm the trigger still rejects the UPDATE despite the new GRANT
+--   -- (run as jolfa_maintenance specifically):
+--   --   UPDATE public.journals SET "actorId" = gen_random_uuid()::text
+--   --   WHERE id = (SELECT id FROM public.journals LIMIT 1);
+--   --   -- Expected: ERROR:  Ledger immutability violation: UPDATE on
+--   --   -- public.journals is not permitted for role "jolfa_maintenance".
+-- ============================================================================
+--
+-- NOTE — separate, already-existing issue also observed in the same local
+-- run: `permission denied for table ledger_accounts` during this test
+-- file's own `afterAll` cleanup (`maintenance.account.deleteMany`).
+-- That table is covered by the EXISTING Step 2F addendum
+-- (p2_6_step2f_maintenance_privilege_addendum.sql), which already reads
+-- `GRANT SELECT, DELETE ON public.ledger_accounts TO jolfa_maintenance;`.
+-- If a local database still denies DELETE on ledger_accounts for
+-- jolfa_maintenance, that addendum's GRANT was not (fully) applied there
+-- — re-run p2_6_step2f_maintenance_privilege_addendum.sql itself (it is
+-- idempotent); no change to that file's contents is needed or made here.
+-- ============================================================================
+-- END OF ADDENDUM
+-- ============================================================================

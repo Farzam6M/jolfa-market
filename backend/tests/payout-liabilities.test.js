@@ -643,3 +643,228 @@ describe('P2.8-A — Receivable-backed liability recovery (real refund -> real s
     expect(refundReceivableLeg.account.id).toBe(creditLeg.account.id);
   });
 });
+
+/**
+ * P2.8-D1 — Financial lifecycle reconciliation: Settlement -> seller wallet
+ * credit -> existing seller liability recovery -> LIABILITY_RECOVERY
+ * posting -> Wallet/Ledger reconciliation.
+ *
+ * Every prior test in this file (and P2.8-A above) inspects one Journal's
+ * legs in isolation. This test instead reconstructs the seller's whole
+ * SELLER_WALLET Ledger Account balance from its full LedgerEntry history
+ * and proves it reconciles exactly against the real Wallet.balance — the
+ * design doc §5/§11.5 invariant the cached Account.balance column exists
+ * to uphold.
+ *
+ * The liability here is created the same way P2.8-A's is: through a REAL
+ * refund clawback shortfall, never `makeLiability()`. But unlike P2.8-A
+ * (which forces the shortfall via a raw `prisma.wallet.update({balance:
+ * 0})`, breaking the wallet/ledger identity for that seller on purpose —
+ * fine there, since P2.8-A only inspects one Journal's legs), this test
+ * needs the identity to hold from a clean start all the way through, so it
+ * forces the same shortfall a different, real way: the seller withdraws
+ * their settlement via a genuine payout first (same pattern as
+ * order-refund.test.js's "seller withdraws their full settlement via a
+ * payout..." test) — a real ledger-posting operation, not a raw column
+ * write — leaving the wallet legitimately empty when the refund lands.
+ *
+ * P2.8-D2 extends the same test in place (no new lifecycle): after the
+ * reconciliation above, it replays the DELIVERED transition that drove
+ * the recovery, through the real API/state-machine, and re-checks that
+ * the replay posts no second Journal, moves no additional Wallet balance,
+ * and that the three-way reconciliation still holds unchanged.
+ */
+describe('P2.8-D1 — Financial lifecycle reconciliation (settlement -> recovery -> wallet/ledger identity)', () => {
+  async function findJournal(eventType, eventId) {
+    return prisma.journal.findUnique({ where: { eventType_eventId: { eventType, eventId } } });
+  }
+
+  async function entriesFor(journalId) {
+    return prisma.ledgerEntry.findMany({ where: { journalId }, include: { account: true } });
+  }
+
+  test('settlement credit, real payout withdrawal, refund shortfall liability, and its recovery on a later settlement all reconcile to the real Wallet.balance', async () => {
+    // Dedicated seller/store/product/customer, isolated from every other
+    // test in this file — same rationale as P2.8-A above. This seller's
+    // wallet never receives a raw/manual balance write anywhere in this
+    // test, so the SELLER_WALLET Ledger Account's cached balance stays
+    // reconcilable against the real Wallet.balance at every step.
+    const customerD = await makeUser('CUSTOMER', uniqueMobileSuffix('22'));
+    await prisma.wallet.create({ data: { userId: customerD.user.id, balance: 100000000 } });
+    const sellerD = await makeUser('SELLER', uniqueMobileSuffix('23'));
+    await prisma.wallet.create({ data: { userId: sellerD.user.id, balance: 0 } });
+    const adminD = await makeUser('ADMIN', uniqueMobileSuffix('24'));
+    await makeApprovedStore(sellerD.user.id, 'فروشگاه تطبیق مالی');
+    const categoryD = await api.post(`${PREFIX}/categories`).set('Authorization', adminD.auth)
+      .send({ name: 'دسته تطبیق مالی', slug: `reconciliation-cat-${Date.now()}` });
+    const existingGlobal = await prisma.commissionRule.findFirst({ where: { scope: 'GLOBAL', isActive: true } });
+    if (!existingGlobal) {
+      await api.post(`${PREFIX}/admin/commission-rules`).set('Authorization', adminD.auth).send({ scope: 'GLOBAL', rate: 10 });
+    }
+    const productD = await makeApprovedProduct(sellerD.auth, adminD.auth, categoryD.body.data.id, { price: 100000, stock: 999 });
+
+    // Step 1 — REAL delivered WALLET order #1: gross=100000, commission
+    // 10% -> sellerEarning=90000, credited to the wallet via a real
+    // SETTLEMENT Journal (SELLER_WALLET CREDIT leg).
+    const { order: firstOrder } = await payAndDeliverOrder(customerD.auth, adminD.auth, productD, 1);
+    const firstItem = firstOrder.items[0];
+    const firstSettlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: firstItem.id } });
+    expect(Number(firstSettlement.sellerEarning)).toBe(90000);
+
+    const walletAfterFirstSettlement = await prisma.wallet.findUnique({ where: { userId: sellerD.user.id } });
+    expect(Number(walletAfterFirstSettlement.balance)).toBe(90000);
+
+    // Step 2 — REAL payout withdrawal of the full balance (Phase 5
+    // createPayout — posts a real PAYOUT_RESERVE Journal, SELLER_WALLET
+    // DEBIT leg), leaving the wallet legitimately empty.
+    const payoutRes = await api.post(`${PREFIX}/payouts`).set('Authorization', sellerD.auth).send({
+      amount: 90000,
+      bankAccountHolder: 'علی رضایی',
+      bankIban: 'IR820540102680020817909002',
+      bankCardNumber: '6037991234567890',
+    });
+    expect(payoutRes.status).toBe(201);
+    const walletAfterPayout = await prisma.wallet.findUnique({ where: { userId: sellerD.user.id } });
+    expect(Number(walletAfterPayout.balance)).toBe(0);
+
+    // Step 3 — REAL refund of order #1. The wallet has nothing left, so
+    // the full 90000 clawback shortfalls: a receivable-backed
+    // SellerPayoutLiability is created for the uncollected remainder (no
+    // additional SELLER_WALLET leg is posted here — there is nothing left
+    // to debit).
+    const refundRes = await api.post(`${PREFIX}/orders/${firstOrder.id}/refund`).set('Authorization', adminD.auth)
+      .send({ items: [{ orderItemId: firstItem.id, qty: 1 }] });
+    expect(refundRes.status).toBe(200);
+
+    const refund = await prisma.paymentRefund.findUnique({ where: { id: refundRes.body.data.refund.id } });
+    const liability = await prisma.sellerPayoutLiability.findFirst({
+      where: { orderId: firstOrder.id, sellerId: sellerD.user.id, refundId: refund.id },
+    });
+    expect(liability).not.toBeNull();
+    expect(liability.status).toBe('OUTSTANDING');
+    expect(Number(liability.amount)).toBe(90000);
+
+    const walletAfterRefund = await prisma.wallet.findUnique({ where: { userId: sellerD.user.id } });
+    expect(Number(walletAfterRefund.balance)).toBe(0); // never went negative, nothing to give back from an empty wallet
+
+    // Step 4 — REAL future settlement for the same seller (order #2, same
+    // gross/commission), recovering the existing liability. postSettlement
+    // posts the FULL sellerEarning as a SELLER_WALLET CREDIT; because the
+    // liability exactly equals that earning, recoverSellerLiabilities'
+    // own LIABILITY_RECOVERY Journal then debits the SAME amount straight
+    // back out — nothing left over for the wallet.
+    const { order: secondOrder } = await payAndDeliverOrder(customerD.auth, adminD.auth, productD, 1);
+    const secondItem = secondOrder.items[0];
+    const secondSettlement = await prisma.orderItemSettlement.findUnique({ where: { orderItemId: secondItem.id } });
+    expect(Number(secondSettlement.sellerEarning)).toBe(90000);
+
+    const liabilityAfter = await prisma.sellerPayoutLiability.findUnique({ where: { id: liability.id } });
+    expect(liabilityAfter.status).toBe('RECOVERED');
+    expect(Number(liabilityAfter.amount)).toBe(0);
+
+    const walletFinal = await prisma.wallet.findUnique({ where: { userId: sellerD.user.id } });
+    expect(Number(walletFinal.balance)).toBe(0); // fully absorbed by the liability, nothing credited
+
+    // --- Reconciliation ---------------------------------------------
+
+    // 1) Read the seller Wallet, the seller SELLER_WALLET Ledger Account,
+    // and every LedgerEntry row posted against that account.
+    const sellerLedgerAccount = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'SELLER_WALLET', ownerId: sellerD.user.id, currency: 'TMN' } },
+    });
+    expect(sellerLedgerAccount).not.toBeNull();
+    const sellerLedgerEntries = await prisma.ledgerEntry.findMany({ where: { accountId: sellerLedgerAccount.id } });
+    // The four legs posted above: SETTLEMENT #1 CREDIT, PAYOUT_RESERVE
+    // DEBIT, SETTLEMENT #2 CREDIT, LIABILITY_RECOVERY DEBIT. The refund's
+    // own REFUND Journal posts no SELLER_WALLET leg (full shortfall).
+    expect(sellerLedgerEntries).toHaveLength(4);
+
+    // 2) Reconstruct the seller Ledger balance from that LedgerEntry
+    // history: SUM(CREDIT) - SUM(DEBIT).
+    const reconstructedBalance = sellerLedgerEntries.reduce(
+      (sum, e) => sum + (e.direction === 'CREDIT' ? Number(e.amount) : -Number(e.amount)),
+      0,
+    );
+    expect(reconstructedBalance).toBe(0); // 90000 - 90000 + 90000 - 90000
+
+    // 3) reconstructed Ledger balance === Account.balance (the cached column).
+    expect(reconstructedBalance).toBe(Number(sellerLedgerAccount.balance));
+
+    // 4) Account.balance === actual Wallet.balance.
+    expect(Number(sellerLedgerAccount.balance)).toBe(Number(walletFinal.balance));
+
+    // 5) The recovery settlement's SETTLEMENT CREDIT and LIABILITY_RECOVERY
+    // DEBIT together equal the actual seller wallet increase across that
+    // settlement (here: fully offsetting, so the increase is exactly 0).
+    const secondSettlementJournal = await findJournal('SETTLEMENT', secondSettlement.id);
+    const secondSettlementEntries = await entriesFor(secondSettlementJournal.id);
+    const secondSettlementSellerLeg = secondSettlementEntries.find((e) => e.account.ownerType === 'SELLER_WALLET');
+    expect(secondSettlementSellerLeg.direction).toBe('CREDIT');
+    expect(Number(secondSettlementSellerLeg.amount)).toBe(90000);
+
+    const recoveryJournal = await findJournal('LIABILITY_RECOVERY', `${secondSettlement.id}:${liability.id}`);
+    expect(recoveryJournal).not.toBeNull();
+    const recoveryEntries = await entriesFor(recoveryJournal.id);
+    const recoveryDebitLeg = recoveryEntries.find((e) => e.direction === 'DEBIT');
+    const recoveryCreditLeg = recoveryEntries.find((e) => e.direction === 'CREDIT');
+    expect(recoveryDebitLeg.account.ownerType).toBe('SELLER_WALLET');
+    expect(Number(recoveryDebitLeg.amount)).toBe(90000);
+
+    const walletIncreaseAcrossRecoverySettlement = Number(walletFinal.balance) - Number(walletAfterRefund.balance);
+    expect(Number(secondSettlementSellerLeg.amount) - Number(recoveryDebitLeg.amount)).toBe(walletIncreaseAcrossRecoverySettlement);
+
+    // 6) The LIABILITY_RECOVERY Journal itself: DEBIT SELLER_WALLET,
+    // CREDIT PLATFORM_RECEIVABLE (this liability's ledgerReceivableEntryId
+    // was set by the real refund shortfall in step 3), balanced totals.
+    expect(recoveryEntries).toHaveLength(2);
+    expect(recoveryDebitLeg.account.ownerId).toBe(sellerD.user.id);
+    expect(recoveryCreditLeg.account.ownerType).toBe('PLATFORM_RECEIVABLE');
+    expect(recoveryCreditLeg.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(Number(recoveryCreditLeg.amount)).toBe(90000);
+    const recoveryDebitTotal = recoveryEntries.filter((e) => e.direction === 'DEBIT').reduce((s, e) => s + Number(e.amount), 0);
+    const recoveryCreditTotal = recoveryEntries.filter((e) => e.direction === 'CREDIT').reduce((s, e) => s + Number(e.amount), 0);
+    expect(recoveryDebitTotal).toBe(recoveryCreditTotal);
+
+    // --- P2.8-D2: replay idempotency ---------------------------------
+    //
+    // Replay the SAME DELIVERED transition that drove step 4's settlement
+    // + recovery above, through the real API/state-machine mechanism (no
+    // direct Journal/LedgerEntry manipulation). By the time this runs,
+    // secondOrder.status is already DELIVERED, so ORDER_TRANSITIONS
+    // (DELIVERED: []) rejects the replay before settleDeliveredOrder can
+    // run a second time — see orders.service.js#updateStatus's own
+    // ORDER_TRANSITIONS check, the same guard payouts.service.js's
+    // assertIdempotentOrThrowInvalidTransition mirrors for payouts.
+    const replayRes = await api.patch(`${PREFIX}/orders/${secondOrder.id}/status`).set('Authorization', adminD.auth).send({ status: 'DELIVERED' });
+    expect(replayRes.status).toBe(409);
+
+    // No second LIABILITY_RECOVERY Journal for the same eventType/eventId.
+    const recoveryJournalsAfterReplay = await prisma.journal.findMany({
+      where: { eventType: 'LIABILITY_RECOVERY', eventId: `${secondSettlement.id}:${liability.id}` },
+    });
+    expect(recoveryJournalsAfterReplay).toHaveLength(1);
+
+    // No additional Wallet movement.
+    const walletAfterReplay = await prisma.wallet.findUnique({ where: { userId: sellerD.user.id } });
+    expect(Number(walletAfterReplay.balance)).toBe(Number(walletFinal.balance));
+
+    // Re-read Wallet.balance, the SELLER_WALLET Account.balance, and the
+    // full LedgerEntry history, and recompute SUM(CREDIT) - SUM(DEBIT).
+    const sellerLedgerAccountAfterReplay = await prisma.account.findUnique({
+      where: { ownerType_ownerId_currency: { ownerType: 'SELLER_WALLET', ownerId: sellerD.user.id, currency: 'TMN' } },
+    });
+    const sellerLedgerEntriesAfterReplay = await prisma.ledgerEntry.findMany({ where: { accountId: sellerLedgerAccountAfterReplay.id } });
+    expect(sellerLedgerEntriesAfterReplay).toHaveLength(4); // still the same 4 legs — nothing new posted by the rejected replay
+
+    const reconstructedBalanceAfterReplay = sellerLedgerEntriesAfterReplay.reduce(
+      (sum, e) => sum + (e.direction === 'CREDIT' ? Number(e.amount) : -Number(e.amount)),
+      0,
+    );
+    expect(reconstructedBalanceAfterReplay).toBe(reconstructedBalance); // unchanged from before the replay
+
+    // All three remain identical after the replay: reconstructed Ledger
+    // balance === Account.balance === Wallet.balance.
+    expect(reconstructedBalanceAfterReplay).toBe(Number(sellerLedgerAccountAfterReplay.balance));
+    expect(Number(sellerLedgerAccountAfterReplay.balance)).toBe(Number(walletAfterReplay.balance));
+  });
+});

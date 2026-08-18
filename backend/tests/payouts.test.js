@@ -38,9 +38,22 @@ const crypto = require('crypto');
 const app = require('../src/app');
 const { prisma } = require('../src/config/database');
 const { signAccessToken } = require('../src/utils/tokens');
+const { PLATFORM_LEDGER_OWNER_ID } = require('../src/modules/ledger/ledger.constants');
 
 const api = request(app);
 const PREFIX = process.env.API_PREFIX || '/api/v1';
+
+// P2.8-C — small Ledger lookup helpers, same shape as
+// order-settlement.test.js / payout-liabilities.test.js's own
+// findJournal/entriesFor helpers (kept local rather than shared/exported,
+// matching those files' own approach).
+async function findJournal(eventType, eventId) {
+  return prisma.journal.findUnique({ where: { eventType_eventId: { eventType, eventId } } });
+}
+
+async function entriesFor(journalId) {
+  return prisma.ledgerEntry.findMany({ where: { journalId }, include: { account: true } });
+}
 
 let roles;
 
@@ -103,6 +116,34 @@ describe('POST /payouts (create — reserve)', () => {
     });
     expect(tx).toBeTruthy();
     expect(Number(tx.amount)).toBe(100000);
+
+    // P2.8-C — PAYOUT_RESERVE Journal: eventId = the real PayoutRequest.id
+    // (createPayout's own postPayoutReserve call — see payouts.service.js).
+    const reserveJournal = await findJournal('PAYOUT_RESERVE', res.body.data.id);
+    expect(reserveJournal).not.toBeNull();
+
+    const reserveEntries = await entriesFor(reserveJournal.id);
+    // Two legs per ledger.constants.js's PAYOUT_RESERVE mapping: DEBIT
+    // SELLER_WALLET(sellerId) / CREDIT PAYOUT_CLEARING(PLATFORM).
+    expect(reserveEntries).toHaveLength(2);
+
+    const sellerLeg = reserveEntries.find((e) => e.account.ownerType === 'SELLER_WALLET');
+    expect(sellerLeg).toBeDefined();
+    expect(sellerLeg.direction).toBe('DEBIT');
+    expect(sellerLeg.account.ownerId).toBe(seller.user.id);
+    expect(Number(sellerLeg.amount)).toBe(100000); // matches the real wallet debit above
+
+    const clearingLeg = reserveEntries.find((e) => e.account.ownerType === 'PAYOUT_CLEARING');
+    expect(clearingLeg).toBeDefined();
+    expect(clearingLeg.direction).toBe('CREDIT');
+    expect(clearingLeg.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(Number(clearingLeg.amount)).toBe(100000);
+
+    // Balanced: SUM(DEBIT) === SUM(CREDIT).
+    const debitTotal = reserveEntries.filter((e) => e.direction === 'DEBIT').reduce((sum, e) => sum + Number(e.amount), 0);
+    const creditTotal = reserveEntries.filter((e) => e.direction === 'CREDIT').reduce((sum, e) => sum + Number(e.amount), 0);
+    expect(debitTotal).toBe(creditTotal);
+    expect(debitTotal).toBe(100000);
   });
 
   test('rejects with 400 and reserves nothing when balance is insufficient', async () => {
@@ -133,6 +174,13 @@ describe('POST /payouts (create — reserve)', () => {
 
     const count = await prisma.payoutRequest.count({ where: { idempotencyKey } });
     expect(count).toBe(1);
+
+    // P2.8-C — idempotency: a retried transition for the same eventId must
+    // NOT create a second Journal for the same eventType/eventId.
+    const reserveJournals = await prisma.journal.findMany({
+      where: { eventType: 'PAYOUT_RESERVE', eventId: first.body.data.id },
+    });
+    expect(reserveJournals).toHaveLength(1);
   });
 
   test('idempotencyKey: concurrent creates with the same key resolve to exactly one payout and one DEBIT, never a raw duplicate-key error', async () => {
@@ -272,11 +320,47 @@ describe('Admin transitions', () => {
     const walletAfterReject = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
     expect(Number(walletAfterReject.balance)).toBe(Number(walletStart.balance));
 
+    // P2.8-C — PAYOUT_RELEASE Journal: same eventId (PayoutRequest.id) as
+    // the PAYOUT_RESERVE Journal posted at create time (releaseReservation's
+    // own postPayoutRelease call — see payouts.service.js).
+    const releaseJournal = await findJournal('PAYOUT_RELEASE', id);
+    expect(releaseJournal).not.toBeNull();
+
+    const releaseEntries = await entriesFor(releaseJournal.id);
+    // Two legs per ledger.constants.js's PAYOUT_RELEASE mapping — the
+    // exact reverse of PAYOUT_RESERVE: DEBIT PAYOUT_CLEARING(PLATFORM) /
+    // CREDIT SELLER_WALLET(sellerId).
+    expect(releaseEntries).toHaveLength(2);
+
+    const clearingLeg = releaseEntries.find((e) => e.account.ownerType === 'PAYOUT_CLEARING');
+    expect(clearingLeg).toBeDefined();
+    expect(clearingLeg.direction).toBe('DEBIT');
+    expect(clearingLeg.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(Number(clearingLeg.amount)).toBe(30000);
+
+    const sellerLeg = releaseEntries.find((e) => e.account.ownerType === 'SELLER_WALLET');
+    expect(sellerLeg).toBeDefined();
+    expect(sellerLeg.direction).toBe('CREDIT');
+    expect(sellerLeg.account.ownerId).toBe(seller.user.id);
+    expect(Number(sellerLeg.amount)).toBe(30000); // matches the real wallet credit above
+
+    // Balanced: SUM(DEBIT) === SUM(CREDIT).
+    const releaseDebitTotal = releaseEntries.filter((e) => e.direction === 'DEBIT').reduce((sum, e) => sum + Number(e.amount), 0);
+    const releaseCreditTotal = releaseEntries.filter((e) => e.direction === 'CREDIT').reduce((sum, e) => sum + Number(e.amount), 0);
+    expect(releaseDebitTotal).toBe(releaseCreditTotal);
+    expect(releaseDebitTotal).toBe(30000);
+
     // Retried reject on an already-REJECTED row must be a no-op — no second credit.
     const second = await api.patch(`${PREFIX}/admin/payouts/${id}/reject`).set('Authorization', admin.auth).send({ reason: 'تکراری' });
     expect(second.status).toBe(200);
     const walletAfterRetry = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
     expect(Number(walletAfterRetry.balance)).toBe(Number(walletStart.balance));
+
+    // P2.8-C — idempotency: the repeated REQUESTED->REJECTED transition
+    // above must NOT create a second Journal for the same
+    // eventType/eventId (PAYOUT_RELEASE, id).
+    const releaseJournalsAfterRetry = await prisma.journal.findMany({ where: { eventType: 'PAYOUT_RELEASE', eventId: id } });
+    expect(releaseJournalsAfterRetry).toHaveLength(1);
   });
 
   test('mark-processed: APPROVED -> PROCESSED, no wallet movement', async () => {
@@ -292,6 +376,41 @@ describe('Admin transitions', () => {
 
     const walletAfter = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
     expect(Number(walletAfter.balance)).toBe(Number(walletBefore.balance));
+
+    // P2.8-C — PAYOUT_PROCESSED Journal: same eventId (PayoutRequest.id)
+    // as the PAYOUT_RESERVE Journal posted at create time (markProcessed's
+    // own postPayoutProcessed call — see payouts.service.js).
+    const processedJournal = await findJournal('PAYOUT_PROCESSED', id);
+    expect(processedJournal).not.toBeNull();
+
+    const processedEntries = await entriesFor(processedJournal.id);
+    // Two legs per ledger.constants.js's PAYOUT_PROCESSED mapping, both
+    // platform-owned: DEBIT PAYOUT_CLEARING(PLATFORM) / CREDIT
+    // PLATFORM_CASH(PLATFORM). No SELLER_WALLET leg — markProcessed's own
+    // doc comment: "the money already left the seller's wallet at
+    // REQUESTED time", matching the unchanged wallet balance above.
+    expect(processedEntries).toHaveLength(2);
+
+    const sellerWalletLeg = processedEntries.find((e) => e.account.ownerType === 'SELLER_WALLET');
+    expect(sellerWalletLeg).toBeUndefined(); // no additional SELLER_WALLET movement at this stage
+
+    const clearingLeg = processedEntries.find((e) => e.account.ownerType === 'PAYOUT_CLEARING');
+    expect(clearingLeg).toBeDefined();
+    expect(clearingLeg.direction).toBe('DEBIT');
+    expect(clearingLeg.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(Number(clearingLeg.amount)).toBe(40000);
+
+    const cashLeg = processedEntries.find((e) => e.account.ownerType === 'PLATFORM_CASH');
+    expect(cashLeg).toBeDefined();
+    expect(cashLeg.direction).toBe('CREDIT');
+    expect(cashLeg.account.ownerId).toBe(PLATFORM_LEDGER_OWNER_ID);
+    expect(Number(cashLeg.amount)).toBe(40000);
+
+    // Balanced: SUM(DEBIT) === SUM(CREDIT).
+    const processedDebitTotal = processedEntries.filter((e) => e.direction === 'DEBIT').reduce((sum, e) => sum + Number(e.amount), 0);
+    const processedCreditTotal = processedEntries.filter((e) => e.direction === 'CREDIT').reduce((sum, e) => sum + Number(e.amount), 0);
+    expect(processedDebitTotal).toBe(processedCreditTotal);
+    expect(processedDebitTotal).toBe(40000);
   });
 
   test('mark-failed: APPROVED -> FAILED returns the reserved amount', async () => {
@@ -474,6 +593,12 @@ describe('Admin transitions', () => {
       expect(after.processedAt.getTime()).toBe(before.processedAt.getTime());
       const walletAfter = await prisma.wallet.findUnique({ where: { userId: seller.user.id } });
       expect(Number(walletAfter.balance)).toBe(Number(walletBefore.balance));
+
+      // P2.8-C — idempotency: the repeated APPROVED->PROCESSED transition
+      // above must NOT create a second Journal for the same
+      // eventType/eventId (PAYOUT_PROCESSED, id).
+      const processedJournals = await prisma.journal.findMany({ where: { eventType: 'PAYOUT_PROCESSED', eventId: id } });
+      expect(processedJournals).toHaveLength(1);
     });
 
     test('mark-processed: on REQUESTED -> invalid transition (409), nothing changes', async () => {

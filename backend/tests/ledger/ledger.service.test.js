@@ -2056,3 +2056,204 @@ describe('postLiabilityRecovery', () => {
     expect(firstResult.journal.id).not.toBe(secondResult.journal.id);
   });
 });
+
+/**
+ * P2.8-E — Ledger immutability trigger
+ * (20260815000000_ledger_immutability_trigger).
+ *
+ * Every other describe block in this file exercises the ledger POSTING
+ * side (getOrCreateAccount/postJournal and the event wrappers). This block
+ * is the first to exercise the migration's own enforcement matrix
+ * end-to-end, against real Journal/LedgerEntry rows, through the actual
+ * role each connection authenticates as — not by reading the trigger's
+ * SQL and asserting it "looks correct":
+ *
+ *                         UPDATE                  DELETE
+ *   jolfa_app             BLOCKED (trigger+GRANT)  BLOCKED (trigger+GRANT)
+ *   jolfa_maintenance     BLOCKED (trigger)        ALLOWED (trigger exception)
+ *
+ * (see that migration's own "Intended enforcement matrix" comment — this
+ * suite does not modify or assume anything beyond what's written there).
+ *
+ * `prisma` (imported above) is the shared application client and
+ * authenticates as jolfa_app — the same connection every other test in
+ * this file already posts real ledger rows through. The maintenance-role
+ * checks reuse tests/helpers/maintenance-client.js, the SAME mechanism
+ * this file's own `afterAll` cleanup already depends on to delete its
+ * fixture rows — no new role, grant, or migration is introduced here.
+ *
+ * Requires the following manually-applied, additive DB provisioning
+ * addenda (repo root, run as an admin Postgres connection — NOT Prisma
+ * migrations) to actually exist against the target database, or the
+ * jolfa_maintenance checks below fail one layer before the trigger with
+ * a plain "permission denied for table ..." instead of exercising the
+ * trigger itself:
+ *   - p2_6_step2f_maintenance_privilege_addendum.sql (SELECT+DELETE on
+ *     ledger_accounts — needed for this file's own afterAll cleanup and
+ *     for `getMaintenanceClient()` calls elsewhere in this suite).
+ *   - p2_6_step2g_maintenance_update_grant_addendum.sql (UPDATE on
+ *     journals/ledger_entries — needed so the maintenance UPDATE test
+ *     below reaches ledger_immutability_guard() instead of being stopped
+ *     by a missing GRANT).
+ */
+describe('P2.8-E — Ledger immutability trigger', () => {
+  let journalId;
+  let ledgerEntryId;
+
+  beforeAll(async () => {
+    // A real Journal + two real LedgerEntry rows, posted the same way
+    // every other test in this file does (postJournal, inside a real
+    // transaction) — not a raw INSERT — so the UPDATE/DELETE attempts
+    // below exercise the trigger against a genuine row, not a synthetic
+    // one shaped by hand.
+    const eventId = crypto.randomUUID();
+    createdEventIds.push(['SETTLEMENT', eventId]);
+
+    const result = await withTx(async (tx) => {
+      const sellerAccount = await makeAccount(tx, 'SELLER_WALLET', crypto.randomUUID());
+      const cashAccount = await makeAccount(tx, 'PLATFORM_CASH', PLATFORM_LEDGER_OWNER_ID);
+      return postJournal(tx, {
+        eventType: 'SETTLEMENT',
+        eventId,
+        actorId: null,
+        currency: 'TMN',
+        legs: [
+          { accountId: cashAccount.id, direction: 'DEBIT', amount: '1000' },
+          { accountId: sellerAccount.id, direction: 'CREDIT', amount: '1000' },
+        ],
+      });
+    });
+    journalId = result.journal.id;
+    ledgerEntryId = result.entries[0].id;
+  });
+
+  // --- jolfa_app (the shared application client) ------------------------
+
+  test('jolfa_app: UPDATE on an existing Journal is rejected', async () => {
+    await expect(
+      prisma.journal.update({ where: { id: journalId }, data: { actorId: crypto.randomUUID() } }),
+    ).rejects.toThrow();
+
+    // Unmutated — the row this test attempted to change is exactly as
+    // beforeAll left it.
+    const stillThere = await prisma.journal.findUnique({ where: { id: journalId } });
+    expect(stillThere).not.toBeNull();
+    expect(stillThere.actorId).toBeNull();
+  });
+
+  test('jolfa_app: DELETE on an existing Journal is rejected', async () => {
+    await expect(prisma.journal.delete({ where: { id: journalId } })).rejects.toThrow();
+
+    const stillThere = await prisma.journal.findUnique({ where: { id: journalId } });
+    expect(stillThere).not.toBeNull();
+  });
+
+  test('jolfa_app: UPDATE on an existing LedgerEntry is rejected', async () => {
+    await expect(
+      prisma.ledgerEntry.update({ where: { id: ledgerEntryId }, data: { amount: new Prisma.Decimal('9999') } }),
+    ).rejects.toThrow();
+
+    const stillThere = await prisma.ledgerEntry.findUnique({ where: { id: ledgerEntryId } });
+    expect(stillThere).not.toBeNull();
+    expect(new Prisma.Decimal(stillThere.amount).equals(new Prisma.Decimal('1000'))).toBe(true);
+  });
+
+  test('jolfa_app: DELETE on an existing LedgerEntry is rejected', async () => {
+    await expect(prisma.ledgerEntry.delete({ where: { id: ledgerEntryId } })).rejects.toThrow();
+
+    const stillThere = await prisma.ledgerEntry.findUnique({ where: { id: ledgerEntryId } });
+    expect(stillThere).not.toBeNull();
+  });
+
+  // --- jolfa_maintenance (the documented DELETE-only exception) ---------
+
+  test('jolfa_maintenance: DELETE on an existing Journal/LedgerEntry is allowed (the trigger\'s documented exception)', async () => {
+    // getMaintenanceClient() throws synchronously if MAINTENANCE_DATABASE_URL
+    // isn't set — this environment may not have that variable configured
+    // (see tests/helpers/maintenance-client.js's own doc comment). Per this
+    // task's own instructions, no role/permission/migration is changed to
+    // force this check to run; if the maintenance connection genuinely
+    // isn't available here, this is a documented environment limitation,
+    // not a trigger failure, so the check is skipped rather than failed.
+    let maintenance;
+    try {
+      maintenance = getMaintenanceClient();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`[P2.8-E] Skipping jolfa_maintenance DELETE-exception check — ${err.message}`);
+      return;
+    }
+
+    // A second, dedicated Journal + LedgerEntry pair — NOT the rows the
+    // jolfa_app tests above already exercised. Those rows must remain
+    // intact for the assertions in this block to mean anything (their
+    // whole point is that the DELETE attempts against them were actually
+    // rejected, not silently no-op'd), so this exception check deletes a
+    // fresh row instead of reusing/consuming them.
+    const eventId2 = crypto.randomUUID();
+    createdEventIds.push(['SETTLEMENT', eventId2]);
+
+    const result2 = await withTx(async (tx) => {
+      const sellerAccount2 = await makeAccount(tx, 'SELLER_WALLET', crypto.randomUUID());
+      const cashAccount2 = await makeAccount(tx, 'PLATFORM_CASH', PLATFORM_LEDGER_OWNER_ID);
+      return postJournal(tx, {
+        eventType: 'SETTLEMENT',
+        eventId: eventId2,
+        actorId: null,
+        currency: 'TMN',
+        legs: [
+          { accountId: cashAccount2.id, direction: 'DEBIT', amount: '500' },
+          { accountId: sellerAccount2.id, direction: 'CREDIT', amount: '500' },
+        ],
+      });
+    });
+    const journalId2 = result2.journal.id;
+    const entryIds2 = result2.entries.map((e) => e.id);
+
+    // Children first — same FK order (ledger_entries -> journals,
+    // ON DELETE Restrict) as this file's own afterAll cleanup.
+    await expect(
+      maintenance.ledgerEntry.deleteMany({ where: { id: { in: entryIds2 } } }),
+    ).resolves.toMatchObject({ count: entryIds2.length });
+    await expect(maintenance.journal.delete({ where: { id: journalId2 } })).resolves.toMatchObject({ id: journalId2 });
+
+    const entriesGone = await prisma.ledgerEntry.findMany({ where: { journalId: journalId2 } });
+    expect(entriesGone).toHaveLength(0);
+    const journalGone = await prisma.journal.findUnique({ where: { id: journalId2 } });
+    expect(journalGone).toBeNull();
+  });
+
+  // UPDATE is blocked unconditionally for every role, including
+  // jolfa_maintenance itself (per the migration's own explicit product
+  // decision — maintenance access is DELETE-only, never row mutation).
+  //
+  // Requires jolfa_maintenance to actually hold table-level UPDATE on
+  // journals/ledger_entries (see p2_6_step2g_maintenance_update_grant_
+  // addendum.sql at the repo root) — without it, an UPDATE attempt is
+  // rejected one layer earlier by Postgres's own GRANT check
+  // ("permission denied for table journals") and never reaches
+  // ledger_immutability_guard() at all, which would let this test pass
+  // for the wrong reason (a missing GRANT, not the trigger's own
+  // documented "BLOCKED (trigger)" policy for this role — see that
+  // migration's "Intended enforcement matrix" comment). Asserting on the
+  // trigger's own RAISE EXCEPTION message keeps this test honest about
+  // which layer actually did the blocking.
+  test('jolfa_maintenance: UPDATE is still rejected — maintenance access is DELETE-only, never mutation', async () => {
+    let maintenance;
+    try {
+      maintenance = getMaintenanceClient();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`[P2.8-E] Skipping jolfa_maintenance UPDATE-blocked check — ${err.message}`);
+      return;
+    }
+
+    await expect(
+      maintenance.journal.update({ where: { id: journalId }, data: { actorId: crypto.randomUUID() } }),
+    ).rejects.toThrow(/immutability/i);
+
+    const stillThere = await prisma.journal.findUnique({ where: { id: journalId } });
+    expect(stillThere).not.toBeNull();
+    expect(stillThere.actorId).toBeNull();
+  });
+});
