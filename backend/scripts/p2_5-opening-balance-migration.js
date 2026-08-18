@@ -154,12 +154,24 @@
  * and exits 0 on success (including when some records were skipped/
  * unresolved — that is expected, not a failure) or exits 1 only if the
  * script itself could not run to completion (e.g. lost DB connectivity).
+ *
+ * P2.10-A — the SAME summary object is also persisted as a timestamped
+ * JSON file under scripts/p2_5-evidence/ (git-ignored — see
+ * scripts/lib/evidence-report.js and scripts/P2_5_OPENING_BALANCE.md),
+ * stamped `mode: 'EXECUTION'` and a safe (host/port/database-name-only,
+ * never credentials) `databaseTarget`. This is the durable, auditable
+ * record that a real execution — as opposed to a preflight — actually
+ * happened, and against which database. Preflight
+ * (scripts/p2_5-preflight-readonly.js) writes its own report the same
+ * way, stamped `mode: 'PREFLIGHT'`, to the same directory but with a
+ * filename that can never be confused with an execution report.
  */
 
 const { prisma } = require('../src/config/database');
 const { Prisma } = require('@prisma/client');
 const { getOrCreateAccount, postOpeningBalance } = require('../src/modules/ledger/ledger.service');
 const { PLATFORM_LEDGER_OWNER_ID, LEDGER_CURRENCY } = require('../src/modules/ledger/ledger.constants');
+const { getSafeDatabaseTarget, writeEvidenceReport } = require('./lib/evidence-report');
 
 /**
  * Phase A — capture the fixed cutover snapshot.
@@ -306,7 +318,15 @@ async function ensurePlatformAccounts() {
 }
 
 async function runMigration() {
+  // P2.10-A — evidence fields. `mode: 'EXECUTION'` is a fixed literal
+  // (never derived from a flag) so this report can never be confused
+  // with scripts/p2_5-preflight-readonly.js's read-only report, which
+  // stamps 'PREFLIGHT' the same way. `databaseTarget` is host/port/
+  // database name ONLY (see lib/evidence-report.js) — never a credential.
   const summary = {
+    mode: 'EXECUTION',
+    generatedAt: new Date().toISOString(),
+    databaseTarget: getSafeDatabaseTarget(),
     cutoverAt: null,
     walletsConsidered: 0,
     accountsCreated: 0,
@@ -452,6 +472,22 @@ async function runMigration() {
 
   console.log('[P2.5] Step 8/9 — reconciliation + summary.');
   console.log(JSON.stringify(summary, null, 2));
+
+  // P2.10-A — durable local evidence. Writing this report is separate
+  // from, and never a precondition for, the migration work above (which
+  // has already fully committed by this point, one account at a time).
+  // A failure here is a reporting problem, not a reason to make this
+  // script exit non-zero for what was otherwise a successful run — but
+  // it IS loud (stderr + a field on the in-memory summary the caller can
+  // still inspect), never silent.
+  try {
+    const reportPath = writeEvidenceReport('p2_5-opening-balance-migration', 'EXECUTION', summary);
+    summary.evidenceReportPath = reportPath;
+    console.log(`[P2.5] Evidence report written: ${reportPath}`);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(`[P2.5] WARNING: migration completed but the evidence report could not be written: ${err.message}`);
+  }
 
   return summary;
 }

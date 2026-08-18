@@ -36,6 +36,13 @@
  * connection itself fails (no DATABASE_URL, secrets, or other connection
  * details are ever printed).
  *
+ * P2.10-A — this report is also persisted as a timestamped JSON file
+ * under scripts/p2_5-evidence/ (git-ignored — see
+ * scripts/lib/evidence-report.js and scripts/P2_5_OPENING_BALANCE.md),
+ * stamped `mode: 'PREFLIGHT'` and a safe (host/port/database-name-only)
+ * `databaseTarget`, so it can never be confused on disk with a real
+ * scripts/p2_5-opening-balance-migration.js execution report.
+ *
  * ============================================================================
  * PRIVACY
  * ============================================================================
@@ -48,6 +55,7 @@
 const { prisma } = require('../src/config/database');
 const { classifyOwnerType } = require('./p2_5-opening-balance-migration');
 const { PLATFORM_LEDGER_OWNER_ID, LEDGER_CURRENCY } = require('../src/modules/ledger/ledger.constants');
+const { getSafeDatabaseTarget, writeEvidenceReport } = require('./lib/evidence-report');
 
 /**
  * SOURCE OF TRUTH: p2_5-opening-balance-migration.js's own
@@ -88,7 +96,15 @@ async function findTargetAccount(ownerType, ownerId, currency) {
 }
 
 async function main() {
+  // P2.10-A — evidence fields. `mode: 'EXECUTION'` is deliberately NEVER
+  // used here — this script never writes financial state, and a fixed
+  // 'PREFLIGHT' literal makes that unambiguous both in this JSON and in
+  // the evidence filename written below, so a preflight run can never be
+  // mistaken for (or claimed as) a real opening-balance execution.
   const report = {
+    mode: 'PREFLIGHT',
+    generatedAt: new Date().toISOString(),
+    databaseTarget: getSafeDatabaseTarget(),
     databaseConnected: false,
     wallets: {
       total: 0, positive: 0, zero: 0, negative: 0,
@@ -262,6 +278,20 @@ async function main() {
     report.platformCash.ledgerEntryCount = await prisma.ledgerEntry.count({
       where: { accountId: platformCash.id },
     });
+  }
+
+  // P2.10-A — durable local evidence, same mechanism and directory as the
+  // real migration script's execution report (scripts/lib/evidence-report.js),
+  // but stamped 'PREFLIGHT' and named accordingly — never mistakable for
+  // an execution report on disk. A write failure here is reported to
+  // stderr but does not change this script's exit code; it never wrote
+  // to the database either way.
+  try {
+    const reportPath = writeEvidenceReport('p2_5-opening-balance-migration', 'PREFLIGHT', report);
+    report.evidenceReportPath = reportPath;
+    process.stderr.write(`[P2.5 Preflight] Evidence report written: ${reportPath}\n`);
+  } catch (err) {
+    process.stderr.write(`[P2.5 Preflight] WARNING: preflight completed but the evidence report could not be written: ${err.message}\n`);
   }
 
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);

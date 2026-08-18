@@ -16,6 +16,10 @@ backend/uploads/*
 logs/
 backend/logs/
 
+# P2.10-A — local P2.5 opening-balance execution/preflight evidence reports
+# (may embed a database host/port/name; never committed)
+backend/scripts/p2_5-evidence/
+
 # Coverage
 coverage/
 .nyc_output/
