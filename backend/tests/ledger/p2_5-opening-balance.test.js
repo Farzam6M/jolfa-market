@@ -57,15 +57,21 @@
  * deleting only the LedgerEntry/Journal rows this file created (as above)
  * would leave that cached balance permanently drifted by this file's own
  * posted amounts, since postJournal's balance increment/decrement is
- * independent of the LedgerEntry row itself. `beforeAll` snapshots
- * PLATFORM_CASH's pre-test { id, balance } (or records that it did not yet
- * exist); `afterAll` then either restores that exact balance (if it
- * pre-existed — this file never touches its prior Journal/LedgerEntry
- * rows, only its own tracked ones, so only the cached column needs
- * correcting) or removes the account entirely (if this file created it
- * fresh and no foreign LedgerEntry rows remain on it afterward). Net
- * effect either way: PLATFORM_CASH is left in exactly the state this file
- * found it in.
+ * independent of the LedgerEntry row itself.
+ *
+ * [P2.5 root-cause fix] `afterAll` no longer snapshots PLATFORM_CASH's
+ * pre-test balance and restores it directly — a snapshot/direct-
+ * restoration is fragile under concurrent activity on the same shared
+ * account between snapshot time and cleanup time (the exact corruption
+ * source identified in the P2.5 root-cause audit). Instead, `afterAll`
+ * reads the actual LedgerEntry rows this file's own tracked events posted
+ * to PLATFORM_CASH, computes the signed delta they caused (CREDIT
+ * increments / DEBIT decrements, matching postJournal), and reverses only
+ * that delta on the current balance — correct regardless of what other
+ * suites have concurrently posted to the same shared account. If this
+ * file created the PLATFORM_CASH account fresh and no LedgerEntry rows
+ * remain on it after this file's own rows are deleted, the row is removed
+ * entirely, same as before.
  *
  * Requires a real Postgres database (DATABASE_URL), migrated:
  *   NODE_ENV=test npx jest tests/ledger/p2_5-opening-balance.test.js --runInBand
@@ -82,15 +88,6 @@ const {
 } = require('../../scripts/p2_5-opening-balance-migration');
 
 let roles;
-// Captured in `beforeAll`, before this file posts anything — either the
-// pre-existing PLATFORM_CASH Account row's { id, balance }, or `null` if
-// no PLATFORM_CASH account existed yet. Used by `afterAll` to leave
-// PLATFORM_CASH in EXACTLY the state this file found it in: restore the
-// original cached balance if the account pre-existed (its own prior
-// Journal/LedgerEntry rows are never touched by this file's cleanup, only
-// its own tracked ones are, so only the cached balance column needs
-// correcting), or remove the account entirely if this file created it.
-let platformCashSnapshot;
 
 const createdUserIds = [];
 const createdOrderIds = [];
@@ -154,6 +151,32 @@ async function makeOrder(userId, total = '1000') {
   return order;
 }
 
+/**
+ * P2.5 root-cause fix (test contamination, not production code): reverses
+ * exactly the Account.balance delta that the given LedgerEntry rows
+ * previously caused via postJournal's cached-balance maintenance (CREDIT
+ * increments, DEBIT decrements — see ledger.service.js#postJournal), for
+ * every accountId present in `entries`. Delta-based, not snapshot/direct-
+ * restoration — see the file-level doc comment above for why that
+ * distinction matters for a shared account like PLATFORM_CASH. Runs on
+ * the shared `prisma` client (jolfa_app): Account.balance is a plain
+ * mutable cache column, not covered by the journals/ledger_entries
+ * immutability trigger, so no maintenance-role connection is needed here.
+ */
+async function reverseAccountBalanceDeltas(entries) {
+  const deltaByAccount = new Map();
+  for (const entry of entries) {
+    const amount = new Prisma.Decimal(entry.amount);
+    const signed = entry.direction === 'CREDIT' ? amount : amount.negated();
+    deltaByAccount.set(entry.accountId, (deltaByAccount.get(entry.accountId) || new Prisma.Decimal(0)).plus(signed));
+  }
+  for (const [accountId, delta] of deltaByAccount) {
+    if (delta.isZero()) continue;
+    // eslint-disable-next-line no-await-in-loop
+    await prisma.account.update({ where: { id: accountId }, data: { balance: { decrement: delta.toString() } } });
+  }
+}
+
 afterAll(async () => {
   // P2.6 Step 2F: journals/ledger_entries/ledger_accounts DELETE requires
   // the jolfa_maintenance role — the shared `prisma` client (jolfa_app)
@@ -168,6 +191,19 @@ afterAll(async () => {
     const journals = await prisma.journal.findMany({ where: journalWhere, select: { id: true } });
     const journalIds = journals.map((j) => j.id);
     if (journalIds.length > 0) {
+      // P2.5 root-cause fix: read the exact LedgerEntry rows about to be
+      // deleted BEFORE deleting them, and reverse the Account.balance
+      // delta they caused on every account. The wallet-side account leg
+      // of each of this file's own OPENING_BALANCE journals lives on an
+      // account this file already tracks in createdAccountIds (deleted
+      // outright below, so a corrected-then-deleted balance is harmless);
+      // the PLATFORM_CASH leg lives on the shared account, which
+      // genuinely needs the correction since its row survives.
+      const entriesToDelete = await prisma.ledgerEntry.findMany({
+        where: { journalId: { in: journalIds } },
+        select: { accountId: true, direction: true, amount: true },
+      });
+      await reverseAccountBalanceDeltas(entriesToDelete);
       await maintenance.ledgerEntry.deleteMany({ where: { journalId: { in: journalIds } } });
     }
     await maintenance.journal.deleteMany({ where: journalWhere });
@@ -183,40 +219,33 @@ afterAll(async () => {
   // above ("orders.userId is ON DELETE RESTRICT, and no role is granted
   // DELETE on orders") for why, and why leaving them is safe.
 
-  // Leave PLATFORM_CASH in exactly the state this file found it in.
-  // Must run AFTER the LedgerEntry/Journal cleanup above, so the "any
-  // entries left on it?" check below reflects only rows outside this
-  // file's own tracked events.
+  // If this file itself created PLATFORM_CASH fresh (via
+  // getOrCreateAccount inside postOpeningBalance/postJournal), remove it
+  // now that its balance has been corrected above — but only if no
+  // LedgerEntry rows remain on it, i.e. nothing outside this file's own
+  // tracked events has touched it concurrently. Must run AFTER the
+  // LedgerEntry/Journal cleanup above so this check reflects only rows
+  // outside this file's own tracked events. A DELETE on ledger_accounts,
+  // so it goes through the maintenance client.
   const platformCashNow = await prisma.account.findUnique({
     where: {
       ownerType_ownerId_currency: { ownerType: 'PLATFORM_CASH', ownerId: PLATFORM_LEDGER_OWNER_ID, currency: LEDGER_CURRENCY },
     },
   });
   if (platformCashNow) {
-    if (platformCashSnapshot) {
-      // Pre-existed this file's run: this file never deleted its prior
-      // Journal/LedgerEntry rows (only its own tracked ones), so the only
-      // thing this file could have thrown off is the cached balance
-      // column — restore it to the exact pre-test value. A direct set
-      // (not a computed increment/decrement) so this is correct
-      // regardless of how many postings this file made. This is a plain
-      // UPDATE on ledger_accounts, which jolfa_app is already granted, so
-      // it stays on the shared `prisma` client, not the maintenance one.
-      await prisma.account.update({
-        where: { id: platformCashNow.id },
-        data: { balance: platformCashSnapshot.balance },
-      });
-    } else {
-      // Did not exist before this file ran, so this file itself created
-      // it (via getOrCreateAccount inside postOpeningBalance/postJournal).
-      // Only remove it if no LedgerEntry rows remain on it — if any do,
-      // something outside this file's own tracked events touched it
-      // concurrently, and deleting it would be unsafe. A DELETE on
-      // ledger_accounts, so this goes through the maintenance client.
-      const remainingEntries = await prisma.ledgerEntry.count({ where: { accountId: platformCashNow.id } });
-      if (remainingEntries === 0) {
-        await maintenance.account.delete({ where: { id: platformCashNow.id } });
-      }
+    // No snapshot to consult for "did this pre-exist" — instead: if zero
+    // LedgerEntry rows reference this account at all (from any suite,
+    // not just this file's own), it has no ledger history whatsoever,
+    // and the delta reversal above already brought its balance back to
+    // whatever it was before this file's own postings (0, if the account
+    // truly has no history). That state is indistinguishable from "never
+    // existed" for every other code path (getOrCreateAccount recreates
+    // it on demand), so it's safe to remove. If any entries remain
+    // (another suite's), the row stays — its balance was never touched
+    // by anything but this file's own reversed delta.
+    const remainingEntries = await prisma.ledgerEntry.count({ where: { accountId: platformCashNow.id } });
+    if (remainingEntries === 0) {
+      await maintenance.account.delete({ where: { id: platformCashNow.id } });
     }
   }
 
@@ -230,18 +259,6 @@ beforeAll(async () => {
   if (!roles.CUSTOMER || !roles.SELLER) {
     throw new Error('P2.5 tests require CUSTOMER and SELLER roles to be seeded (run prisma/seed.js)');
   }
-
-  // Snapshot PLATFORM_CASH's state BEFORE this file posts anything, so
-  // afterAll can restore it exactly (see platformCashSnapshot's doc
-  // comment above).
-  const existingPlatformCash = await prisma.account.findUnique({
-    where: {
-      ownerType_ownerId_currency: { ownerType: 'PLATFORM_CASH', ownerId: PLATFORM_LEDGER_OWNER_ID, currency: LEDGER_CURRENCY },
-    },
-  });
-  platformCashSnapshot = existingPlatformCash
-    ? { id: existingPlatformCash.id, balance: existingPlatformCash.balance.toString() }
-    : null;
 });
 
 // ─────────────────────────────────────────────────────────────────────────

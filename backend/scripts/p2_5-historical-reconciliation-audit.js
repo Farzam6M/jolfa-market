@@ -11,7 +11,13 @@
  * Run from backend/:
  *   node ../p2_5-historical-reconciliation-audit.js > p2_5-audit-report.json
  *
- * Produces sections A–F of the P2.5 Historical Reconciliation Audit spec.
+ * Produces sections A–F of the P2.5 Historical Reconciliation Audit spec,
+ * plus two sections added post-root-cause-fix:
+ *   G — Account.balance vs signed SUM(LedgerEntry) for EVERY Account row
+ *       (not just wallet-linked ones covered by Section A/E), split into
+ *       platform vs non-platform, with exact mismatch amounts.
+ *   H — total Journal/LedgerEntry counts and first/last Journal
+ *       timestamps, for a quick sense of ledger volume and time span.
  * Prints JSON to stdout, progress to stderr.
  */
 
@@ -103,9 +109,75 @@ function classifyDiscrepancy({ walletBalance, accountBalance, journals }) {
   return { category: 'UNKNOWN_REQUIRES_HUMAN_DECISION', reason: 'Ledger activity exists and is internally balanced, but the residual difference from Wallet.balance is not explained by any single traced event — needs a human to walk the full WalletTransaction history alongside this Journal history.' };
 }
 
+// ---- Section G: every Account, Account.balance vs signed SUM(LedgerEntry)
+// -----------------------------------------------------------------------
+// Global check — independent of Wallet ownership classification, unlike
+// Section A/E above (which only walks wallet-linked CUSTOMER_WALLET/
+// SELLER_WALLET accounts). Covers PLATFORM_* accounts, wallet accounts
+// with no resolvable Wallet row, and any other Account row that exists.
+// Read-only: findMany/groupBy only.
+async function everyAccountReconciliation() {
+  const accounts = await prisma.account.findMany();
+  const sums = await prisma.ledgerEntry.groupBy({
+    by: ['accountId', 'direction'],
+    _sum: { amount: true },
+  });
+  const computedByAccount = new Map();
+  for (const row of sums) {
+    const prior = computedByAccount.get(row.accountId) || 0;
+    const amt = Number(row._sum.amount || 0);
+    computedByAccount.set(row.accountId, prior + (row.direction === 'CREDIT' ? amt : -amt));
+  }
+
+  const rows = accounts.map((a) => {
+    const computed = computedByAccount.get(a.id) || 0;
+    const stored = Number(a.balance);
+    return {
+      accountId: a.id,
+      ownerType: a.ownerType,
+      ownerId: a.ownerId,
+      currency: a.currency,
+      isPlatformAccount: PLATFORM_OWNER_TYPES.includes(a.ownerType),
+      storedBalance: a.balance.toString(),
+      computedFromEntries: computed,
+      matches: stored === computed,
+      mismatchAmount: stored === computed ? 0 : stored - computed,
+    };
+  });
+
+  return {
+    totalAccounts: rows.length,
+    platformAccounts: rows.filter((r) => r.isPlatformAccount),
+    nonPlatformAccounts: rows.filter((r) => !r.isPlatformAccount),
+    mismatches: rows.filter((r) => !r.matches),
+  };
+}
+
+// ---- Section H: Journal/LedgerEntry counts + timestamp span -----------
+// Read-only: count/findFirst only.
+async function journalLedgerEntryCounts() {
+  const [journalCount, ledgerEntryCount, firstJournal, lastJournal] = await Promise.all([
+    prisma.journal.count(),
+    prisma.ledgerEntry.count(),
+    prisma.journal.findFirst({ orderBy: { createdAt: 'asc' }, select: { id: true, createdAt: true, eventType: true } }),
+    prisma.journal.findFirst({ orderBy: { createdAt: 'desc' }, select: { id: true, createdAt: true, eventType: true } }),
+  ]);
+  return {
+    journalCount,
+    ledgerEntryCount,
+    firstJournal: firstJournal ? { id: firstJournal.id, eventType: firstJournal.eventType, createdAt: firstJournal.createdAt.toISOString() } : null,
+    lastJournal: lastJournal ? { id: lastJournal.id, eventType: lastJournal.eventType, createdAt: lastJournal.createdAt.toISOString() } : null,
+  };
+}
+
 async function main() {
   const report = { generatedAt: new Date().toISOString(), mode: 'AUDIT_READ_ONLY' };
   await prisma.$connect();
+
+  // ---- Section G + H: every-Account reconciliation and Journal/LedgerEntry
+  // counts (independent of the wallet-scoped sections below) ------------
+  report.sectionG_everyAccountReconciliation = await everyAccountReconciliation();
+  report.sectionH_journalLedgerEntryCounts = await journalLedgerEntryCounts();
 
   // ---- Section A + B: DEFER_EXISTING_LEDGER_ACTIVITY accounts ----------
   const wallets = await prisma.wallet.findMany({ select: { id: true, userId: true, balance: true } });
@@ -223,6 +295,8 @@ async function main() {
     noSignalWalletsNonZero: noSignal.filter((w) => !w.balanceZero).length,
     ledgerIntegrityClean: unbalancedJournals.length === 0 && duplicates.length === 0 && orphanEntries.length === 0
       && Object.values(platformAccounts).every((a) => !a.exists || a.matches),
+    everyAccountReconciliationClean: report.sectionG_everyAccountReconciliation.mismatches.length === 0,
+    everyAccountMismatchCount: report.sectionG_everyAccountReconciliation.mismatches.length,
   };
 
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);

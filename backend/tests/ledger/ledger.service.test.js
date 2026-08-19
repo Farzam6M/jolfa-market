@@ -60,6 +60,44 @@ async function makeAccount(tx, ownerType, ownerId) {
   return account;
 }
 
+/**
+ * P2.5 root-cause fix (test contamination, not production code): reverses
+ * exactly the Account.balance delta that the given LedgerEntry rows
+ * previously caused via postJournal's cached-balance maintenance (CREDIT
+ * increments, DEBIT decrements — see ledger.service.js#postJournal), for
+ * every accountId in `entries` EXCEPT the ones in `skipAccountIds` (whose
+ * Account row is about to be deleted outright, so its balance no longer
+ * matters).
+ *
+ * Deliberately delta-based, not snapshot/direct-restoration: it reads the
+ * exact rows about to be deleted and reverses only what they contributed,
+ * so it is correct regardless of concurrent activity on a shared account
+ * (e.g. PLATFORM_CASH) between snapshot time and cleanup time — the bug
+ * class documented in the P2.5 root-cause audit for
+ * tests/ledger/p2_5-opening-balance.test.js.
+ *
+ * Uses Prisma.Decimal throughout (never Number/parseFloat) to match
+ * postJournal's own arithmetic discipline. Runs on the shared `prisma`
+ * client (jolfa_app) — Account.balance is a plain mutable cache column,
+ * not covered by the journals/ledger_entries immutability trigger, so no
+ * maintenance-role connection is needed for this part.
+ */
+async function reverseAccountBalanceDeltas(entries, skipAccountIds) {
+  const skip = new Set(skipAccountIds);
+  const deltaByAccount = new Map();
+  for (const entry of entries) {
+    if (skip.has(entry.accountId)) continue;
+    const amount = new Prisma.Decimal(entry.amount);
+    const signed = entry.direction === 'CREDIT' ? amount : amount.negated();
+    deltaByAccount.set(entry.accountId, (deltaByAccount.get(entry.accountId) || new Prisma.Decimal(0)).plus(signed));
+  }
+  for (const [accountId, delta] of deltaByAccount) {
+    if (delta.isZero()) continue;
+    // eslint-disable-next-line no-await-in-loop
+    await prisma.account.update({ where: { id: accountId }, data: { balance: { decrement: delta.toString() } } });
+  }
+}
+
 afterAll(async () => {
   // P2.6 Step 2F: journals/ledger_entries/ledger_accounts are immutable
   // under the ledger_immutability_guard trigger and jolfa_app's grants —
@@ -68,6 +106,26 @@ afterAll(async () => {
   // lookups below; only the actual deleteMany calls go through the
   // maintenance client. See tests/helpers/maintenance-client.js.
   const maintenance = getMaintenanceClient();
+
+  // Which of this file's own tracked accounts are safe to delete outright
+  // (computed up front, so the balance-delta reversal below knows which
+  // accountIds to SKIP — their whole row is being removed, so their
+  // balance no longer matters). Never the shared/singleton PLATFORM_*
+  // accounts (ownerId === PLATFORM_LEDGER_OWNER_ID) — trackAccounts above
+  // push their ids into createdAccountIds alongside this file's genuinely
+  // per-test (random-ownerId) accounts, but PLATFORM_CASH / PLATFORM_
+  // REVENUE / PAYMENT_GATEWAY_CLEARING are platform-wide infrastructure
+  // rows also written to by other test suites (e.g. order-refund.test.js)
+  // that do not delete their own Journal/LedgerEntry rows in cleanup.
+  // Deleting the shared account here would violate
+  // ledger_entries_accountId_fkey (ON DELETE RESTRICT) for entries this
+  // file never created and has no way to know about.
+  const ownedAccounts = createdAccountIds.length > 0
+    ? await prisma.account.findMany({ where: { id: { in: createdAccountIds } }, select: { id: true, ownerId: true } })
+    : [];
+  const deletableAccountIds = ownedAccounts
+    .filter((a) => a.ownerId !== PLATFORM_LEDGER_OWNER_ID)
+    .map((a) => a.id);
 
   // Children first (FK onDelete: Restrict on ledger_entries -> journals/
   // ledger_accounts, per the 20260811000000_ledger_foundation migration).
@@ -78,36 +136,22 @@ afterAll(async () => {
     const journals = await prisma.journal.findMany({ where: journalWhere, select: { id: true } });
     const journalIds = journals.map((j) => j.id);
     if (journalIds.length > 0) {
+      // P2.5 root-cause fix: read the exact LedgerEntry rows about to be
+      // deleted BEFORE deleting them, and reverse the Account.balance
+      // delta they caused on every account that will survive this
+      // cleanup (i.e. shared PLATFORM_* accounts) — delta reversal, never
+      // snapshot/direct restoration.
+      const entriesToDelete = await prisma.ledgerEntry.findMany({
+        where: { journalId: { in: journalIds } },
+        select: { accountId: true, direction: true, amount: true },
+      });
+      await reverseAccountBalanceDeltas(entriesToDelete, deletableAccountIds);
       await maintenance.ledgerEntry.deleteMany({ where: { journalId: { in: journalIds } } });
     }
     await maintenance.journal.deleteMany({ where: journalWhere });
   }
-  if (createdAccountIds.length > 0) {
-    // Never delete the shared/singleton PLATFORM_* accounts (ownerId ===
-    // PLATFORM_LEDGER_OWNER_ID) — trackPlatformAccounts/trackAccounts
-    // above push their ids into createdAccountIds alongside this file's
-    // genuinely per-test (random-ownerId) accounts, but PLATFORM_CASH /
-    // PLATFORM_REVENUE / PAYMENT_GATEWAY_CLEARING are platform-wide
-    // infrastructure rows also written to by other test suites that
-    // exercise the same business-flow code (e.g. order-refund.test.js),
-    // which do not delete their own Journal/LedgerEntry rows in cleanup.
-    // Deleting the shared account here would violate
-    // ledger_entries_accountId_fkey (ON DELETE RESTRICT, per the
-    // 20260811000000_ledger_foundation migration) for entries this file
-    // never created and has no way to know about. Same convention
-    // tests/ledger/p2_5-opening-balance.test.js already uses for
-    // PLATFORM_CASH — only uniquely-owned (random ownerId) accounts are
-    // safe to remove.
-    const ownedAccounts = await prisma.account.findMany({
-      where: { id: { in: createdAccountIds } },
-      select: { id: true, ownerId: true },
-    });
-    const deletableAccountIds = ownedAccounts
-      .filter((a) => a.ownerId !== PLATFORM_LEDGER_OWNER_ID)
-      .map((a) => a.id);
-    if (deletableAccountIds.length > 0) {
-      await maintenance.account.deleteMany({ where: { id: { in: deletableAccountIds } } });
-    }
+  if (deletableAccountIds.length > 0) {
+    await maintenance.account.deleteMany({ where: { id: { in: deletableAccountIds } } });
   }
   await disconnectMaintenanceClient();
   await prisma.$disconnect();
@@ -2209,6 +2253,26 @@ describe('P2.8-E — Ledger immutability trigger', () => {
     });
     const journalId2 = result2.journal.id;
     const entryIds2 = result2.entries.map((e) => e.id);
+
+    // P2.5 root-cause fix: this block deletes journalId2/entryIds2
+    // directly (ahead of and outside the file's own afterAll), so it is a
+    // second instance of the same contamination path — it posted a real
+    // DEBIT leg to the shared PLATFORM_CASH account (cashAccount2) via
+    // postJournal above, and deleting these rows without reversing that
+    // delta would permanently drift PLATFORM_CASH.balance. Same
+    // delta-reversal helper the main afterAll uses, not a snapshot.
+    // No skip list here: cashAccount2 (shared PLATFORM_CASH) genuinely
+    // needs correcting now, and sellerAccount2 (a genuinely per-test,
+    // random-ownerId account already tracked in createdAccountIds) will
+    // be deleted outright by this file's own afterAll regardless — a
+    // reversed balance on a row that's about to be deleted entirely is
+    // harmless, so it's simpler and just as correct not to special-case
+    // it here.
+    const entriesToDelete2 = await prisma.ledgerEntry.findMany({
+      where: { id: { in: entryIds2 } },
+      select: { accountId: true, direction: true, amount: true },
+    });
+    await reverseAccountBalanceDeltas(entriesToDelete2, []);
 
     // Children first — same FK order (ledger_entries -> journals,
     // ON DELETE Restrict) as this file's own afterAll cleanup.
